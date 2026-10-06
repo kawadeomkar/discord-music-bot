@@ -58,7 +58,7 @@ from src.util import (
     fmt_duration,
     trace_id_of,
 )
-from src.queue_item import NpCard, NpHostRef, QueueObject
+from src.queue_item import NpCard, NpHostRef, QueueObject, SearchAsk
 from src.youtube import YTDL
 from tests.helpers import (
     ask_of,
@@ -4704,6 +4704,23 @@ class TestEnqueueDepth:
         assert spy.await_args.kwargs["expected_duration"] == 233
         assert out.isrc is None
         assert out.duration == 234
+
+    async def test_the_resolve_keeps_the_search_it_came_from(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The term and ISRC clear, but the item keeps them as `resolved_from`, so a
+        video that fails its age check at stream time can be re-asked."""
+        source = unresolved("a song", isrc="GBAHS1600463", duration=233)
+        asked = SearchAsk(term=source.search, isrc="GBAHS1600463", secs=233)
+        resolved = QueueObject(
+            webpage_url="https://youtube.com/watch?v=1",
+            title="One",
+            requester=mock_author,
+            resolved_from=asked,
+        )
+        with patch.object(YTDL, "yt_source", new=AsyncMock(return_value=resolved)):
+            out = await music_player._resolve_source(source)
+        assert out.resolved_from is asked
 
     async def test_resolved_search_passes_its_query_source_through(
         self, music_player: MusicPlayer, mock_author: MagicMock

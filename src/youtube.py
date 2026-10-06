@@ -4,7 +4,8 @@ import copy
 import os
 import re
 import time
-from collections.abc import Iterator
+import unicodedata
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
@@ -22,9 +23,9 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
-from src.queue_item import NpCard, QueueObject
+from src.queue_item import NpCard, QueueObject, SearchAsk
 from src.redis_client import cache_del, cache_get, cache_set
-from src.sources import is_link, is_mix
+from src.sources import YTSource, is_link, is_mix, parse_input
 from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
@@ -160,6 +161,7 @@ class ExtractionError(Exception):
         video_id: str = "",
         cause_type: str = "",
         unsupported: bool = False,
+        age_restricted: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -170,6 +172,9 @@ class ExtractionError(Exception):
         # UnsupportedError, classified in the worker where the original type still
         # exists; yt_source reads it to say "not a site I can play".
         self.unsupported = unsupported
+        # The video (video_id) asks a signed-out client to confirm its age. A search
+        # that landed on one can still be answered by music search.
+        self.age_restricted = age_restricted
 
     @property
     def user_message(self) -> str:
@@ -188,22 +193,32 @@ class ExtractionError(Exception):
 
 def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     """Mine the classification that exists only here, inside the worker."""
-    inner = None
+    # extract_info wraps the extractor's error in a DownloadError; a direct call
+    # into an extractor (_music_search) raises it bare.
+    inner: Optional[BaseException] = e
     exc_info = getattr(e, "exc_info", None)
-    if isinstance(exc_info, tuple) and len(exc_info) == 3:
+    if isinstance(exc_info, tuple) and len(exc_info) == 3 and exc_info[1] is not None:
         inner = exc_info[1]
     cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
     # extract_info wraps an UnsupportedError in a DownloadError carrying the
     # original in exc_info, so check both.
     unsupported = isinstance(e, UnsupportedError) or isinstance(inner, UnsupportedError)
+    message = str(e)
     return ExtractionError(
-        message=str(e),
+        message=message,
         original_type=type(e).__name__,
         expected=bool(getattr(inner, "expected", False)),
         video_id=str(getattr(inner, "video_id", "") or ""),
         cause_type=type(cause).__name__ if cause is not None else "",
         unsupported=unsupported,
+        age_restricted=bool(_AGE_GATE_RE.search(message)),
     )
+
+
+# The reasons yt-dlp's own `_is_agegated` matches in a playability status, as they
+# reach the raised message. The player request asks for English (hl=en), so the
+# wording does not follow the host's locale.
+_AGE_GATE_RE = re.compile(r"confirm your age|age-restricted", re.IGNORECASE)
 
 
 class _YTDLVideoInfoRequired(TypedDict):
@@ -292,10 +307,19 @@ class YTDLEntry(YTDLVideoMetadata, total=False):
     webpage_url: str
     id: str
     _type: str
+    ie_key: str
     # Flat-entry fields: `channel` is a lockupViewModel result's `uploader`, and
     # `live_status` is the only warning that a live entry's `duration` is None.
     channel: str
     live_status: str
+    # Music-search fields, read from InnerTube by _music_search_entries: the
+    # artist segment as shown, the row's kind ("song", "video", "episode"), its
+    # musicVideoType minus the prefix ("ATV", "OMV", "UGC"), and whether it is the
+    # top-result card.
+    artists: str
+    music_kind: str
+    music_video_type: str
+    music_top: bool
 
 
 class YTDLExtractResult(YTDLEntry, total=False):
@@ -510,6 +534,9 @@ class ExtractRequest:
     download: bool = False
     # True at every call site: process=False does no format selection.
     process: bool = True
+    # `url` is a music.youtube.com search page, read through _music_search
+    # rather than extract_info.
+    music_search: bool = False
 
 
 def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
@@ -519,14 +546,190 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it;
     # the copy keeps the opts profile immutable across a worker's extractions.
     try:
-        result = youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
-            url, download=download, process=process
-        )
+        ydl = youtube_dl.YoutubeDL(copy.copy(opts))
+        if req.music_search:
+            return _music_search(ydl, url)
+        result = ydl.extract_info(url, download=download, process=process)
     except YoutubeDLError as e:
         # `from e`: the stdlib stringifies the chain into the parent's __cause__.
         raise _classify_ytdlp_error(e) from e
     # Slimmed here so the unpicklable payload never enters the result queue.
     return _slim_info(result)
+
+
+# The section `sp=` names on a music search URL, as yt-dlp's own
+# YoutubeMusicSearchURLIE._SECTIONS spells it: tracks only, each row carrying its
+# artist and length.
+_MUSIC_SONGS_PARAMS: Final[str] = "EgWKAQIIAWoKEAoQAxAEEAkQBQ=="
+_MUSIC_SECTIONS_PATH: Final[tuple[Any, ...]] = (
+    "contents", "tabbedSearchResultsRenderer", "tabs", 0, "tabRenderer", "content",
+    "sectionListRenderer", "contents",
+)  # fmt: skip
+# Row kinds an unfiltered search labels a playable row with (hl=en). A songs-filtered
+# row carries no label: its first segment is already the artist.
+_MUSIC_ROW_KINDS: Final[frozenset[str]] = frozenset({"song", "video", "episode"})
+_MUSIC_CLOCK_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
+
+
+def _music_search(ydl: Any, url: str) -> YTDLExtractResult:
+    """One music search POST, parsed by _music_search_entries. The request is the
+    first page of yt-dlp's own `_search_results` (its client version, headers and
+    retries); only the parse is ours, because yt-dlp's keeps a row's title alone and
+    skips the top-result card. See docs/ARCHITECTURE.md#reading-music-search."""
+    query_string = parse_qs(urlparse(url).query)
+    query = (query_string.get("q") or [""])[0]
+    data: dict[str, str] = {"query": query}
+    params = (query_string.get("sp") or [""])[0]
+    if params:
+        data["params"] = params
+    ie = ydl.get_info_extractor("YoutubeMusicSearchURL")
+    response = ie._extract_response(
+        item_id=f'query "{query}"',
+        ep="search",
+        query=data,
+        default_client="web_music",
+        check_get_keys=("contents",),
+        ytcfg={},
+        headers=ie.generate_api_headers(ytcfg={}, default_client="web_music"),
+    )
+    return {
+        "_type": "playlist",
+        "id": query,
+        "title": query,
+        "entries": list(_music_search_entries(response)),
+    }
+
+
+def _dig(node: Any, *path: Any) -> Any:
+    """`node[path[0]][path[1]]…`, or None where the shape stops matching."""
+    for step in path:
+        if isinstance(node, list) and isinstance(step, int):
+            node = node[step] if -len(node) <= step < len(node) else None
+        elif isinstance(node, dict) and not isinstance(step, int):
+            node = node.get(step)
+        else:
+            return None
+    return node
+
+
+def _music_segments(text: Any) -> list[str]:
+    """A music subtitle's ` • `-separated segments, each joined from its runs."""
+    segments: list[str] = [""]
+    for run in _dig(text, "runs") or []:
+        piece = run.get("text", "") if isinstance(run, dict) else ""
+        if piece.strip() == "•":
+            segments.append("")
+        else:
+            segments[-1] += piece
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def _music_clock_secs(segment: str) -> Optional[int]:
+    match = _MUSIC_CLOCK_RE.match(segment)
+    if match is None:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def _music_entry(
+    video_id: Any,
+    title: Any,
+    subtitle: Any,
+    endpoint: Any,
+    thumbnail: Any,
+    *,
+    top: bool,
+) -> Optional[YTDLEntry]:
+    """One playable result as a flat entry plus the music fields, or None for a row
+    that is not a video (an album, an artist, a playlist)."""
+    if not isinstance(video_id, str) or len(video_id) != _VIDEO_ID_LEN:
+        return None
+    segments = _music_segments(subtitle)
+    kind = "song"
+    if segments and segments[0].casefold() in _MUSIC_ROW_KINDS:
+        kind = segments.pop(0).casefold()
+    durations = [secs for s in segments if (secs := _music_clock_secs(s)) is not None]
+    # An episode's first segment is its date; the show after it is its credit.
+    credits = segments[1:] if kind == "episode" else segments
+    credit = credits[0] if credits else ""
+    video_type = str(
+        _dig(
+            endpoint,
+            "watchEndpointMusicSupportedConfigs",
+            "watchEndpointMusicConfig",
+            "musicVideoType",
+        )
+        or ""
+    ).removeprefix("MUSIC_VIDEO_TYPE_")
+    thumbs = _dig(thumbnail, "musicThumbnailRenderer", "thumbnail", "thumbnails")
+    entry: YTDLEntry = {
+        "_type": "url",
+        "ie_key": "Youtube",
+        "id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": "".join(
+            run.get("text", "")
+            for run in _dig(title, "runs") or []
+            if isinstance(run, dict)
+        ),
+        "artists": credit,
+        "music_kind": kind,
+        "music_video_type": video_type,
+        "music_top": top,
+    }
+    if durations:
+        entry["duration"] = durations[-1]
+    thumb = _dig(thumbs, -1, "url") if isinstance(thumbs, list) else None
+    if isinstance(thumb, str) and thumb:
+        entry["thumbnail"] = thumb
+    return entry
+
+
+def _music_search_entries(response: Any) -> Iterator[YTDLEntry]:
+    """The playable results of a music search response, top-result card first,
+    each id once. Pure, so the parse is tested on recorded responses."""
+    seen: set[str] = set()
+    for section in _dig(response, *_MUSIC_SECTIONS_PATH) or []:
+        card = _dig(section, "musicCardShelfRenderer")
+        rows: list[Optional[YTDLEntry]] = []
+        if isinstance(card, dict):
+            endpoint = _dig(card, "title", "runs", 0, "navigationEndpoint")
+            rows.append(
+                _music_entry(
+                    _dig(endpoint, "watchEndpoint", "videoId"),
+                    card.get("title"),
+                    card.get("subtitle"),
+                    _dig(endpoint, "watchEndpoint"),
+                    card.get("thumbnail"),
+                    top=True,
+                )
+            )
+        for shelf in ("itemSectionRenderer", "musicShelfRenderer"):
+            for item in _dig(section, shelf, "contents") or []:
+                row = _dig(item, "musicResponsiveListItemRenderer")
+                if not isinstance(row, dict):
+                    continue
+                columns = [
+                    _dig(column, "musicResponsiveListItemFlexColumnRenderer", "text")
+                    for column in row.get("flexColumns") or []
+                ]
+                title = columns[0] if columns else None
+                rows.append(
+                    _music_entry(
+                        _dig(row, "playlistItemData", "videoId"),
+                        title,
+                        columns[1] if len(columns) > 1 else None,
+                        _dig(title, "runs", 0, "navigationEndpoint", "watchEndpoint"),
+                        row.get("thumbnail"),
+                        top=False,
+                    )
+                )
+        for entry in rows:
+            video_id = entry.get("id", "") if entry is not None else ""
+            if entry is not None and video_id not in seen:
+                seen.add(video_id)
+                yield entry
 
 
 async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
@@ -924,9 +1127,16 @@ def _identity_from_wire(entry: dict[str, Any]) -> SourceIdentity:
     )
 
 
-def _source_cache_value(identity: SourceIdentity) -> dict[str, Any]:
-    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads."""
-    return {**_identity_to_wire(identity), "cached_at": time.time()}
+def _source_cache_value(
+    identity: SourceIdentity, *, via_music: bool = False
+) -> dict[str, Any]:
+    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads.
+    `via_music` marks an answer music search gave in place of the ask's own search,
+    which a revalidation would replace with what that search finds."""
+    value = {**_identity_to_wire(identity), "cached_at": time.time()}
+    if via_music:
+        value["via"] = "music"
+    return value
 
 
 def _playlist_cache_key(url: str) -> str:
@@ -1573,6 +1783,21 @@ def _nothing_playable(search: str) -> _NothingFound:
     )
 
 
+def _age_restricted_miss(error: ExtractionError) -> _NothingFound:
+    """The miss for a search term whose result is a video only a signed-in, adult
+    account may play. Worded here because yt-dlp's text is cookie advice."""
+    log.warning(f"age-restricted result for a search: {error.video_id}")
+    return _NothingFound(
+        ExtractionError(
+            "That search's top result is age-restricted, and I couldn't find "
+            "another upload of it.",
+            expected=True,
+            video_id=error.video_id,
+            age_restricted=True,
+        )
+    )
+
+
 _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
@@ -1582,10 +1807,12 @@ _SEARCH_KIND_MUSIC: Final[str] = "music"
 # (`UC…`) ids beside the tracks, and length is what separates them.
 _VIDEO_ID_LEN: Final[int] = 11
 
-# Shortest query word that can carry a match. Three, because "xvi" is a real ask
-# and a two-letter word ("u2") is shared by too much to mean anything.
+# Shortest word that can carry a match. Three for Latin letters and digits,
+# because "xvi" is a real ask and a two-letter word ("u2") is shared by too much
+# to mean anything; two in any other script, where a syllable or a letter carries
+# more ("좋은", "до").
 _MIN_MATCH_WORD: Final[int] = 3
-_WORD_RE = re.compile(r"[a-z0-9]+")
+_MIN_MATCH_WORD_OTHER: Final[int] = 2
 # Words that carry no identity, so sharing one is no evidence: a stranger's title
 # matched "song", "the" or "you" in a nonsense query. Kept out of both sides.
 _MATCH_STOPWORDS: Final[frozenset[str]] = frozenset(
@@ -1603,6 +1830,7 @@ _MATCH_VARIANT_WORDS: Final[frozenset[str]] = frozenset(
     {
         "karaoke", "nightcore", "instrumental", "cover", "remix", "slowed", "sped",
         "reverb", "8d", "live", "acapella", "acoustic", "piano", "tutorial", "reaction",
+        "reacts",
     }
 )  # fmt: skip
 # How far a candidate may run from the length the ask already knows (Spotify's)
@@ -1654,27 +1882,129 @@ def _search_terms(
     return terms
 
 
-def _match_words(text: str) -> set[str]:
-    """The words of `text` that can carry a match: long enough, and not stopwords."""
-    return {
-        word
-        for word in _WORD_RE.findall(text.lower())
-        if len(word) >= _MIN_MATCH_WORD and word not in _MATCH_STOPWORDS
-    }
+def _dense_script(char: str) -> bool:
+    """Whether `char` belongs to a script written without spaces between words
+    (Han, kana, Thai, Lao, Khmer, Myanmar), where a run of it is a phrase."""
+    point = ord(char)
+    return (
+        0x3040 <= point <= 0x30FF  # hiragana, katakana
+        or 0x31F0 <= point <= 0x31FF  # katakana phonetic extensions
+        or 0x3400 <= point <= 0x4DBF  # CJK extension A
+        or 0x4E00 <= point <= 0x9FFF  # CJK unified ideographs
+        or 0xF900 <= point <= 0xFAFF  # CJK compatibility ideographs
+        or 0x20000 <= point <= 0x3FFFF  # CJK extensions B onward
+        or 0x0E00 <= point <= 0x0EFF  # Thai, Lao
+        or 0x1000 <= point <= 0x109F  # Myanmar
+        or 0x1780 <= point <= 0x17FF  # Khmer
+    )
 
 
-def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
-    """Whether a music-search title is plausibly an answer to `query`: it shares at
-    least half the ask's identifying words and is no rendition (karaoke, a live set)
-    the ask did not name. See docs/ARCHITECTURE.md#the-music-search-fallback."""
-    wanted = _match_words(query)
-    if not wanted:
+def _match_tokens(text: str) -> set[str]:
+    """`text` as the tokens a match is counted in: NFKC-normalised and case-folded,
+    split at anything that is not a letter, mark or digit. A run of a dense script
+    becomes its character pairs, so "夜に駆ける" can share "駆け" with a title. Too
+    short or a stopword drops out. See docs/ARCHITECTURE.md#the-relevance-gate."""
+    tokens: set[str] = set()
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    for word in _words(folded):
+        for dense, run in _script_runs(word):
+            if dense:
+                if len(run) == 1:
+                    tokens.add(run)
+                tokens.update(run[i : i + 2] for i in range(len(run) - 1))
+                continue
+            floor = (
+                _MIN_MATCH_WORD
+                if all(ord(char) < 0x250 for char in run)
+                else _MIN_MATCH_WORD_OTHER
+            )
+            if len(run) >= floor and run not in _MATCH_STOPWORDS:
+                tokens.add(run)
+    return tokens
+
+
+def _words(text: str) -> Iterator[str]:
+    """The runs of letters, combining marks and digits in `text`. By Unicode
+    category rather than the regex word class, which ends a Devanagari word at its
+    first combining vowel sign."""
+    word: list[str] = []
+    for char in text:
+        if unicodedata.category(char)[0] in "LMN":
+            word.append(char)
+        elif word:
+            yield "".join(word)
+            word = []
+    if word:
+        yield "".join(word)
+
+
+def _script_runs(word: str) -> Iterator[tuple[bool, str]]:
+    """`word` cut where it moves between a dense script and any other."""
+    start = 0
+    for index in range(1, len(word) + 1):
+        if index == len(word) or _dense_script(word[index]) != _dense_script(
+            word[start]
+        ):
+            yield _dense_script(word[start]), word[start:index]
+            start = index
+
+
+def _token_scripts(tokens: set[str]) -> set[str]:
+    """The scripts `tokens` are written in, by the first word of each letter's
+    Unicode name (LATIN, CYRILLIC, CJK…), kana and Han as one. Digits carry none."""
+    scripts: set[str] = set()
+    for token in tokens:
+        for char in token:
+            if not char.isalpha():
+                continue
+            script = unicodedata.name(char, "").split(" ")[0]
+            scripts.add("CJK" if script in ("HIRAGANA", "KATAKANA") else script)
+    return scripts
+
+
+def _music_candidate_matches(
+    query: str,
+    title: Optional[str],
+    artists: str = "",
+    *,
+    ask_artists: frozenset[str] = frozenset(),
+    corroborated: bool = False,
+) -> bool:
+    """Whether a music-search result is plausibly the answer to `query`.
+
+    `ask_artists` are the ask's words that name an artist somewhere in the result
+    set; the candidate has to be credited to one of them, so another act's
+    rendition, or an upload that only names the artist in its title, fails.
+    The ask's other words are the song, and the title has to carry all of them when
+    no artist was named, two thirds when one was, half when the candidate is also
+    `corroborated` (music search's top card, by the card's artist, or its length is
+    the one the ask knows). An ask naming no artist needs the corroboration: words
+    alone match any song that shares a title with a tutorial or a meme. A corroborated candidate by the ask's artist whose title is in a script
+    the ask did not type passes on that alone. A rendition (karaoke, live) passes
+    only when the ask names it too. See docs/ARCHITECTURE.md#the-relevance-gate."""
+    wanted = _match_tokens(_SEARCH_PREFIX_RE.sub("", query))
+    if not wanted or not title:
         return False
-    words = set(_WORD_RE.findall((title or "").lower()))
-    if (words & _MATCH_VARIANT_WORDS) - set(_WORD_RE.findall(query.lower())):
+    title_tokens = _match_tokens(title)
+    if (title_tokens & _MATCH_VARIANT_WORDS) != (wanted & _MATCH_VARIANT_WORDS):
         return False
-    shared = wanted & words
-    return bool(shared) and 2 * len(shared) >= len(wanted)
+    artist_tokens = _match_tokens(artists)
+    named = wanted & ask_artists
+    if named and not named & artist_tokens:
+        return False
+    song_words = wanted - named
+    if not song_words:
+        return False
+    if named and corroborated and named <= artist_tokens:
+        scripts = _token_scripts(title_tokens)
+        if scripts and not scripts & _token_scripts(song_words):
+            return True
+    shared = len(song_words & title_tokens)
+    if not named:
+        return corroborated and shared == len(song_words)
+    if corroborated:
+        return shared > 0 and 2 * shared >= len(song_words)
+    return shared > 0 and 3 * shared >= 2 * len(song_words)
 
 
 def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bool:
@@ -1685,14 +2015,78 @@ def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bo
     return abs(int(duration) - expected) <= _MUSIC_DURATION_TOLERANCE_SECS
 
 
+# Where one credited artist ends and the next begins in an artist segment
+# ("akiaura, LONOWN & DJ Pointless", "Pritam feat. Arijit Singh").
+_CREDIT_SPLIT_RE = re.compile(r",|&|/|\bfeat\.?|\bft\.|\s+x\s+", re.IGNORECASE)
+
+
+def _music_pick(
+    query: str,
+    entries: list[Optional[YTDLEntry]],
+    *,
+    exclude: frozenset[str] = frozenset(),
+    expected_duration: Optional[int] = None,
+) -> Optional[YTDLEntry]:
+    """The first result, top-result card first, that passes the relevance gate and
+    whose length (when music search gave one) fits `expected_duration`. `exclude`
+    names videos already known not to play."""
+    tracks = [
+        entry
+        for entry in entries
+        # Album and channel pages arrive as `YoutubeTab` entries with `MPREb_`/`UC`
+        # ids; select_search_entry cannot tell them apart, and queued they play
+        # nothing.
+        if entry
+        and entry.get("ie_key") == "Youtube"
+        and len(str(entry.get("id") or "")) == _VIDEO_ID_LEN
+        and entry.get("id") not in exclude
+    ]
+    # The ask names an artist when it carries the whole name of one the answer
+    # credits; its words are then artist words, and a candidate by someone else is a
+    # rendition. Whole names, so "tie" in a credit does not make "how to tie a tie"
+    # an artist's ask. See the gate's docstring.
+    asked = _match_tokens(query)
+    named: set[str] = set()
+    for entry in tracks:
+        for credit in _CREDIT_SPLIT_RE.split(entry.get("artists") or ""):
+            tokens = _match_tokens(credit)
+            if tokens and tokens <= asked:
+                named |= tokens
+    # The artist music search's own top card credits — read before `exclude`, since
+    # a card that cannot play still says whose song the ask is.
+    card = next((e for e in entries if e and e.get("music_top")), None)
+    card_artists = _match_tokens(card.get("artists") or "") if card else set()
+    for entry in tracks:
+        duration = entry.get("duration")
+        if duration is not None and not _music_duration_fits(
+            int(duration), expected_duration
+        ):
+            continue
+        timed = duration is not None and expected_duration is not None
+        artists = entry.get("artists") or ""
+        if _music_candidate_matches(
+            query,
+            entry.get("title"),
+            artists,
+            ask_artists=frozenset(named),
+            corroborated=bool(entry.get("music_top"))
+            or timed
+            or bool(card_artists & _match_tokens(artists)),
+        ):
+            return entry
+    return None
+
+
 async def _ytmusic_candidate_url(
     search: str,
     *,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    exclude: frozenset[str] = frozenset(),
+    expected_duration: Optional[int] = None,
 ) -> Optional[str]:
-    """The watch URL of the first track music.youtube.com answers `search` with that
-    passes the relevance gate, or None. FLAT only: processed, one age-restricted
-    track in the result set raises for the whole search.
+    """The watch URL of what music.youtube.com answers `search` with, chosen by
+    _music_pick, or None. One search POST, parsed in the worker: no result is
+    extracted, so an age-restricted track in the set cannot fail the search.
     See docs/ARCHITECTURE.md#the-music-search-fallback."""
     query = _SEARCH_PREFIX_RE.sub("", search).strip()
     if not query:
@@ -1700,25 +2094,67 @@ async def _ytmusic_candidate_url(
     url = "https://music.youtube.com/search?q=" + quote_plus(query)
     data = await _extract_for_source(
         _inflight_key(_source_cache_key(url), "music"),
-        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS),
+        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS, music_search=True),
         url,
         pool_slot=pool_slot,
     )
-    for entry in (data or {}).get("entries") or []:
-        # Music search interleaves album and channel pages with the tracks, as
-        # `YoutubeTab` entries carrying an `MPREb_`/`UC` id and no title.
-        # select_search_entry cannot tell them apart — they are not `_type`
-        # "playlist" — and queueing one plays nothing.
-        if not entry or entry.get("ie_key") != "Youtube":
-            continue
-        video_id = str(entry.get("id") or "")
-        if len(video_id) != _VIDEO_ID_LEN:
-            continue
-        if not _music_candidate_matches(query, entry.get("title")):
-            continue
-        return f"https://www.youtube.com/watch?v={video_id}"
-    trace.get_current_span().set_attribute("ytdl.music_no_match", True)
-    return None
+    picked = _music_pick(
+        query,
+        (data or {}).get("entries") or [],
+        exclude=exclude,
+        expected_duration=expected_duration,
+    )
+    span = trace.get_current_span()
+    if picked is None:
+        span.set_attribute("ytdl.music_no_match", True)
+        return None
+    span.set_attribute("ytdl.music_pick_top", bool(picked.get("music_top")))
+    span.set_attribute("ytdl.music_pick_type", picked.get("music_video_type") or "")
+    return f"https://www.youtube.com/watch?v={picked.get('id')}"
+
+
+async def _cache_music_answer(
+    redis: Optional[aioredis.Redis], term: str, found: QueueObject
+) -> None:
+    """Cache what music search found under the term the next ask reads first, or
+    every repeat re-asks the failing search and music search before reaching the
+    watch URL's own entry. Marked, so a revalidation does not swap it back."""
+    if redis is None:
+        return
+    await cache_set(
+        redis,
+        _source_cache_key(term),
+        _source_cache_value(
+            SourceIdentity(
+                webpage_url=found.webpage_url,
+                title=found.title,
+                duration=found.duration,
+                uploader=found.uploader,
+                thumbnail=found.thumbnail,
+            ),
+            via_music=True,
+        ),
+        _YT_SOURCE_TTL,
+    )
+
+
+def _typed_search(user_input: Optional[str]) -> Optional[SearchAsk]:
+    """The search a typed `-play <words>` resolved through, rebuilt from what was
+    typed, or None for a link, a Spotify page or nothing."""
+    try:
+        source = parse_input(user_input) if user_input else None
+    except Exception:
+        # A link parse_input refuses (an unsupported Spotify page) was never a
+        # typed search, and the rescue runs inside its caller's error handling.
+        return None
+    if not isinstance(source, YTSource) or source.ytsearch is None:
+        return None
+    return SearchAsk(term=source.ytsearch)
+
+
+def _video_id_of(webpage_url: str) -> str:
+    """The `v=` of a watch URL, or "" for any other shape."""
+    return (parse_qs(urlparse(webpage_url).query).get("v") or [""])[0]
 
 
 def _first_video_entry(
@@ -1996,6 +2432,10 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.np_card
 
     @property
+    def resolved_from(self) -> Optional[SearchAsk]:
+        return self.queued.resolved_from
+
+    @property
     def played_at(self) -> float:
         return self.queued.played_at
 
@@ -2087,10 +2527,14 @@ class YTDL(discord.FFmpegOpusAudio):
             )
         except Exception as e:
             trace.get_current_span().record_exception(e)
+            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
+            # The rescue's resolve warms the new song's stream itself.
+            rescued = await cls.rescue_age_restricted(qo, e, redis)
+            if rescued is not None:
+                return rescued
             trace.get_current_span().set_status(
                 StatusCode.ERROR, f"prefetch_stream failed: {e}"
             )
-            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return None
         if data is not None:
             # Shielded like every other join: a cancelled prefetch (every bulk queue
@@ -2330,9 +2774,20 @@ class YTDL(discord.FFmpegOpusAudio):
         uninterruptible executor job in that path."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
 
-        data = await cls._resolve_playable_stream(
-            qo, redis, allow_reextract=allow_reextract
-        )
+        try:
+            data = await cls._resolve_playable_stream(
+                qo, redis, allow_reextract=allow_reextract
+            )
+        except ExtractionError as e:
+            # The song plays as what music search found for its ask, and the
+            # YTDL carries the re-pointed item, so the card and history name it.
+            rescued = await cls.rescue_age_restricted(qo, e, redis)
+            if rescued is None:
+                raise
+            qo = rescued
+            data = await cls._resolve_playable_stream(
+                qo, redis, allow_reextract=allow_reextract
+            )
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts:
@@ -2406,7 +2861,7 @@ class YTDL(discord.FFmpegOpusAudio):
         terms = _search_terms(
             search, isrc=isrc, expected_duration=expected_duration, flat=flat
         )
-        resolve = partial(
+        resolve_term = partial(
             cls._resolve_term,
             requester,
             expected_duration=expected_duration,
@@ -2419,86 +2874,210 @@ class YTDL(discord.FFmpegOpusAudio):
             redis=redis,
             pool_slot=pool_slot,
         )
+        # A Spotify-shaped ask, whose user_input (a link) cannot rebuild the search:
+        # every item it resolves to carries it, for rescue_age_restricted.
+        asked = (
+            SearchAsk(term=search, isrc=isrc, secs=expected_duration)
+            if (isrc is not None or expected_duration is not None)
+            and not is_link(search.strip())
+            else None
+        )
+
+        async def resolve(term: str, **kwargs: Any) -> QueueObject:
+            found = await resolve_term(term, **kwargs)
+            return found if asked is None else replace(found, resolved_from=asked)
+
         last_miss: Optional[_NothingFound] = None
+        # Videos a term landed on that refused a signed-out client its age check.
+        age_gated: set[str] = set()
         for index, (kind, term) in enumerate(terms):
             trace.get_current_span().set_attribute("ytdl.search_kind", kind)
             try:
-                return await resolve(term, flat=flat)
+                found = await resolve(term, flat=flat)
+                if kind != _SEARCH_KIND_ISRC or _music_duration_fits(
+                    found.duration, expected_duration
+                ):
+                    return found
+                # An ISRC names one recording, so an upload this far from its
+                # length is mis-tagged: measured, a 176 s clip for a 268 s track.
+                trace.get_current_span().set_attribute(
+                    "ytdl.isrc_length_mismatch", True
+                )
+                log.info(
+                    f"ISRC search {term!r} found {found.webpage_url} at "
+                    f"{found.duration}s against {expected_duration}s; declined"
+                )
+                last_miss = _nothing_playable(term)
             except _NothingFound as miss:
                 last_miss = miss
-                if index < len(terms) - 1:
-                    log.info(
-                        f"{kind} search {term!r} found nothing; "
-                        f"falling back to {terms[index + 1][1]!r}"
-                    )
+            except ExtractionError as e:
+                # A link names the one video it plays; a search can be answered
+                # by another upload of the same song.
+                if not e.age_restricted or is_link(search.strip()):
+                    raise
+                age_gated.add(e.video_id)
+                last_miss = _age_restricted_miss(e)
+            if index < len(terms) - 1:
+                log.info(
+                    f"{kind} search {term!r} found nothing playable; "
+                    f"falling back to {terms[index + 1][1]!r}"
+                )
         if last_miss is None:
             raise AssertionError("_search_terms never returns an empty ladder")
 
         # Every ytsearch term missed. For a SEARCH that can mean YouTube withheld
-        # the results rather than holding none, which music search is not subject
-        # to. A LINK is excluded: it named one video, and a second opinion on a
-        # different corpus would play something the user did not ask for.
+        # the results, or ranked an age-restricted video first; music search is
+        # subject to neither. A LINK is excluded: it named one video, and a second
+        # opinion on a different corpus would play something the user did not ask for.
         if not is_link(search.strip()):
-            trace.get_current_span().set_attribute("ytdl.music_fallback", True)
-            try:
-                watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
-                if watch_url is not None:
-                    log.info(
-                        f"search {search!r} found nothing; music search found {watch_url}"
-                    )
-                    # Never flat: the candidate is a link now, and the link path is
-                    # what fills both caches from one round. The needle is the ask's,
-                    # not the watch URL's, so -remove still matches what was typed.
-                    found = await resolve(
-                        watch_url,
-                        flat=False,
-                        user_input=user_input if user_input is not None else search,
-                    )
-                    if _music_duration_fits(found.duration, expected_duration):
-                        # Stamped only here: an attempt that declined or failed is
-                        # `ytdl.music_fallback` alone, still the ladder's kind.
-                        trace.get_current_span().set_attribute(
-                            "ytdl.search_kind", _SEARCH_KIND_MUSIC
-                        )
-                        # Under the term the next ask reads first, or every repeat
-                        # re-asks the walled search and music search before reaching
-                        # the watch URL's own entry.
-                        if redis is not None:
-                            await cache_set(
-                                redis,
-                                _source_cache_key(terms[0][1]),
-                                _source_cache_value(
-                                    SourceIdentity(
-                                        webpage_url=found.webpage_url,
-                                        title=found.title,
-                                        duration=found.duration,
-                                        uploader=found.uploader,
-                                        thumbnail=found.thumbnail,
-                                    )
-                                ),
-                                _YT_SOURCE_TTL,
-                            )
-                        return found
-                    # A Spotify ask knows its length, and music search's pick ran
-                    # too far from it to be that recording: declined like any miss.
-                    trace.get_current_span().set_attribute(
-                        "ytdl.music_duration_mismatch", True
-                    )
-                    log.info(
-                        f"music search's candidate {watch_url} for {search!r} runs "
-                        f"{found.duration}s against {expected_duration}s; declined"
-                    )
-            except Exception as e:
-                # BOTH legs are best-effort: the ask keeps the answer it earned. Each
-                # leg has its own way of replacing it — a candidate raises yt-dlp's
-                # cookies boilerplate, which user_message shows verbatim for an
-                # `expected` error, and the music ask's unsupported branch names the
-                # internal search URL in text a user reads.
-                log.warning(f"music fallback for {search!r} failed: {e!r}")
+            span = trace.get_current_span()
+            span.set_attribute("ytdl.music_fallback", True)
+            span.set_attribute(
+                "ytdl.music_fallback_trigger",
+                "age_restricted" if age_gated else "nothing_found",
+            )
+            found = await cls._music_answer(
+                search,
+                resolve,
+                cache_terms=(terms[0][1],),
+                user_input=user_input,
+                redis=redis,
+                pool_slot=pool_slot,
+                expected_duration=expected_duration,
+                exclude=frozenset(age_gated),
+            )
+            if found is not None:
+                return found
 
         # Raised as the failure the caller has always seen, `from None` because the
         # wrapper is this method's private business.
         raise last_miss.public from None
+
+    @staticmethod
+    async def _music_answer(
+        search: str,
+        resolve: Callable[..., Awaitable[QueueObject]],
+        *,
+        cache_terms: tuple[str, ...],
+        user_input: Optional[str],
+        redis: Optional[aioredis.Redis],
+        pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]],
+        expected_duration: Optional[int],
+        exclude: frozenset[str],
+    ) -> Optional[QueueObject]:
+        """What music search answers `search` with, resolved through `resolve` as a
+        link and cached under each of `cache_terms`, or None. Never raises: both legs are
+        best-effort, and the ask keeps the answer it earned."""
+        try:
+            watch_url = await _ytmusic_candidate_url(
+                search,
+                pool_slot=pool_slot,
+                exclude=exclude,
+                expected_duration=expected_duration,
+            )
+            if watch_url is None:
+                return None
+            log.info(f"search {search!r} missed; music search found {watch_url}")
+            # Never flat: the candidate is a link now, and the link path is what
+            # fills both caches from one round. The needle is the ask's, not the
+            # watch URL's, so -remove still matches what was typed.
+            found = await resolve(
+                watch_url,
+                flat=False,
+                user_input=user_input if user_input is not None else search,
+            )
+            if not _music_duration_fits(found.duration, expected_duration):
+                # A Spotify ask knows its length, and the pick ran too far from it
+                # to be that recording: declined like any miss.
+                trace.get_current_span().set_attribute(
+                    "ytdl.music_duration_mismatch", True
+                )
+                log.info(
+                    f"music search's candidate {watch_url} for {search!r} runs "
+                    f"{found.duration}s against {expected_duration}s; declined"
+                )
+                return None
+            # Stamped only here: an attempt that declined or failed is
+            # `ytdl.music_fallback` alone, still the ladder's kind.
+            trace.get_current_span().set_attribute(
+                "ytdl.search_kind", _SEARCH_KIND_MUSIC
+            )
+            for cache_term in cache_terms:
+                await _cache_music_answer(redis, cache_term, found)
+            return found
+        except Exception as e:
+            # A candidate raises yt-dlp's cookies boilerplate, which user_message
+            # shows verbatim for an `expected` error, and the music ask's
+            # unsupported branch names the internal search URL.
+            log.warning(f"music fallback for {search!r} failed: {e!r}")
+            return None
+
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.rescue_age_restricted")
+    async def rescue_age_restricted(
+        cls,
+        qo: QueueObject,
+        error: BaseException,
+        redis: Optional[aioredis.Redis],
+    ) -> Optional[QueueObject]:
+        """`qo` re-pointed at what music search answers its ask with, when its
+        stream failed for an age check and the ask can be rebuilt — the search it
+        resolved from (`resolved_from`, a Spotify track), or a typed one; else None.
+
+        A flat resolve cannot see an age gate (it makes no player call), and a
+        cached answer can name a video that has since been restricted, so either
+        queues and fails here. The answer replaces the ask's source-cache entries,
+        which still name the restricted video.
+        See docs/ARCHITECTURE.md#an-age-restricted-top-hit."""
+        if not isinstance(error, ExtractionError) or not error.age_restricted:
+            return None
+        asked = qo.resolved_from or _typed_search(qo.user_input)
+        if asked is None:
+            return None
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.music_fallback", True)
+        span.set_attribute("ytdl.music_fallback_trigger", "age_restricted_stream")
+        failed = {error.video_id, _video_id_of(qo.webpage_url)} - {""}
+        found = await cls._music_answer(
+            asked.term,
+            partial(
+                cls._resolve_term,
+                qo.requester,
+                query_source=qo.query_source,
+                queued_at=qo.queued_at,
+                queue_position=qo.queue_position,
+                redis=redis,
+            ),
+            # The first term of both ladders the ask could have taken (flat for a
+            # TAIL, full at dequeue): whichever served the restricted video, the
+            # next ask reads that one first.
+            cache_terms=tuple(
+                dict.fromkeys(
+                    _search_terms(
+                        asked.term,
+                        isrc=asked.isrc,
+                        expected_duration=asked.secs,
+                        flat=flat,
+                    )[0][1]
+                    for flat in (True, False)
+                )
+            ),
+            user_input=qo.user_input,
+            redis=redis,
+            pool_slot=None,
+            expected_duration=asked.secs,
+            exclude=frozenset(failed),
+        )
+        if found is None:
+            return None
+        return replace(
+            qo,
+            webpage_url=found.webpage_url,
+            title=found.title,
+            duration=found.duration,
+            uploader=found.uploader,
+            thumbnail=found.thumbnail,
+        )
 
     @classmethod
     async def _resolve_term(
@@ -2538,7 +3117,10 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
                 stale = _source_entry_is_stale(cached)
                 trace.get_current_span().set_attribute("ytdl.source_stale", stale)
-                if stale and not is_link(search.strip()):
+                # A music answer stands until its TTL: the search a refresh would
+                # re-run is the one that failed, and its answer would replace it.
+                via_music = cached.get("via") == "music"
+                if stale and not via_music and not is_link(search.strip()):
                     # Served now, refreshed behind the reply: what ages is the
                     # ranking a search resolved through, and a link's mapping is
                     # the link. Not awaited — this play uses the entry it has.

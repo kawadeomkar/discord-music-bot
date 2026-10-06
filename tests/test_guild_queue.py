@@ -28,7 +28,7 @@ from src.guild_queue import (
 )
 from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.redis_client import GUILD_TTL, GuildRedisStore
-from src.queue_item import QueueObject
+from src.queue_item import QueueObject, SearchAsk
 from tests.helpers import (
     queue_object,
     seed_queue,
@@ -1921,6 +1921,24 @@ class TestRestoreEntries:
         )
         assert await gq.restore_entries([entry]) == 1
         assert gq.display_items()[0].requester is left_the_guild
+
+    async def test_the_search_a_resolved_item_came_from_rehydrates(
+        self, gq: GuildQueue
+    ) -> None:
+        entry = SongQueueEntry(
+            webpage_url="https://www.youtube.com/watch?v=NJAv_7lHUIU",
+            title="Kesariya",
+            requester_id=None,
+            resolved_term="Kesariya Arijit Singh",
+            resolved_isrc="INS172203702",
+            resolved_secs=268,
+        )
+        assert await gq.restore_entries([entry, _unresolved_entry()]) == 2
+        items = gq.display_items()
+        assert items[0].resolved_from == SearchAsk(
+            term="Kesariya Arijit Singh", isrc="INS172203702", secs=268
+        )
+        assert items[1].resolved_from is None
 
     async def test_the_isrc_rehydrates(self, gq: GuildQueue) -> None:
         """The recording a collection walk named has to survive a restart, or

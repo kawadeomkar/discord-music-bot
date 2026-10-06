@@ -154,7 +154,8 @@ because the title of a well-known song finds the music video and the ISRC finds 
 label's art track (263 s against 234 s for "Shape of You"). A playlist asks for it in its
 `fields` mask; an album's simplified tracks carry none, so `_page_isrcs` batches one
 `/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
-of a FLAT search, which costs the same for five as for one. Full rule and numbers:
+of a FLAT search, which costs the same for five as for one, and an ISRC answer more
+than 10 s from it is declined as mis-tagged (`ytdl.isrc_length_mismatch`). Full rule and numbers:
 ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
@@ -171,11 +172,25 @@ with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 **Music search answers a search every term missed.** It is not a rung of
 `_search_terms`: once the ladder is exhausted, `yt_source` asks it once, for a search
 only, because a signed-out `ytsearch` whose top results hold age-restricted content
-comes back EMPTY with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url`
-asks music.youtube.com flat, filters to `ie_key` `Youtube` with an 11-character id,
-gates on relevance (and on length for a Spotify ask), and hands back a watch URL that
-resolves processed. Why each of those, and what it costs:
-ARCHITECTURE.md#the-music-search-fallback.
+comes back EMPTY with nothing in what yt-dlp returns to say so — or answers with an
+age-restricted top hit that fails the processed search, which the worker classifies
+(`ExtractionError.age_restricted`) and the ladder counts as that term's miss, the
+restricted id excluded from the music pick. The flat path cannot see the gate, so
+`rescue_age_restricted` re-answers a typed search where its stream fails. `_ytmusic_candidate_url`
+sends one music search POST through `ExtractRequest(music_search=True)`: the worker issues
+yt-dlp's own request (`_music_search`, two private yt-dlp methods) and parses the answer
+itself (`_music_search_entries`), because yt-dlp's parser keeps only a row's title and
+drops the top-result card. `_music_pick` takes the card first, then the rows, and
+`_music_candidate_matches` gates each on the ask's artist words (the whole name of an
+act the answer credits; the candidate must be credited to it, not merely name it in its
+title), its song words (tokenized script-aware: NFKC, case-folded, CJK/Thai as character
+pairs) and, for a Spotify ask, its length. An ask naming no artist needs the pick backed
+by music search itself (the top card, the card's artist, or a matching length). The winner's watch URL resolves
+processed. The parser is pinned by recorded responses in `tests/data/ytmusic_search.json`
+— re-record them (and re-read `_music_search_entries`) when a yt-dlp bump or a YouTube
+change moves the renderer shapes. Why each of those, and what it costs:
+ARCHITECTURE.md#the-music-search-fallback, #an-age-restricted-top-hit,
+#reading-music-search, #the-relevance-gate.
 
 ## Concurrency primitives
 

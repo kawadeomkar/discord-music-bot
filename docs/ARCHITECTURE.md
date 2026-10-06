@@ -19,6 +19,9 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
    - [The music search fallback](#the-music-search-fallback)
+     - [An age-restricted top hit](#an-age-restricted-top-hit)
+     - [Reading music search](#reading-music-search)
+     - [The relevance gate](#the-relevance-gate)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
@@ -292,7 +295,7 @@ graph TD
 | `SpotifySource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; every live item is a `QueueObject`, resolved or not ([one queue item](#one-queue-item)) |
-| `SongQueueEntry` | `guild_state.py` | The at-rest queue entry (`"qobj"`), one shape for every item. It carries `search`, the term an unresolved item resolves through — `ytsearch` on the wire only when non-empty, so a resolved entry's bytes are unchanged — and `GuildQueue._rehydrate` restores such an item unresolved. It also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by, the ask-time analytics `queued_at` / `queue_position` (the item's own two fields, flat on the wire too), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. `GuildQueue._rehydrate` makes a user of `requester_id` at restore — this guild's member, else the bot's user cache (a member who left keeps their plays), else the caller's fallback requester, else `guild.owner`, else the entry is dropped |
+| `SongQueueEntry` | `guild_state.py` | The at-rest queue entry (`"qobj"`), one shape for every item. It carries `search`, the term an unresolved item resolves through — `ytsearch` on the wire only when non-empty, so a resolved entry's bytes are unchanged — and `GuildQueue._rehydrate` restores such an item unresolved. A resolved Spotify item's `resolved_from` (the search it came from) rides flat as `resolved_term` / `resolved_isrc` / `resolved_secs`, likewise only when set. It also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by, the ask-time analytics `queued_at` / `queue_position` (the item's own two fields, flat on the wire too), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. `GuildQueue._rehydrate` makes a user of `requester_id` at restore — this guild's member, else the bot's user cache (a member who left keeps their plays), else the caller's fallback requester, else `guild.owner`, else the entry is dropped |
 | `GuildStateData` / `NowPlayingData` / `GuildPlaybackSnapshot` | `guild_state.py` | Typed snapshots of the state hash, now-playing hash, and the full restore read |
 | `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `channel_id`, `queued_at`, `queue_position`, `query_source`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
 | `GuildRedisStore` | `redis_client.py` | Per-guild Redis operations namespace |
@@ -772,6 +775,18 @@ Where the ISRC comes from, and where it does not:
 - Anything malformed is refused by `_ISRC_RE` rather than searched, because a code that is
   not one finds nothing and costs a round trip.
 
+**An ISRC answer at the wrong length is declined.** The ISRC names one recording, so an
+upload more than `_MUSIC_DURATION_TOLERANCE_SECS` (10 s) from Spotify's length is
+mis-tagged, and `yt_source` moves on to the title term, setting
+`ytdl.isrc_length_mismatch`. Measured 2026-10-06: `ytsearch:"INS172203702"` (Kesariya,
+268 s) answers with the art track or, in 1 of 8 calls, a 176 s clip a compilation
+channel tagged with the same code. The title term is not held to the length: it is the
+ladder's last word, and its processed single result is what the ask always got. The
+declined answer stays cached under the ISRC's key, so a repeat pays one Redis GET to
+decline it again. Widening the flat ISRC search to three results and picking by length
+was not done: it renames every Spotify track's first cache key, and the processed path
+cannot widen at all.
+
 The length Spotify reports is the second half of the rule: `select_search_entry` prefers
 the entry closest to it, with everything inside `_DURATION_TIE_SECS` of the best treated
 as a tie and settled by YouTube's own ranking. That widening rides the FLAT path only. One
@@ -779,6 +794,27 @@ search POST costs the same for one result as for five (0.51 s measured, either w
 a processed search extracts every entry it answers with — 3.69 s for three against 1.22 s
 for one, and three times the player requests, which is not a cost worth paying at the
 dequeue resolve for a re-upload instead of a music video.
+
+**A songs-filtered music search as a rung after the ISRC was measured and not built.**
+Music search's songs section prints each row's artist and length in one POST (0.50 s
+median, the same as the widened title search's 0.52 s), so it could pick by artist and
+Spotify's length before any resolve. What it could add depends on how often the ISRC rung
+misses, so that was measured first, on 2026-10-06, over 118 tracks — the first eight of 12
+albums across genres and languages and of 3 user playlists (indie, Bollywood, J-pop):
+
+| | tracks |
+|---|---|
+| carried an ISRC | 118 / 118 |
+| ISRC search answered | 111 (94 %) |
+| … within `_MUSIC_DURATION_TOLERANCE_SECS` of Spotify's length | 110 |
+| today's ladder (ISRC, else the length-matched title search) within tolerance | 116 (98 %) |
+| ISRC missed, songs search would have picked within tolerance | 7 / 7 |
+| outcome a songs rung would change | 1 (a 174 s upload against Spotify's 187 s) |
+
+One rung for one track in 118, paid by every miss: not built. The other miss of the two
+is an ISRC hit at the wrong length (a 176 s upload for a 268 s recording), which the
+ISRC length check above now declines in favour of the title term. Script and per-track data: `docs/ytm_research/isrc_measure.py`,
+`isrc.json`.
 
 ### The music search fallback
 
@@ -803,58 +839,52 @@ would mean patching a private yt-dlp method inside the pool worker, against a lo
 string. So the bot cannot tell the two apart, and `-play` answered both with "Couldn't
 find anything playable for that." for a song that exists and plays.
 
-`music.youtube.com` is not subject to it, and yt-dlp reaches it natively through
-`youtube:music:search_url`. So once every term `_search_terms` returned has missed,
-`yt_source` makes one more ask, outside the ladder and only for a search:
-`_ytmusic_candidate_url` asks music search for the same query and hands back the watch
-URL of the first track that passes the gates below, which then resolves through the
-ordinary LINK path — one round that fills both the source and stream caches. Measured:
-0.41–0.49 s for the flat music ask plus 1.06–1.13 s for the resolve, on a path that
-previously just failed.
+The wall is one of two ways a signed-out search fails on age; the other answers, and
+fails later ([An age-restricted top hit](#an-age-restricted-top-hit)). Music search
+answers both.
+
+`music.youtube.com` is not subject to it. So once every term `_search_terms` returned has
+missed, `yt_source` makes one more ask, outside the ladder and only for a search:
+`_ytmusic_candidate_url` asks music search for the same query — one InnerTube POST, read
+by the bot's own parser ([Reading music search](#reading-music-search)) — and hands back
+the watch URL of the first result that passes [the relevance gate](#the-relevance-gate),
+which then resolves through the ordinary LINK path — one round that fills both the source
+and stream caches. Measured: 0.39–0.56 s for the music ask plus 1.06–1.13 s for the
+resolve, on a path that previously just failed.
 
 Four properties are load-bearing:
 
-- **FLAT, always.** A processed extraction walks the whole result set, and the set
-  legitimately contains age-restricted tracks — with `ignoreerrors=False` one of them
-  raises for the entire search. Measured: the processed form dies on `rQvsCP38DJk` for
-  both orderings, including the one plain search answers fine.
-- **The entries are filtered by KIND and id length.** Music search interleaves album
-  (`MPREb_…`) and channel (`UC…`) pages with the tracks as `YoutubeTab` entries carrying
-  no title. They are not `_type` `"playlist"`, so `select_search_entry` would take one,
-  and queueing it plays nothing.
+- **One search POST, nothing extracted.** A processed extraction walks the whole result
+  set, and the set legitimately contains age-restricted tracks — with
+  `ignoreerrors=False` one of them raises for the entire search. Measured: the processed
+  form dies on `rQvsCP38DJk` for both orderings, including the one plain search answers
+  fine. The ask reads the search response and nothing else; only the one candidate is
+  extracted, through the link path.
+- **Only videos are candidates.** Music search interleaves album (`MPREb_…`), artist
+  (`UC…`) and playlist rows with the tracks. Queued, one of them plays nothing, so the
+  parser keeps rows carrying an 11-character `playlistItemData.videoId` (or, for the top
+  card, a `watchEndpoint`), and `_music_pick` filters on `ie_key` `Youtube` and the id's
+  length again.
 - **A LINK never reaches it.** It named one video; a second opinion from another
   corpus would play something the user did not ask for.
 - **The candidate has to be the ask.** Music search NEVER answers with nothing — asked
   for something with no matches it returns its loosest associations, so a candidate
   existing is no evidence the ask was found. Measured, before any gate existed:
   `zzzzqqqq no such song anywhere 98765` resolved to an unrelated devotional track and the
-  bot played it, which is worse than the failure being fixed. A first gate, one shared
-  word of three characters, still let that query through on a live title that contains
-  the word *song*. `_music_candidate_matches` now asks three things of a title:
-  - It shares **at least half** of the ask's identifying words — words of
-    `_MIN_MATCH_WORD` (3) characters or more that are not in `_MATCH_STOPWORDS` (`the`,
-    `you`, `song`, `official`…). Half rather than all because a music title carries no
-    artist: "XVI" answers `xvi akiaura`, "Just Your Doll" answers
-    `just your doll snow strippers`. Three characters because "xvi" is a real ask and a
-    two-letter word (`u2`) is shared by too much to mean anything.
-  - It is not a rendition the ask did not name: `_MATCH_VARIANT_WORDS` (`karaoke`,
-    `nightcore`, `live`, `remix`, `cover`…). Measured on 2026-10-06, music search ranked
-    "Snow Strippers - Just Your Doll (karaoke)" ahead of the original for that ask, and
-    the ranking moves between calls, so the gate cannot lean on order.
-  - A Spotify ask carries its own length, and music search's flat entries carry none, so
-    the candidate's duration is read once it has resolved (`_music_duration_fits`):
-    more than `_MUSIC_DURATION_TOLERANCE_SECS` (10 s) away and it is declined, setting
-    `ytdl.music_duration_mismatch`. The tolerance is a judgment rather than a
-    measurement: a re-upload lands within seconds, an edit or an extended cut well
-    outside it.
+  bot played it, which is worse than the failure being fixed. What the gate asks is
+  [its own section](#the-relevance-gate). A declined candidate leaves the ask with the
+  answer it already had, and sets `ytdl.music_no_match` on the span; an accepted one sets
+  `ytdl.music_pick_top` (it was the top-result card) and `ytdl.music_pick_type` (its
+  `musicVideoType`: `ATV`, `OMV`, `UGC`…). Every attempt sets `ytdl.music_fallback`;
+  `ytdl.search_kind` becomes `music` only when the candidate is the answer, so a declined
+  or failed attempt keeps the ladder's kind.
 
-  Live, against the queries that broke the first gate: `zzzzqqqq no such song anywhere
-  98765` and `the zzzqqq nonexistent track 999` are declined, and `just your doll snow
-  strippers` resolves to the official upload rather than the karaoke one. A declined
-  candidate leaves the ask with the answer it already had, and sets `ytdl.music_no_match`
-  on the span. Every attempt sets `ytdl.music_fallback`; `ytdl.search_kind` becomes
-  `music` only when the candidate is the answer, so a declined or failed attempt keeps
-  the ladder's kind.
+A Spotify ask carries its own length. A result whose length music search printed (the
+top card, every songs-section row) is skipped before the resolve when it runs more than
+`_MUSIC_DURATION_TOLERANCE_SECS` (10 s) from it, and the candidate's resolved duration is
+checked again afterwards (`_music_duration_fits`), which sets
+`ytdl.music_duration_mismatch` when it declines. The tolerance is a judgment rather than a
+measurement: a re-upload lands within seconds, an edit or an extended cut well outside it.
 
 The queued song keeps the ask's `user_input`, never the candidate's watch URL — that is
 the needle `-remove` matches, and nobody typed the watch URL.
@@ -877,11 +907,199 @@ The song music search found is cached twice: under the candidate's watch URL, by
 link path that resolves it, and under the ask's first term, by `yt_source`. The second is
 what a repeat reads first, so a repeat of a walled query is one Redis GET (~2 ms) rather
 than the walled search, the music ask and the candidate's hit (~0.85 s and two pool slots,
-measured, before this was cached). It is an ordinary `ytdl:source` entry: 24 h TTL, and
-past the freshness window it is revalidated behind the reply like any search — a
-revalidation that finds the search still walled writes nothing, so the entry stands until
-its TTL. A search that genuinely has no matches pays the flat music ask and then
-declines, on a path that was already failing; nothing is cached for it.
+measured, before this was cached). It is an ordinary `ytdl:source` entry with a 24 h TTL,
+marked `"via": "music"` (`_cache_music_answer`), and a marked entry is never revalidated:
+the refresh re-runs the ask's own search, which for an age-restricted top hit finds the
+very video that failed and would write it back over the answer. So the entry stands until
+its TTL. A search that genuinely has no matches pays the music ask and then declines, on a
+path that was already failing; nothing is cached for it.
+
+#### An age-restricted top hit
+
+The second failure is a search that answers, with an age-restricted video first. Measured
+on 2026-10-06: `yoru ni kakeru yoasobi` and `夜に駆ける` rank YOASOBI's music video
+`x8VYWazR5mE` first, and `coffin dance meme` ranked `Er57QHHiE_Q` first; the processed
+search failed with "Sign in to confirm your age" in 8 of the research's 9 attempts, while
+the flat search returned the same entry with a title and a length. yt-dlp raises the
+player's age reason (the request asks for `hl=en`), so the worker classifies it there:
+`_classify_ytdlp_error` sets `ExtractionError.age_restricted` when the message carries one
+of the reasons yt-dlp's own `_is_agegated` matches. It also unwraps a bare
+`ExtractorError`, which `_music_search` raises without `extract_info`'s `DownloadError`
+around it.
+
+**A full resolve (cold start, an interjection head, an item at dequeue).** `yt_source`
+treats an age-restricted failure of a SEARCH term as a miss of that term: the next term
+runs (an ISRC hit that is restricted falls through to the title), and an exhausted ladder
+asks music search with the restricted ids in `exclude` — music search ranks the same video
+first for `夜に駆ける`, and taking it would fail again. `ytdl.music_fallback_trigger` is
+`age_restricted` (else `nothing_found`). When music search declines, the ask fails with
+"That search's top result is age-restricted, and I couldn't find another upload of it."
+rather than yt-dlp's cookie advice. A LINK to a restricted video fails exactly as before:
+it named that video.
+
+**A flat resolve (`TAIL`/`NEXT`).** The flat search makes no player call, so nothing at
+enqueue can see the gate: the restricted entry queues, the card names it, and its stream
+extraction is the first thing to fail. The search response does differ — the restricted
+renderers lacked `inlinePlaybackEndpoint` where the others had one — but that is an
+undocumented UI field yt-dlp's flat entry does not carry, and reading it would mean
+replacing yt-dlp's `ytsearch` parser; declined. Instead `YTDL.rescue_age_restricted`
+runs where the stream fails, in two places:
+
+- `prefetch_stream`, the enqueue-time warm `queue_put` spawns. It returns the re-pointed
+  item, and `_warm_stream` swaps it into the queue's slot (`GuildQueue.replace_item`) —
+  seconds after the card, while the song is still waiting its turn.
+- `yt_stream`, for the loop's one-ahead prefetch and its play-time resolve. The YTDL is
+  built on the re-pointed item, so the Now Playing card, `-replay` and play history name
+  what plays.
+
+The rescue has to rebuild the ask. A typed search rebuilds from `user_input`, which
+`parse_input` reads back into the very term the ask was cached under. A Spotify track
+cannot — its `user_input` is the track's link, or its collection's — so every item a
+Spotify-shaped ask resolves to (`yt_source` given an ISRC or a length) carries
+`resolved_from`, a `SearchAsk` of the term, the ISRC and Spotify's length;
+`MusicPlayer._resolve_source` keeps it when it clears `search` and `isrc` at dequeue. It
+rides the queue list as `resolved_term` / `resolved_isrc` / `resolved_secs`, written only
+when set, so every other entry keeps its bytes and an entry from an older build reads
+back without one (and is rescued only if it was a typed search). It is +8 B per
+`QueueObject` (216 B). An item with neither — a link — is not rescued. The rescue
+excludes the restricted id and the item's own, asks music search with the ask's length
+(so the pick and the resolved candidate are held to it, as on the ask's own resolve),
+resolves the candidate through the link path (warming its stream), and overwrites the
+first source-cache key of both ladders the ask could have taken — the flat `TAIL`
+ladder's and the dequeue's, one key when an ISRC leads both — with the marked music
+answer. Live, a Spotify item pointed at the restricted `x8VYWazR5mE` (as a cached answer
+would leave it) played YOASOBI's art track in ~4.6 s with Redis absent, where it failed. The item keeps everything about the ask — `user_input` (`-remove`'s needle),
+`ts`, the requester and the analytics — and changes only its five display fields. When
+music search declines, the original failure stands and the song is skipped as before. The
+Redis queue list keeps the bytes it holds for the slot until its next rebuild, so a crash
+in between restores the restricted URL, and the rescue runs again at its turn.
+
+#### Reading music search
+
+yt-dlp reaches music search through `youtube:music:search_url`, and its parse of the
+answer is thin: `_music_reponsive_list_entry` (`yt_dlp/extractor/youtube/_tab.py`) keeps
+`flexColumns[0]` — the title — and drops the row's artist, length and `musicVideoType`,
+and `_extract_entries` has no branch for `musicCardShelfRenderer`, the **top-result
+card**, so the card is never an entry at all (upstream
+[#15389](https://github.com/yt-dlp/yt-dlp/issues/15389), open). Verified against the pinned
+nightly on 2026-10-06: for `minecraft sweden c418`, `yoru ni kakeru yoasobi` and
+`Radiohead - Weird Fishes/Arpeggi` the card held `5w3rRFWzjcM` (C418's "Sweden"),
+`by4SYYWlhEs` (YOASOBI's art track) and `LUjGtyYEi90`, and none of the three was among
+yt-dlp's entries. For the first, the title-only gate settled on a fan edit further down.
+
+So the worker sends the request yt-dlp would send and parses the response itself.
+`ExtractRequest(music_search=True)` routes `_ytdlp_extract` to `_music_search`, which
+issues exactly the first page of yt-dlp's own `_search_results` — `ie._extract_response(ep=
+"search", default_client="web_music")` on `YoutubeMusicSearchURLIE`, with
+`generate_api_headers` — so the client version, the headers, the retry loop, proxies and
+the socket timeout stay yt-dlp's. Only `_music_search_entries` is the bot's: a pure
+function over the response, tested against recorded answers
+(`tests/data/ytmusic_search.json`). It yields the card first, then the rows, each id once,
+as flat entries with four more fields — `artists` (the subtitle's artist segment as
+shown; an episode's show), `music_kind` (`song`, `video` or `episode`; a songs-section row carries no label
+and is a song), `music_video_type`, `music_top` — plus `duration` where the subtitle
+prints a clock (the card and every songs-section row; an unfiltered row prints plays or
+views instead) and the thumbnail. The request runs in the pool like every other search,
+under the same `"music"` single-flight key and the caller's pool slot, and its parse
+crosses the process boundary as plain dicts.
+
+Two private yt-dlp methods are on this path, `_extract_response` and
+`generate_api_headers`; both are what yt-dlp's own search extractors call, and the first
+is what the previous `youtube:music:search_url` route already depended on. The response
+shape is the maintenance cost: a renamed renderer makes the parser yield nothing, which
+the fallback answers like any declined candidate — the ask keeps the miss it already had —
+and the recorded-response tests fail on the next bump. Measured through the real pool:
+0.39–0.56 s per ask, the same as the yt-dlp route it replaced.
+
+Weighed and declined:
+
+- **A raw InnerTube client on the bot's own aiohttp session**, outside the pool. Same
+  0.48 s and no worker held, but the `WEB_REMIX` client version, headers and retries would
+  be the bot's to keep current, where yt-dlp already moves them for every YouTube change.
+- **`ytmusicapi`** as a dependency. It parses the same response the same way, so it moves
+  the maintenance rather than removing it, and it is synchronous `requests`: it would sit
+  in a pool worker anyway, beside a second HTTP stack, a new pin pair and a shared-env
+  install.
+- **Staying on yt-dlp's parser.** No artist, so the gate could not tell "Not Like Us" by
+  Kendrick Lamar from a street clip that names him; and no top card.
+
+#### The relevance gate
+
+`_music_pick` walks the candidates, card first, and takes the first one
+`_music_candidate_matches` accepts. Everything is compared as tokens (`_match_tokens`):
+NFKC-normalised and case-folded, split at anything that is not a letter, combining mark or
+digit — by Unicode category, because the regex word class splits a Devanagari word at its
+vowel signs. A run of a script written without spaces (Han, kana, Thai, Lao, Khmer,
+Myanmar) becomes its character pairs, so `夜に駆ける` is `{夜に, に駆, 駆け, ける}`; any
+other run is one token, kept at `_MIN_MATCH_WORD` (3) characters for Latin letters and
+digits — "xvi" is a real ask, and a two-letter word (`u2`) is shared by too much to mean
+anything — and `_MIN_MATCH_WORD_OTHER` (2) in any other script, where `좋은` or a
+two-letter Cyrillic word carries more. `_MATCH_STOPWORDS` (`the`, `you`, `song`,
+`official`…) drop out of both sides.
+
+The ask's tokens split in two. **Artist words** are the tokens of an act the answer
+credits whose WHOLE name is in the ask — `_music_pick` splits every candidate's credit at
+`,`, `&`, `/`, `feat.` and ` x ` (`_CREDIT_SPLIT_RE`), so `akiaura` is named by
+`xvi akiaura` out of "akiaura, LONOWN & DJ Pointless". Whole names, because a songs answer
+for `how to tie a tie` credits an act called "tie a tie", and one shared word would have
+made "tie" an artist word. The rest are the **song words**. A podcast episode's subtitle
+leads with its date, so its credit is the show after it ("Lex Fridman Podcast"). A
+candidate:
+
+- **is credited to one of the artist words**, in its artist column — not its title, where
+  a re-upload ("Radiohead - Weird Fishes [OFFICIAL VIDEO]" by avalanchealonso) or a fan mix
+  names the act it is not. So a cover by another act is a rendition: `yoru ni kakeru
+  yoasobi` declines "Yoru ni Kakeru 「夜に駆ける」" by MyReminiscence;
+- **carries the song words in its title** — two thirds of them when the ask named an
+  artist, half when the candidate is also **corroborated**, and all of them, corroborated,
+  when the ask named none. Corroborated means music search backs the candidate itself:
+  it is the top-result card, it is credited to the card's artist (read before `exclude`,
+  since a restricted card still says whose song the ask is), or its printed length
+  matches the one a Spotify ask knows. Without the artist column a title could never
+  carry an ask's artist half, so "Not Like Us" failed `Kendrick Lamar - Not Like Us` on
+  one word of three and a street clip naming him won;
+- **is no rendition the ask did not name, and the rendition it did name**:
+  `_MATCH_VARIANT_WORDS` (`karaoke`, `nightcore`, `live`, `remix`, `cover`, `reacts`…) has
+  to be the same set on both sides. Measured on 2026-10-06, music search ranked "Snow
+  Strippers - Just Your Doll (karaoke)" ahead of the original, and the ranking moves
+  between calls, so the gate cannot lean on order;
+- **or, corroborated and by the ask's artist, has a title in a script the ask's song words
+  are not written in.** `yoru ni kakeru yoasobi` cannot share a token with "夜に駆ける";
+  YOASOBI's own top card can still be the answer.
+
+**An ask that names no artist needs music search to back the pick**, because its words
+alone are no evidence: every word of `how to tie a tie` is in "How To Tie A Tie", an art
+track by Stellar Core, and the gate cannot know the ask is not a song. Music search
+returns no card for it, and nothing it ranks is by a card's artist, so it declines. A
+title-only song ask keeps its answer through the card: `bohemian rhapsody`'s card is a
+live cut the ask did not name, and the studio track below it is by the card's artist.
+The kind and `musicVideoType` music search reports were weighed for this and do not
+separate the two: the tutorial's namesake is an `ATV` song, and the right answer to
+`lex fridman podcast elon musk` is an `episode`.
+
+**Transliteration was weighed and not built.** Matching a romanised ask against a native
+title (or Arabic against Latin) needs a romaniser per script, and the ones tried on
+2026-10-06 are unsound where it matters: `unidecode` reads kanji as Chinese pinyin
+("夜に駆ける" → "Ye niQu keru") and drops Arabic's unwritten vowels ("تملي معاك" →
+"tmly m`k", against the credited "Tamally Maak"); the dictionary-backed `pykakasi` gives
+"yoru ni kake ru", which still misses the ask's "kakeru" token, and is a new dependency. The
+corroborated-card exception above already covers the case that comes up — the act's own
+card — so an Arabic or Thai ask whose answer is credited and titled in Latin declines.
+
+Over the research's 46-query set — music search's answers recorded on 2026-10-06 and
+replayed through both gates (`docs/ytm_research/gate_eval.py`) — against the title-only
+gate: `Kendrick Lamar - Not Like Us`, `kesariya arijit singh`,
+`Radiohead - Weird Fishes/Arpeggi`, `yoru ni kakeru yoasobi`, `夜に駆ける`,
+`кино группа крови` and `minecraft sweden c418` now take the artist's own recording where
+they took a lyric upload, a re-upload, a fan sub, a fan edit or nothing; `joe rogan
+experience 2000`, `hbomberguy plagiarism and you`, `kurzgesagt black holes`,
+`how to tie a tie`, `among us drip theme`, `markiplier fnaf 1` and `coffin dance meme`
+now decline where they took a rap song, a reaction, another band's song, a namesake song,
+fan remixes or a cover; every nonsense ask still declines. What the stricter rules give
+up, on this set: `blinding lights remix`, `rain sounds 10 hours`, `ocarina of time full
+soundtrack`, `tame impala let it happen live`, `hotel california live 1977` and
+`creep cover postmodern jukebox` now decline where they took an acceptable upload — all
+asks a working `ytsearch` answers, and this path runs only when it does not.
 
 #### What the fallback costs
 
@@ -898,10 +1116,19 @@ ask 0.41–0.49 s (one outlier at 0.83 s), the candidate's resolve 1.06–1.13 s
   a burst of failing searches holds them for the music asks too; on the flat path that
   is what the dropped re-search already cost.
 - **A walled `TAIL` enqueue** answers in ~1.8–2.1 s, not the ~0.6 s flat budget: the
-  candidate resolves processed, because music search's flat entries carry only `id`,
-  `title` and `url` — no duration, uploader or thumbnail — and the flat path refuses an
-  entry without a duration. A walled song is one that previously did not queue at all,
-  and its repeats are a source-cache hit.
+  candidate resolves processed. An unfiltered row prints plays or views where a length
+  would be, and the flat path refuses an entry without a duration; the resolve is also
+  what proves the candidate plays before it is cached under the ask. A walled song is one
+  that previously did not queue at all, and its repeats are a source-cache hit.
+- **An age-restricted top hit, full path** answers in ~3.1–3.4 s (measured, 2026-10-06):
+  the failing processed search (~1.6 s, its player call included), the music ask and the
+  candidate's resolve — where it used to fail in ~1.6 s.
+- **An age-restricted top hit, flat path** still acknowledges at flat speed (~0.4–0.5 s):
+  the card names the restricted video. The enqueue warm then pays its failed stream
+  extraction (~1.2 s), the music ask and the candidate's resolve (~1.7 s) behind the card,
+  so the slot is corrected a few seconds later. Reached at play time instead (the warm
+  bound was full, or the item was restored), the same ~3 s is added before the song
+  starts — once per ask per day, since the music answer is then cached under the ask.
 - **At dequeue**, an unresolved collection item whose ISRC and title terms both miss
   pays up to four extractions — both terms, the music ask, and a candidate declined on
   length — ~2.0–2.6 s at worst, inside `_IN_BAND_RESOLVE_TIMEOUT_SECS` (300 s) with two
@@ -1462,7 +1689,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 |---|---|---|---|
 | `guild:{id}:state` | Hash | 22 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song` (the parked `SongQueueEntry` whole — [The parked song](#the-parked-song)) beside the thirteen prefixed copies an older build reads, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_user_input/_played_at`, then `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`, and `ytsearch` only while the item has not resolved). An entry whose `"type"` is not `"qobj"`, or missing `webpage_url`, `title` or `requester_id`, is dropped as corrupt. RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`, `ytsearch` only while the item has not resolved, and `resolved_term` / `resolved_isrc` / `resolved_secs` only on a resolved Spotify item — the search it came from, for [the age rescue](#an-age-restricted-top-hit)). An entry whose `"type"` is not `"qobj"`, or missing `webpage_url`, `title` or `requester_id`, is dropped as corrupt. RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
 | `bot:{application_id}:config` | Hash | One field per `-settings bot` knob, named as its env var in lower case (`Knob.field`); absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
 | `guild:{id}:config` | Hash | 8 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |

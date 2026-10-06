@@ -2091,6 +2091,9 @@ class MusicPlayer:
             thumbnail=resolved.thumbnail,
             search="",
             isrc=None,
+            # The term and recording it cleared, kept for a re-ask should the
+            # video it resolved to fail its age check at stream time.
+            resolved_from=resolved.resolved_from,
         )
 
     def _channel_bitrate(self) -> Optional[int]:
