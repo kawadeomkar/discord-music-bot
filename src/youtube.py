@@ -2245,7 +2245,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
         `isrc` and `expected_duration` are what a Spotify track knows about itself,
         and they decide WHICH term resolves: see _search_terms. Each term caches
-        under its own key, so a fallback is spent once per track per TTL.
+        under its own key, so a fallback is spent once per track per TTL; a song
+        only music search found is cached under the first term too.
         """
         terms = _search_terms(
             search, isrc=isrc, expected_duration=expected_duration, flat=flat
@@ -2294,7 +2295,26 @@ class YTDL(discord.FFmpegOpusAudio):
                     )
                     # Never flat: the candidate is a link now, and the link path is
                     # what fills both caches from one round.
-                    return await resolve(watch_url, flat=False)
+                    found = await resolve(watch_url, flat=False)
+                    # Under the term the next ask reads first, or every repeat
+                    # re-asks the walled search and music search before reaching
+                    # the watch URL's own entry.
+                    if redis is not None:
+                        await cache_set(
+                            redis,
+                            _source_cache_key(terms[0][1]),
+                            _source_cache_value(
+                                SourceIdentity(
+                                    webpage_url=found.webpage_url,
+                                    title=found.title,
+                                    duration=found.duration,
+                                    uploader=found.uploader,
+                                    thumbnail=found.thumbnail,
+                                )
+                            ),
+                            _YT_SOURCE_TTL,
+                        )
+                    return found
             except Exception as e:
                 # BOTH legs are best-effort: the ask keeps the answer it earned. Each
                 # leg has its own way of replacing it — a candidate raises yt-dlp's

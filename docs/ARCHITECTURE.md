@@ -842,10 +842,15 @@ PO tokens do not help: they buy format access, not age verification. The officia
 API's `safeSearch=none` does not filter results, but `search.list` costs 100 of a
 10,000-unit daily quota, so ~100 searches a day.
 
-A repeat of a walled query re-walks the ladder: the identity is cached under the
-candidate's watch URL, not under the search term, so only the resolve is a hit. A search
-that genuinely has no matches pays the flat music ask (~0.8 s measured) and then declines,
-on a path that was already failing.
+The song music search found is cached twice: under the candidate's watch URL, by the
+link path that resolves it, and under the ask's first term, by `yt_source`. The second is
+what a repeat reads first, so a repeat of a walled query is one Redis GET (~2 ms) rather
+than the walled search, the music ask and the candidate's hit (~0.85 s and two pool slots,
+measured, before this was cached). It is an ordinary `ytdl:source` entry: 24 h TTL, and
+past the freshness window it is revalidated behind the reply like any search — a
+revalidation that finds the search still walled writes nothing, so the entry stands until
+its TTL. A search that genuinely has no matches pays the flat music ask (~0.8 s measured)
+and then declines, on a path that was already failing; nothing is cached for it.
 
 ---
 

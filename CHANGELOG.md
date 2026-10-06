@@ -35,14 +35,14 @@ plays the first track it names.
 - **Only a search that found NOTHING reaches it**, so no search that works today changes
   its answer. A link never reaches it at all.
 - **It costs about 1.7 seconds**, and only on a request that previously failed outright.
-  A repeat of the same wording pays it again — the result is remembered against the track
-  it found, not against the words you typed.
+  The answer is remembered against the words you typed for a day, so a repeat of the same
+  wording starts as fast as any other cached search.
 - **A search that genuinely has no matches still says so**, with the same wording as
   before, about 0.8 seconds later than it used to. YouTube Music always offers *something*,
   so a track is only accepted when it shares a word with what you asked for — a typo gets
   the same "couldn't find anything" it always got, not a stranger's song.
-- **Roll back freely**, to any 2.55.x. Nothing here changes what is written to Redis or
-  Postgres.
+- **Roll back freely**, to any 2.55.x. The one thing written to Redis is an ordinary
+  day-long search cache entry, which any 2.55.x reads as it reads its own.
 
 ## 2.55.3 — 2026-10-02
 

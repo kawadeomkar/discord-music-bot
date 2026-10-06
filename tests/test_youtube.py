@@ -1536,28 +1536,113 @@ class TestMusicSearchFallback:
         "duration": 244,
     }
     # The shape music search answers with: album and channel pages interleaved with
-    # the tracks, carrying no title and an id that is not 11 characters.
+    # the tracks, ahead of them.
     _MUSIC_RESULT = {
         "entries": [
             {"ie_key": "YoutubeTab", "id": "MPREb_2Kryrn9iVK0", "title": None},
             {"ie_key": "YoutubeTab", "id": "UCTuxLS8YPPDUn8xtwItOt_g", "title": None},
-            # Eleven characters, so length alone would admit it. The kind is what
-            # rules it out, and this is the entry that says so.
-            {"ie_key": "YoutubeTab", "id": "OLAK5uy_abc", "title": None},
-            # Right kind, wrong id. The length check is what rejects it, and the
-            # url it would build — watch?v=short — resolves to nothing.
-            {"ie_key": "Youtube", "id": "short", "title": "truncated id"},
+            # A titled album page with an eleven-character id: the relevance gate
+            # and the length check both admit it, so the kind is the only thing
+            # that rejects it. Music search titles album results like this.
+            {"ie_key": "YoutubeTab", "id": "OLAK5uy_abc", "title": "XVI"},
+            # Right kind and a matching title, wrong id: only the length check
+            # rejects it, and watch?v=short resolves to nothing.
+            {"ie_key": "Youtube", "id": "short", "title": "XVI akiaura"},
             {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
             {"ie_key": "Youtube", "id": "UH8OV1D091Q", "title": "also playable"},
         ]
     }
 
-    def _extract(self, answers: dict[str, Any], asked: list[str]) -> Any:
-        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+    def _extract(
+        self,
+        answers: dict[str, Any],
+        asked: list[str],
+        requests: Optional[list[tuple[str, Any]]] = None,
+    ) -> Any:
+        """The extraction double: answers by search string, records what was asked,
+        and, given `requests`, the single-flight key and request of every call."""
+
+        async def extract(key: Any, request: Any, search: str, **_kw: Any) -> Any:
             asked.append(search)
+            if requests is not None:
+                requests.append((key, request))
             return answers.get(search)
 
         return extract
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["dequeue", "fast-ack"])
+    async def test_the_music_ask_is_flat_and_the_candidate_is_not(
+        self, mock_ctx: MagicMock, flat: bool
+    ) -> None:
+        """FLAT is what keeps one age-restricted track in the result set from
+        raising for the whole search; the candidate is a link and resolves
+        processed. Both hold from the fast-ack shape (flat=True) too."""
+        asked: list[str] = []
+        requests: list[tuple[str, Any]] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract(answers, asked, requests),
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                flat=flat,
+            )
+
+        assert result.title == "XVI"
+        music = [(k, r) for k, r in requests if r.url == self._MUSIC_URL]
+        assert len(music) == 1
+        key, request = music[0]
+        assert request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+        assert key.endswith("|music")
+        candidate = [r for _k, r in requests if "kSAEcjWWuew" in r.url]
+        assert len(candidate) == 1
+        assert candidate[0].opts is youtube._YTDL_STREAM_SEARCH_OPTS
+
+    async def test_a_song_music_search_found_is_cached_under_the_ask(
+        self, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        """The candidate's own entry is keyed by its watch URL, which a repeat of
+        the same ask never reads: without this every repeat pays the walled
+        search and music search again, for exactly the songs people replay."""
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            first = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                redis=fake_redis,
+            )
+            asked.clear()
+            again = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                redis=fake_redis,
+            )
+
+        assert asked == []
+        assert again.webpage_url == first.webpage_url
+        assert again.title == "XVI"
+        ttl = await fake_redis.ttl(youtube._source_cache_key("ytsearch:xvi akiaura"))
+        assert 0 < ttl <= youtube._YT_SOURCE_TTL
 
     async def test_an_exhausted_ladder_resolves_what_music_search_found(
         self, mock_ctx: MagicMock
