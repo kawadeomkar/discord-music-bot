@@ -39,8 +39,10 @@ plays the first track it names.
   wording starts as fast as any other cached search.
 - **A search that genuinely has no matches still says so**, with the same wording as
   before, about 0.8 seconds later than it used to. YouTube Music always offers *something*,
-  so a track is only accepted when it shares a word with what you asked for — a typo gets
-  the same "couldn't find anything" it always got, not a stranger's song.
+  so a track is only accepted when its title carries at least half of the meaningful words
+  you asked for, is not a karaoke, nightcore, live or similar version you did not ask
+  for, and — for a Spotify link — runs within ten seconds of the length Spotify gives. A
+  typo gets the same "couldn't find anything" it always got, not a stranger's song.
 - **Roll back freely**, to any 2.55.x. The one thing written to Redis is an ordinary
   day-long search cache entry, which any 2.55.x reads as it reads its own.
 

@@ -1477,11 +1477,33 @@ _SEARCH_KIND_MUSIC: Final[str] = "music"
 # (`UC…`) ids beside the tracks, and length is what separates them.
 _VIDEO_ID_LEN: Final[int] = 11
 
-# Shortest query word that can carry a match. Music search NEVER answers with
-# nothing, so a candidate existing is no evidence the ask was found; one shared word
-# is. Three, because "xvi" is a real ask.
+# Shortest query word that can carry a match. Three, because "xvi" is a real ask
+# and a two-letter word ("u2") is shared by too much to mean anything.
 _MIN_MATCH_WORD: Final[int] = 3
 _WORD_RE = re.compile(r"[a-z0-9]+")
+# Words that carry no identity, so sharing one is no evidence: a stranger's title
+# matched "song", "the" or "you" in a nonsense query. Kept out of both sides.
+_MATCH_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "the", "and", "you", "your", "for", "with", "from", "that", "this", "are",
+        "not", "does", "was", "but", "all", "out", "now", "into", "about", "what",
+        "song", "songs", "track", "music", "official", "video", "audio", "lyrics",
+        "lyric", "feat", "version", "full", "hd", "new",
+    }
+)  # fmt: skip
+# Renditions of a song that are not the song. Music search can rank one first —
+# measured, a karaoke upload ahead of the original — so a title carrying one is
+# passed over unless the ask names it too.
+_MATCH_VARIANT_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "karaoke", "nightcore", "instrumental", "cover", "remix", "slowed", "sped",
+        "reverb", "8d", "live", "acapella", "acoustic", "piano", "tutorial", "reaction",
+    }
+)  # fmt: skip
+# How far a candidate may run from the length the ask already knows (Spotify's)
+# and still be that recording. A judgment, not a measurement: re-encodes and
+# re-uploads land within seconds, and an edit or extended cut lands well outside.
+_MUSIC_DURATION_TOLERANCE_SECS: Final[int] = 10
 
 # How many results a length gets to choose between. One search POST costs the same
 # for one result as for five (0.51 s either way), but a PROCESSED search extracts
@@ -1527,19 +1549,42 @@ def _search_terms(
     return terms
 
 
+def _match_words(text: str) -> set[str]:
+    """The words of `text` that can carry a match: long enough, and not stopwords."""
+    return {
+        word
+        for word in _WORD_RE.findall(text.lower())
+        if len(word) >= _MIN_MATCH_WORD and word not in _MATCH_STOPWORDS
+    }
+
+
 def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
     """Whether a music-search title is plausibly an answer to `query`.
 
     Asked for something with no matches, music search returns its loosest
-    associations rather than an empty result — measured, a typo'd query answered with
-    an unrelated devotional track. So the candidate has to earn its place: one shared
-    word of `_MIN_MATCH_WORD` characters is what separates "XVI" for `xvi akiaura`
-    from that. Rejecting leaves the ask with the answer it already had.
+    associations rather than an empty result, so a candidate existing is no evidence.
+    It has to share at least half the ask's identifying words — "XVI" for
+    `xvi akiaura` does, a stranger matching one word of a long nonsense query does
+    not — and must not be a rendition (karaoke, a live set) the ask did not name.
+    Titles carry no artist, so half rather than all. Rejecting leaves the ask with
+    the answer it already had. See docs/ARCHITECTURE.md#the-music-search-fallback.
     """
-    wanted = {w for w in _WORD_RE.findall(query.lower()) if len(w) >= _MIN_MATCH_WORD}
+    wanted = _match_words(query)
     if not wanted:
         return False
-    return bool(wanted & set(_WORD_RE.findall((title or "").lower())))
+    words = set(_WORD_RE.findall((title or "").lower()))
+    if (words & _MATCH_VARIANT_WORDS) - set(_WORD_RE.findall(query.lower())):
+        return False
+    shared = wanted & words
+    return bool(shared) and 2 * len(shared) >= len(wanted)
+
+
+def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bool:
+    """Whether a resolved candidate's length is the recording the ask knows. Music
+    search's flat entries carry no duration, so this is read after the resolve."""
+    if expected is None or duration is None:
+        return True
+    return abs(int(duration) - expected) <= _MUSIC_DURATION_TOLERANCE_SECS
 
 
 async def _ytmusic_candidate_url(
@@ -2296,25 +2341,35 @@ class YTDL(discord.FFmpegOpusAudio):
                     # Never flat: the candidate is a link now, and the link path is
                     # what fills both caches from one round.
                     found = await resolve(watch_url, flat=False)
-                    # Under the term the next ask reads first, or every repeat
-                    # re-asks the walled search and music search before reaching
-                    # the watch URL's own entry.
-                    if redis is not None:
-                        await cache_set(
-                            redis,
-                            _source_cache_key(terms[0][1]),
-                            _source_cache_value(
-                                SourceIdentity(
-                                    webpage_url=found.webpage_url,
-                                    title=found.title,
-                                    duration=found.duration,
-                                    uploader=found.uploader,
-                                    thumbnail=found.thumbnail,
-                                )
-                            ),
-                            _YT_SOURCE_TTL,
-                        )
-                    return found
+                    if _music_duration_fits(found.duration, expected_duration):
+                        # Under the term the next ask reads first, or every repeat
+                        # re-asks the walled search and music search before reaching
+                        # the watch URL's own entry.
+                        if redis is not None:
+                            await cache_set(
+                                redis,
+                                _source_cache_key(terms[0][1]),
+                                _source_cache_value(
+                                    SourceIdentity(
+                                        webpage_url=found.webpage_url,
+                                        title=found.title,
+                                        duration=found.duration,
+                                        uploader=found.uploader,
+                                        thumbnail=found.thumbnail,
+                                    )
+                                ),
+                                _YT_SOURCE_TTL,
+                            )
+                        return found
+                    # A Spotify ask knows its length, and music search's pick ran
+                    # too far from it to be that recording: declined like any miss.
+                    trace.get_current_span().set_attribute(
+                        "ytdl.music_duration_mismatch", True
+                    )
+                    log.info(
+                        f"music search's candidate {watch_url} for {search!r} runs "
+                        f"{found.duration}s against {expected_duration}s; declined"
+                    )
             except Exception as e:
                 # BOTH legs are best-effort: the ask keeps the answer it earned. Each
                 # leg has its own way of replacing it — a candidate raises yt-dlp's

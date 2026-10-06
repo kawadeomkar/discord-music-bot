@@ -1706,27 +1706,71 @@ class TestMusicSearchFallback:
             ("xvi akiaura", "XVI", True),
             ("xvi drake", "Reflections - Drake's Head", True),
             ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", True),
-            # The measured regression: music search answered a typo with an
-            # unrelated devotional track, and the bot played it.
+            # Live, 2026-10-06: the original is titled without its artist.
+            ("just your doll snow strippers", "Just Your Doll", True),
+            # Every title below is one music search really answered these with.
+            # The old one-shared-word gate took the first three: "song", "favorite"
+            # adjacent, and "999".
             (
                 "zzzzqqqq no such song anywhere 98765",
-                "Sis Chinyere Udoma Jesus Bu Uzo Official Video",
+                "Listen from https://audiomack.com/ugobueze/song/ijere-mmanwu",
                 False,
             ),
+            (
+                "my favourite song that does not exist",
+                "This Is Not The Song I Wrote (feat. Joey Dosik & Jacob Jeffries)",
+                False,
+            ),
+            ("the zzzqqq nonexistent track 999", "999 (feat. K9rdz21)", False),
+            # Three of four words shared, and every one of them a stopword: counted,
+            # they would carry the half on their own.
+            ("you and the night", "You And The Song", False),
+            ("zzzzqqqq no such song anywhere 98765", "Nursery Songs ", False),
             ("u2", "Beautiful Day", False),  # no word long enough to carry a match
             # What the floor is FOR: a two-letter word is shared by too much to
             # mean anything, and matching on it plays the wrong artist entirely.
             ("u2 akiaura", "U2 - With Or Without You", False),
             ("xvi akiaura", None, False),  # an album page, were one to get this far
+            # Renditions the ask did not name: music search ranked these first.
+            (
+                "just your doll snow strippers",
+                "Snow Strippers  - Just Your Doll (karaoke)",
+                False,
+            ),
+            (
+                "just your doll snow strippers",
+                "NIGHTCORE - Snow Strippers - Just Your Doll",
+                False,
+            ),
+            (
+                "just your doll snow strippers",
+                "Snow Strippers - Live at Washington D.C [FULL SET | 1/8/26]",
+                False,
+            ),
+            # ...and one the ask did name.
+            (
+                "just your doll karaoke",
+                "Snow Strippers - Just Your Doll (karaoke)",
+                True,
+            ),
         ],
         ids=[
             "short-word",
             "across-punctuation",
             "prefixed",
-            "unrelated",
+            "title-without-artist",
+            "stopword-in-a-url",
+            "stopwords-only",
+            "one-of-three",
+            "only-stopwords-shared",
+            "plural-of-a-stopword",
             "no-usable-word",
             "short-word-is-not-a-match",
             "titleless",
+            "karaoke",
+            "nightcore",
+            "live-set",
+            "rendition-asked-for",
         ],
     )
     def test_a_candidate_has_to_share_a_word_with_the_ask(
@@ -1740,28 +1784,81 @@ class TestMusicSearchFallback:
         """Music search never answers with nothing, so "a candidate exists" cannot be
         the test — the ask keeps the answer it earned instead of playing a stranger."""
         asked: list[str] = []
+        # The title music search really answered this nonsense with. It shares
+        # "song" with the ask, which the one-shared-word gate accepted.
         unrelated = {
             "entries": [
-                {"ie_key": "Youtube", "id": "NHmXV8GXN4a", "title": "Jesus Bu Uzo"}
+                {
+                    "ie_key": "Youtube",
+                    "id": "NHmXV8GXN4a",
+                    "title": "Listen from https://audiomack.com/ugobueze/song/ijere-mmanwu",
+                }
             ]
         }
         with (
             patch(
                 "src.youtube._extract_for_source",
-                new=self._extract({self._MUSIC_URL: unrelated}, asked),
+                new=self._extract(
+                    {
+                        "https://music.youtube.com/search?q=zzzzqqqq+no+such+song+anywhere+98765": unrelated
+                    },
+                    asked,
+                ),
             ),
             pytest.raises(Exception, match="Could not find song"),
         ):
             await YTDL.yt_source(
                 mock_ctx.author,
-                "ytsearch:xvi akiaura",
+                "ytsearch:zzzzqqqq no such song anywhere 98765",
                 query_source="search",
                 **_ANALYTICS,
                 user_input=None,
             )
 
         # The candidate was never resolved — only the ytsearch term and the music ask.
-        assert asked == ["ytsearch:xvi akiaura", self._MUSIC_URL]
+        assert asked == [
+            "ytsearch:zzzzqqqq no such song anywhere 98765",
+            "https://music.youtube.com/search?q=zzzzqqqq+no+such+song+anywhere+98765",
+        ]
+
+    @pytest.mark.parametrize(
+        ("expected", "kept"),
+        [
+            (244, True),
+            (244 + 10, True),
+            (244 + 11, False),
+            (244 - 11, False),
+            (None, True),
+        ],
+        ids=["exact", "at-tolerance", "too-long", "too-short", "no-length-known"],
+    )
+    async def test_a_candidate_of_the_wrong_length_is_declined(
+        self, mock_ctx: MagicMock, expected: Optional[int], kept: bool
+    ) -> None:
+        """Music search's flat entries carry no duration, so a Spotify ask's own
+        length is checked once the candidate has resolved. One that runs far from
+        it is a different recording, and the ask keeps the answer it earned."""
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,  # 244 s
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            ask = YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                expected_duration=expected,
+            )
+            if kept:
+                assert (await ask).title == "XVI"
+            else:
+                with pytest.raises(Exception, match="Couldn't find|Could not find"):
+                    await ask
 
     async def test_a_link_that_finds_nothing_does_not_ask_music_search(
         self, mock_ctx: MagicMock

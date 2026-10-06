@@ -818,15 +818,35 @@ Four properties are load-bearing:
   and queueing it plays nothing.
 - **A LINK never reaches this rung.** It named one video; a second opinion from another
   corpus would play something the user did not ask for.
-- **The candidate has to share a word with the ask.** Music search NEVER answers with
-  nothing — asked for something with no matches it returns its loosest associations, so a
-  candidate existing is no evidence the ask was found. Measured, before this gate existed:
+- **The candidate has to be the ask.** Music search NEVER answers with nothing — asked
+  for something with no matches it returns its loosest associations, so a candidate
+  existing is no evidence the ask was found. Measured, before any gate existed:
   `zzzzqqqq no such song anywhere 98765` resolved to an unrelated devotional track and the
-  bot played it, which is worse than the failure being fixed. `_music_candidate_matches`
-  requires one shared word of `_MIN_MATCH_WORD` (3) characters — three because "xvi" is a
-  real ask, and not fewer because a two-letter word is shared by too much to mean anything
-  (`u2 akiaura` would take a U2 song). A declined candidate leaves the ask with the answer
-  it already had, and sets `ytdl.music_no_match` on the span.
+  bot played it, which is worse than the failure being fixed. A first gate, one shared
+  word of three characters, still let that query through on a live title that contains
+  the word *song*. `_music_candidate_matches` now asks three things of a title:
+  - It shares **at least half** of the ask's identifying words — words of
+    `_MIN_MATCH_WORD` (3) characters or more that are not in `_MATCH_STOPWORDS` (`the`,
+    `you`, `song`, `official`…). Half rather than all because a music title carries no
+    artist: "XVI" answers `xvi akiaura`, "Just Your Doll" answers
+    `just your doll snow strippers`. Three characters because "xvi" is a real ask and a
+    two-letter word (`u2`) is shared by too much to mean anything.
+  - It is not a rendition the ask did not name: `_MATCH_VARIANT_WORDS` (`karaoke`,
+    `nightcore`, `live`, `remix`, `cover`…). Measured on 2026-10-06, music search ranked
+    "Snow Strippers - Just Your Doll (karaoke)" ahead of the original for that ask, and
+    the ranking moves between calls, so the gate cannot lean on order.
+  - A Spotify ask carries its own length, and music search's flat entries carry none, so
+    the candidate's duration is read once it has resolved (`_music_duration_fits`):
+    more than `_MUSIC_DURATION_TOLERANCE_SECS` (10 s) away and it is declined, setting
+    `ytdl.music_duration_mismatch`. The tolerance is a judgment rather than a
+    measurement: a re-upload lands within seconds, an edit or an extended cut well
+    outside it.
+
+  Live, against the queries that broke the first gate: `zzzzqqqq no such song anywhere
+  98765` and `the zzzqqq nonexistent track 999` are declined, and `just your doll snow
+  strippers` resolves to the official upload rather than the karaoke one. A declined
+  candidate leaves the ask with the answer it already had, and sets `ytdl.music_no_match`
+  on the span.
 
 **Both legs are best-effort**, under one guard: a failure of either is logged and the ask
 keeps the answer it earned. Each has its own way of taking it — an age-restricted candidate
