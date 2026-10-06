@@ -717,8 +717,9 @@ class PlayRegistry:
         client by id alone — which by then may be a NEWER, connected one.
         See docs/ARCHITECTURE.md#voice-teardown.
 
-        Never cancels the CALLING task: `-join` starts the player that reaches
-        cleanup, and cancelling yourself mid-teardown abandons the rest of it.
+        Never cancels the calling task, so a teardown that runs on the join's own
+        task finishes. Await it directly: inside asyncio.gather, current_task() is
+        the gather's child and the guard sees a stranger.
         """
         plays = self._guilds.get(guild_id)
         join = plays.join if plays is not None else None

@@ -459,9 +459,10 @@ class TestPlayRegistry:
     async def test_cancel_join_never_cancels_its_own_caller(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """`-join` starts the player that reaches cleanup, so the join task can be
-        the one asking for the cancel. Cancelling itself there raises out of cleanup
-        and abandons every step after it."""
+        """A teardown running on the join's own task would cancel itself and
+        abandon every step after it. Awaited directly, as cleanup() does; through
+        asyncio.gather the guard sees the gather's child instead (pinned in
+        test_musicbot)."""
         mp = mock_mp()
         req = admit(music_bot, mock_ctx, mp)
         returned = asyncio.Event()

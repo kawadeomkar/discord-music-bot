@@ -14,7 +14,9 @@ from opentelemetry import trace
 from src.queue_item import QueueObject
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
+    PlaceResult,
     PlaceStalled,
+    PlaceVerdict,
     ResolveWaitExpired,
     resolve_mode_for,
     slow_resolve_notice,
@@ -341,15 +343,34 @@ async def _resolve_and_place(
                 await abandon_cold_start(cog, ctx, mp)
                 raise
             join_started = time.monotonic()
-            with contextlib.suppress(Exception):
+            try:
                 # The join task runs on the CREATOR's context, so a waiter's
                 # trace has to say the join was somebody else's.
                 if not owns_join:
                     trace.get_current_span().set_attribute("play.join_shared", True)
                 await asyncio.shield(join)
+            except asyncio.CancelledError:
+                # A cancellation aimed at this command propagates. One that only
+                # reached the join is a teardown's (cleanup's cancel_join), and
+                # this command still owes its author a reply.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                pass
             trace.get_current_span().set_attribute(
                 "play.join_wait_secs", round(time.monotonic() - join_started, 3)
             )
+            if join.cancelled():
+                # The teardown that cancelled the join already took the player
+                # down, so there is nothing to abandon: only the drop to report,
+                # naming the command that stamped it.
+                trace.get_current_span().set_attribute(
+                    "play.dropped_by", req.dropped_by or "session"
+                )
+                return cog._dropped_notice(
+                    req, PlaceResult(verdict=PlaceVerdict.SESSION_ENDED)
+                )
             # Inserting onto a join that produced no usable client hands the
             # loop a song it can only raise on.
             if not join_succeeded(ctx):

@@ -4331,6 +4331,65 @@ class TestColdStartSingleflight:
         assert len(told) == 1, said
         assert "s2" in told[0]  # and it names the song that was dropped
 
+    async def test_a_stop_during_the_join_is_reported_not_swallowed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """cleanup() cancels the guild's cold join. The waiting -play used to get
+        that CancelledError out of its join wait, past every handler, into
+        discord.py's dispatcher, which drops it: the author heard nothing."""
+        join_gate = asyncio.Event()  # never set: a handshake still in flight
+        mp = self._cold(music_bot, mock_ctx, join_gate=join_gate)
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        with no_typing("src.commands.play.background_typing"):
+            play = asyncio.create_task(
+                command_callback(MusicBot.play)(music_bot, mock_ctx, url="s1")
+            )
+            await settle()
+            # What -stop does: stamp the resolving requests, then cleanup's cancel.
+            key = play_key(mock_ctx)
+            music_bot._plays.inflight(key, "stop")
+            await music_bot._plays.cancel_join(key)
+            await play
+
+        assert not play.cancelled()
+        mp.queue_put_front.assert_not_awaited()
+        said = [
+            call.kwargs["embed"].description
+            for call in mock_ctx.send.await_args_list
+            if call.kwargs.get("embed") is not None
+        ]
+        dropped = [
+            text for text in said if "`-stop` ran while it was resolving" in text
+        ]
+        assert len(dropped) == 1, said
+        assert "s1" in dropped[0]
+
+    async def test_a_cancelled_play_still_stops_at_its_join_wait(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The other half of the same handler: a cancellation aimed at the command
+        itself is not a teardown's, and must not be reported as a drop."""
+        join_gate = asyncio.Event()
+        mp = self._cold(music_bot, mock_ctx, join_gate=join_gate)
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        with no_typing("src.commands.play.background_typing"):
+            play = asyncio.create_task(
+                command_callback(MusicBot.play)(music_bot, mock_ctx, url="s1")
+            )
+            await settle()
+            play.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await play
+            join_gate.set()
+            await settle()
+
+        mp.queue_put_front.assert_not_awaited()
+        for call_ in mock_ctx.send.await_args_list:
+            embed = call_.kwargs.get("embed")
+            assert embed is None or "ran while it was resolving" not in (
+                embed.description or ""
+            )
+
     async def test_a_failed_join_names_itself_on_the_span(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

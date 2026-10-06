@@ -299,12 +299,14 @@ class MusicBot(commands.Cog):
         await self._plays.retire_player(guild.id, mp)
         log.info("going to cleanup/disconnect")
         try:
+            # The cold join first, and awaited on this task rather than inside the
+            # gather: it is the one task that can put the bot BACK in the channel
+            # after the disconnect below, and cancel_join's self-guard reads
+            # current_task(), which in a gather child is the child.
+            await self._plays.cancel_join(guild.id)
             # Cancel before disconnecting so the loop cannot start the next song
-            # between voice_client.stop() and cancellation. The cold join is in
-            # here for the same reason: it is the one task that can put the bot
-            # BACK in the channel after the disconnect below takes it out.
+            # between voice_client.stop() and cancellation.
             teardown = [
-                self._plays.cancel_join(guild.id),
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
                 cancel_task(mp._heartbeat_task),
@@ -538,6 +540,10 @@ class MusicBot(commands.Cog):
     async def _report_dropped(self, req: PlayRequest, verdict: PlaceResult) -> None:
         """Tell the author why a resolved request did not place. An ordinary
         command reply, so it carries the NP block like any other."""
+        await req.ctx.send(embed=self._dropped_notice(req, verdict))
+
+    def _dropped_notice(self, req: PlayRequest, verdict: PlaceResult) -> discord.Embed:
+        """Why a request did not place, as the embed _report_dropped sends."""
         if verdict.verdict is PlaceVerdict.VOICE:
             text = verdict.refusal
         elif req.dropped_by:
@@ -558,7 +564,7 @@ class MusicBot(commands.Cog):
         # Which one: a user with three resolving requests gets three of these, and
         # the dropping command's own listing is not reachable from every path.
         text = f"{text}\n{echo(req.query)}"
-        await req.ctx.send(embed=notice_embed(text, discord.Color.red()))
+        return notice_embed(text, discord.Color.red())
 
     @commands.command(
         name="play",

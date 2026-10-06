@@ -506,6 +506,25 @@ class TestCleanup:
 
         music_bot._plays.cancel_join.assert_awaited_once_with(mock_guild.id)
 
+    async def test_cancels_the_join_on_its_own_task_not_a_gather_child(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """cancel_join never cancels the task that calls it, which it decides by
+        current_task(). Inside asyncio.gather that is the gather's child, so a
+        cleanup running on the join's own task would cancel itself mid-teardown."""
+        self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client.disconnect = AsyncMock()
+        seen: list[Optional[asyncio.Task[Any]]] = []
+
+        async def _record(_guild_id: int) -> None:
+            seen.append(asyncio.current_task())
+
+        music_bot._plays.cancel_join = _record  # pyright: ignore[reportAttributeAccessIssue]
+        cleanup = asyncio.ensure_future(music_bot.cleanup(mock_guild))
+        await cleanup
+
+        assert seen == [cleanup]
+
     async def test_removes_guild_from_mps(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:

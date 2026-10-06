@@ -2470,9 +2470,13 @@ cleared, so the bot rejoins a session already declared over and after
 `voice_client.cleanup()` → `ConnectionState._remove_voice_client(guild_id)`, which is
 `self._voice_clients.pop(guild_id, None)` — no identity check. A `-play` that registered
 a fresh, connected client in the meantime loses it to that pop, which is the same
-bot-gone-locally/still-in-channel split described above. The cancel is self-guarded:
-`-join` starts the player that can reach `cleanup()`, and a task cancelling itself
-mid-teardown abandons every step after it.
+bot-gone-locally/still-in-channel split described above. The cancel runs first, awaited
+on `cleanup()`'s own task rather than inside the gather of the other cancels, and never
+cancels the task that called it — a check that reads `current_task()`, which inside
+`asyncio.gather` is the gather's child. A `-play` waiting on the cancelled join gets
+the cancellation out of its `asyncio.shield`; it tells that apart from its own by
+`cancelling()`, and reports the drop (``-stop` ran while it was resolving``) instead of
+letting the error reach discord.py's dispatcher, which would discard it silently.
 
 **Reading it from the logs:** `_voice_disconnect()` logs `The voice handshake is being
 terminated for Channel ID …` at INFO every time it sends the clear, so that line's
