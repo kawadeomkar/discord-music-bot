@@ -15,7 +15,7 @@ from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aiohttp
 import discord
@@ -1520,6 +1520,85 @@ class TestYTSourceTermLadder:
         # The ISRC miss is not cached — only a resolve writes an entry — so it is
         # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
+
+
+class TestIsrcLength:
+    """An ISRC names one recording. Measured over 118 Spotify tracks: one ISRC
+    search answered with a 176 s upload for Kesariya, a 268 s recording, and the
+    title term behind it found the right one."""
+
+    _ISRC = 'ytsearch:"INS172203702"'
+    _TERM = "ytsearch:Kesariya Pritam Arijit Singh Amitabh Bhattacharya"
+    _CLIP = {
+        "webpage_url": "https://www.youtube.com/watch?v=clip1234567",
+        "title": 'Kesariya (From "Brahmastra")',
+        "url": "https://cdn/clip",
+        "duration": 176,
+        "uploader": "Top Bollywood songs",
+    }
+    _SONG = {
+        "webpage_url": "https://www.youtube.com/watch?v=song1234567",
+        "title": "Kesariya - Film Version",
+        "url": "https://cdn/song",
+        "duration": 262,
+    }
+
+    async def _resolve(
+        self, mock_ctx: MagicMock, expected: Optional[int], asked: list[str], **kw: Any
+    ) -> QueueObject:
+        answers = {self._ISRC: self._CLIP, self._TERM: self._SONG}
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            return answers.get(search)
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            return await YTDL.yt_source(
+                mock_ctx.author, self._TERM, query_source="spotify", **_ANALYTICS,
+                user_input=None, isrc="INS172203702", expected_duration=expected, **kw,
+            )  # fmt: skip
+
+    @pytest.mark.parametrize(
+        ("expected", "url", "asked_title"),
+        [
+            (268, "https://www.youtube.com/watch?v=song1234567", True),
+            # Inside the tolerance either way: the ISRC's answer stands.
+            (176 + 10, "https://www.youtube.com/watch?v=clip1234567", False),
+            (176 - 10, "https://www.youtube.com/watch?v=clip1234567", False),
+            # No length known: nothing to check it against.
+            (None, "https://www.youtube.com/watch?v=clip1234567", False),
+        ],
+        ids=["mis-tagged", "at-tolerance-over", "at-tolerance-under", "no-length"],
+    )
+    async def test_an_isrc_answer_of_another_length_falls_to_the_title(
+        self,
+        mock_ctx: MagicMock,
+        expected: Optional[int],
+        url: str,
+        asked_title: bool,
+    ) -> None:
+        asked: list[str] = []
+        got = await self._resolve(mock_ctx, expected, asked)
+        assert got.webpage_url == url
+        assert (self._TERM in asked) is asked_title
+
+    async def test_the_title_term_is_not_held_to_the_length(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The title term is the ladder's last word: its single processed result
+        is what the ask always got, whatever its length."""
+        asked: list[str] = []
+        with patch.dict(self._SONG, {"duration": 400}):
+            got = await self._resolve(mock_ctx, 268, asked)
+        assert got.webpage_url == "https://www.youtube.com/watch?v=song1234567"
+
+    async def test_the_decline_is_on_the_span(self, mock_ctx: MagicMock) -> None:
+        span = MagicMock()
+        with patch("src.youtube.trace.get_current_span", return_value=span):
+            await self._resolve(mock_ctx, 268, [])
+        assert (
+            call("ytdl.isrc_length_mismatch", True) in span.set_attribute.call_args_list
+        )
 
 
 class TestMusicSearchFallback:

@@ -775,6 +775,18 @@ Where the ISRC comes from, and where it does not:
 - Anything malformed is refused by `_ISRC_RE` rather than searched, because a code that is
   not one finds nothing and costs a round trip.
 
+**An ISRC answer at the wrong length is declined.** The ISRC names one recording, so an
+upload more than `_MUSIC_DURATION_TOLERANCE_SECS` (10 s) from Spotify's length is
+mis-tagged, and `yt_source` moves on to the title term, setting
+`ytdl.isrc_length_mismatch`. Measured 2026-10-06: `ytsearch:"INS172203702"` (Kesariya,
+268 s) answers with the art track or, in 1 of 8 calls, a 176 s clip a compilation
+channel tagged with the same code. The title term is not held to the length: it is the
+ladder's last word, and its processed single result is what the ask always got. The
+declined answer stays cached under the ISRC's key, so a repeat pays one Redis GET to
+decline it again. Widening the flat ISRC search to three results and picking by length
+was not done: it renames every Spotify track's first cache key, and the processed path
+cannot widen at all.
+
 The length Spotify reports is the second half of the rule: `select_search_entry` prefers
 the entry closest to it, with everything inside `_DURATION_TIE_SECS` of the best treated
 as a tie and settled by YouTube's own ranking. That widening rides the FLAT path only. One

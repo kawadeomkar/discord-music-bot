@@ -145,7 +145,8 @@ because the title of a well-known song finds the music video and the ISRC finds 
 label's art track (263 s against 234 s for "Shape of You"). A playlist asks for it in its
 `fields` mask; an album's simplified tracks carry none, so `_page_isrcs` batches one
 `/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
-of a FLAT search, which costs the same for five as for one. Full rule and numbers:
+of a FLAT search, which costs the same for five as for one, and an ISRC answer more
+than 10 s from it is declined as mis-tagged (`ytdl.isrc_length_mismatch`). Full rule and numbers:
 ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes

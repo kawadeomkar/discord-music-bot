@@ -2721,7 +2721,21 @@ class YTDL(discord.FFmpegOpusAudio):
         for index, (kind, term) in enumerate(terms):
             trace.get_current_span().set_attribute("ytdl.search_kind", kind)
             try:
-                return await resolve(term, flat=flat)
+                found = await resolve(term, flat=flat)
+                if kind != _SEARCH_KIND_ISRC or _music_duration_fits(
+                    found.duration, expected_duration
+                ):
+                    return found
+                # An ISRC names one recording, so an upload this far from its
+                # length is mis-tagged: measured, a 176 s clip for a 268 s track.
+                trace.get_current_span().set_attribute(
+                    "ytdl.isrc_length_mismatch", True
+                )
+                log.info(
+                    f"ISRC search {term!r} found {found.webpage_url} at "
+                    f"{found.duration}s against {expected_duration}s; declined"
+                )
+                last_miss = _nothing_playable(term)
             except _NothingFound as miss:
                 last_miss = miss
             except ExtractionError as e:
