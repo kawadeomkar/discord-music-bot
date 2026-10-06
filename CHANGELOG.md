@@ -24,8 +24,8 @@ differently, what you have to do, and whether you can roll it back.
 was not the bot and not yt-dlp: when the top of a result set holds age-restricted content,
 YouTube serves a signed-out client an empty page — a "Confirm your age" card where the
 videos would be — and reports zero results. `xvi akiaura` is one; `akiaura xvi`, the same
-two words reordered, returns 17,176. Nothing in what yt-dlp hands back distinguishes that
-from a query with no matches, which is why the bot believed it.
+two words reordered, returns tens of thousands. Nothing in what yt-dlp hands back
+distinguishes that from a query with no matches, which is why the bot believed it.
 
 Such a search now gets one more try through YouTube Music, which answers it normally, and
 plays the first track it names.
@@ -34,15 +34,18 @@ plays the first track it names.
   music.youtube.com search yt-dlp already supports.
 - **Only a search that found NOTHING reaches it**, so no search that works today changes
   its answer. A link never reaches it at all.
-- **It costs about 1.7 seconds**, and only on a request that previously failed outright.
-  The answer is remembered against the words you typed for a day, so a repeat of the same
-  wording starts as fast as any other cached search.
+- **It costs about 1.5 seconds** on top of the failed search, about 2 seconds in all,
+  and only on a request that previously failed outright. The answer is remembered
+  against the words you typed for a day, so a repeat of the same wording starts as fast
+  as any other cached search.
 - **A search that genuinely has no matches still says so**, with the same wording as
-  before, about 0.8 seconds later than it used to. YouTube Music always offers *something*,
-  so a track is only accepted when its title carries at least half of the meaningful words
-  you asked for, is not a karaoke, nightcore, live or similar version you did not ask
-  for, and — for a Spotify link — runs within ten seconds of the length Spotify gives. A
-  typo gets the same "couldn't find anything" it always got, not a stranger's song.
+  before, about half a second later than it used to — except a search queued while the
+  bot is already in voice, which skips a search it used to send twice and answers about
+  as fast as it always did. YouTube Music always offers *something*, so a track is only accepted when
+  its title carries at least half of the meaningful words you asked for, is not a
+  karaoke, nightcore, live or similar version you did not ask for, and — for a Spotify
+  link — runs within ten seconds of the length Spotify gives. A typo gets the same
+  "couldn't find anything" it always got, not a stranger's song.
 - **Roll back freely**, to any 2.55.x. The one thing written to Redis is an ordinary
   day-long search cache entry, which any 2.55.x reads as it reads its own.
 
@@ -124,7 +127,6 @@ Two things to know. Spotify links resolved in the last 24 hours keep the video t
 already resolved to until that entry ages out. And the Spotify caches are re-keyed by
 this release: the first play of a playlist or album after deploying walks it again.
 Rolling back is safe — the old build ignores the new keys and re-walks once itself.
-
 
 ## 2.54.1 — 2026-09-27
 

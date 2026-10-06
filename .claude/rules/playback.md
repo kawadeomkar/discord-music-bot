@@ -85,7 +85,11 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   failure past the join. What the flat path gives up on the placements that take it
   is the enqueue-time playability check — an age-gated, region-blocked or
   members-only video has an id, a title and a duration, so it queues and fails at
-  its turn instead of failing the command. A live/duration-less first result
+  its turn instead of failing the command. An EMPTY page is final for its term (the
+  processed search would re-send the same POST). A search every term misses asks
+  music search once: a walled search answers in ~1.8–2.1s, and a genuine miss
+  costs what flat misses always did. docs/ARCHITECTURE.md#what-the-fallback-costs.
+  A live/duration-less first result
   declines — after paying the flat POST — and falls through to:
   Miss on a LINK, an interjection head, or a declined flat entry → ONE unified
   stream-opts extraction returns identity AND a selected playable stream URL, so

@@ -1468,6 +1468,14 @@ class _NothingFound(Exception):
         self.public = public
 
 
+def _nothing_playable(search: str) -> _NothingFound:
+    """The miss for a term whose result holds no playable entry."""
+    log.warning(f"no playable result for {search!r}")
+    return _NothingFound(
+        ExtractionError("Couldn't find anything playable for that.", expected=True)
+    )
+
+
 _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
@@ -1559,16 +1567,9 @@ def _match_words(text: str) -> set[str]:
 
 
 def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
-    """Whether a music-search title is plausibly an answer to `query`.
-
-    Asked for something with no matches, music search returns its loosest
-    associations rather than an empty result, so a candidate existing is no evidence.
-    It has to share at least half the ask's identifying words — "XVI" for
-    `xvi akiaura` does, a stranger matching one word of a long nonsense query does
-    not — and must not be a rendition (karaoke, a live set) the ask did not name.
-    Titles carry no artist, so half rather than all. Rejecting leaves the ask with
-    the answer it already had. See docs/ARCHITECTURE.md#the-music-search-fallback.
-    """
+    """Whether a music-search title is plausibly an answer to `query`: it shares at
+    least half the ask's identifying words and is no rendition (karaoke, a live set)
+    the ask did not name. See docs/ARCHITECTURE.md#the-music-search-fallback."""
     wanted = _match_words(query)
     if not wanted:
         return False
@@ -1592,19 +1593,10 @@ async def _ytmusic_candidate_url(
     *,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
 ) -> Optional[str]:
-    """The watch URL of the first playable track music.youtube.com answers `search`
-    with, or None. The last rung of yt_source's ladder, and the only one that sees a
-    result set YouTube does not age-wall: a signed-out `ytsearch` whose top results
-    hold age-restricted content comes back EMPTY — `estimatedResults: 0` and a
-    "Confirm your age" card where the videos would be — with nothing in the result
-    yt-dlp hands back to say so. Music search answers the same query normally.
-    See docs/ARCHITECTURE.md#the-music-search-fallback.
-
-    FLAT, and only ever flat: a processed extraction walks the whole result set, and
-    `ignoreerrors=False` means one age-restricted track in it raises for the entire
-    search. Returning a watch URL hands the resolve back to the link path, which is
-    what fills both caches.
-    """
+    """The watch URL of the first track music.youtube.com answers `search` with that
+    passes the relevance gate, or None. FLAT only: processed, one age-restricted
+    track in the result set raises for the whole search.
+    See docs/ARCHITECTURE.md#the-music-search-fallback."""
     query = _SEARCH_PREFIX_RE.sub("", search).strip()
     if not query:
         return None
@@ -2329,19 +2321,27 @@ class YTDL(discord.FFmpegOpusAudio):
         # to. A LINK is excluded: it named one video, and a second opinion on a
         # different corpus would play something the user did not ask for.
         if not is_link(search.strip()):
+            trace.get_current_span().set_attribute("ytdl.music_fallback", True)
             try:
                 watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
                 if watch_url is not None:
-                    trace.get_current_span().set_attribute(
-                        "ytdl.search_kind", _SEARCH_KIND_MUSIC
-                    )
                     log.info(
                         f"search {search!r} found nothing; music search found {watch_url}"
                     )
                     # Never flat: the candidate is a link now, and the link path is
-                    # what fills both caches from one round.
-                    found = await resolve(watch_url, flat=False)
+                    # what fills both caches from one round. The needle is the ask's,
+                    # not the watch URL's, so -remove still matches what was typed.
+                    found = await resolve(
+                        watch_url,
+                        flat=False,
+                        user_input=user_input if user_input is not None else search,
+                    )
                     if _music_duration_fits(found.duration, expected_duration):
+                        # Stamped only here: an attempt that declined or failed is
+                        # `ytdl.music_fallback` alone, still the ladder's kind.
+                        trace.get_current_span().set_attribute(
+                            "ytdl.search_kind", _SEARCH_KIND_MUSIC
+                        )
                         # Under the term the next ask reads first, or every repeat
                         # re-asks the walled search and music search before reaching
                         # the watch URL's own entry.
@@ -2461,6 +2461,11 @@ class YTDL(discord.FFmpegOpusAudio):
                 search,
                 pool_slot=pool_slot,
             )
+            if flat_data is not None and flat_data.get("entries") == []:
+                # The search answered with no results at all. The full path below
+                # would re-send the same search POST and get the same empty page,
+                # so this miss is final for the term.
+                raise _nothing_playable(search)
             flat_entry = (
                 _first_video_entry(flat_data, expected_duration=expected_duration)
                 if flat_data is not None
@@ -2499,8 +2504,8 @@ class YTDL(discord.FFmpegOpusAudio):
                         _YT_SOURCE_TTL,
                     )
                 return flat_qobj
-            # A live entry, one without a duration, or no result: take the full path
-            # on top of the flat POST already spent, re-fetching the same video.
+            # A live entry, one without a duration, or no video among the entries:
+            # take the full path on top of the flat POST already spent.
             trace.get_current_span().set_attribute("ytdl.flat_fallback", True)
 
         # The only path for a link: one stream-opts call yields identity AND a
@@ -2529,12 +2534,7 @@ class YTDL(discord.FFmpegOpusAudio):
         ):
             # Refused before the cache write below: an identity that is not a page
             # URL cannot be streamed, and cached it fails every play for 24h.
-            log.warning(f"no playable result for {search!r}")
-            raise _NothingFound(
-                ExtractionError(
-                    "Couldn't find anything playable for that.", expected=True
-                )
-            )
+            raise _nothing_playable(search)
         if not selected.get("url"):
             # This path runs processed, so a result with no stream URL is one
             # yt-dlp could select no format for. It fails at stream time, where

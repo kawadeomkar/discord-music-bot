@@ -147,12 +147,6 @@ label's art track (263 s against 234 s for "Shape of You"). A playlist asks for 
 `/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
 of a FLAT search, which costs the same for five as for one. Full rule and numbers:
 ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
-**The ladder's last rung is music search**, and it is there for a different failure: a
-signed-out `ytsearch` whose top results hold age-restricted content comes back EMPTY,
-with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url` asks
-music.youtube.com instead and hands the first playable track back as a watch URL —
-flat only, filtered to `ie_key` `Youtube` with an 11-character id, and never for a
-LINK. Why each of those: ARCHITECTURE.md#the-music-search-fallback.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
 the playlist's path through `queue_source`, the card and every placement; page 1 rides
@@ -164,6 +158,15 @@ queued card and the `--now` path turn into a notice. `parse_url` drops a share l
 `/intl-xx/` segment, and a Spotify link of a type the bot does not queue, with no id, or
 with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 `ValueError`, which `parse_input` would turn into a YouTube search for the link.
+
+**Music search answers a search every term missed.** It is not a rung of
+`_search_terms`: once the ladder is exhausted, `yt_source` asks it once, for a search
+only, because a signed-out `ytsearch` whose top results hold age-restricted content
+comes back EMPTY with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url`
+asks music.youtube.com flat, filters to `ie_key` `Youtube` with an 11-character id,
+gates on relevance (and on length for a Spotify ask), and hands back a watch URL that
+resolves processed. Why each of those, and what it costs:
+ARCHITECTURE.md#the-music-search-fallback.
 
 ## Concurrency primitives
 

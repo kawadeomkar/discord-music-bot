@@ -18,7 +18,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play Command Pipeline](#-play-command-pipeline)
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
-     - [The music search fallback](#the-music-search-fallback)
+   - [The music search fallback](#the-music-search-fallback)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
@@ -787,7 +787,7 @@ of the result set holds age-restricted content, YouTube withholds the whole page
 anonymous client: `estimatedResults: "0"`, no `videoRenderer`, and a
 `backgroundPromoRenderer` reading **"Confirm your age" / "These results may be
 inappropriate for some users."** with a `Sign in` call to action. Measured, `xvi akiaura`
-is walled while `akiaura xvi` answers with 17,176 results — the two orderings rank
+is walled while `akiaura xvi` answers with results in the tens of thousands — the two orderings rank
 differently and only one surfaces a restricted item. It is not a rule about word order or
 leading tokens: `xvi drake`, `xiv drake`, `xv drake` and `xvii drake` are all walled
 while `xvi sace`, `xvi song`, `xvi lonown` and `xvi taylor swift` answer normally, and
@@ -795,16 +795,22 @@ while `xvi sace`, `xvi song`, `xvi lonown` and `xvi taylor swift` answer normall
 semantic.
 
 **Nothing in what yt-dlp returns says so.** The result is `entries: []`,
-`playlist_count: 0`, no warning and no error — byte-identical in shape to a query with no
-matches. So the bot cannot tell the two apart, and `-play` answered both with "Couldn't
+`playlist_count: 0`, no warning and no error — identical, but for the query string, to a
+query with no matches (compared field by field on 2026-10-05, walled and genuine). The
+raw page does differ — a genuine miss carries a "No results found" promo where the wall
+carries "Confirm your age" — but yt-dlp's search extractor drops both, and reading it
+would mean patching a private yt-dlp method inside the pool worker, against a localized
+string. So the bot cannot tell the two apart, and `-play` answered both with "Couldn't
 find anything playable for that." for a song that exists and plays.
 
 `music.youtube.com` is not subject to it, and yt-dlp reaches it natively through
-`youtube:music:search_url`. So the last rung of `yt_source`'s term ladder
-(`_ytmusic_candidate_url`) asks music search for the same query and hands back the watch
-URL of the first playable track, which then resolves through the ordinary LINK path —
-one round that fills both the source and stream caches. Measured end to end: 0.5 s for
-the flat music search plus 1.2 s for the resolve, on a path that previously just failed.
+`youtube:music:search_url`. So once every term `_search_terms` returned has missed,
+`yt_source` makes one more ask, outside the ladder and only for a search:
+`_ytmusic_candidate_url` asks music search for the same query and hands back the watch
+URL of the first track that passes the gates below, which then resolves through the
+ordinary LINK path — one round that fills both the source and stream caches. Measured:
+0.41–0.49 s for the flat music ask plus 1.06–1.13 s for the resolve, on a path that
+previously just failed.
 
 Four properties are load-bearing:
 
@@ -816,7 +822,7 @@ Four properties are load-bearing:
   (`MPREb_…`) and channel (`UC…`) pages with the tracks as `YoutubeTab` entries carrying
   no title. They are not `_type` `"playlist"`, so `select_search_entry` would take one,
   and queueing it plays nothing.
-- **A LINK never reaches this rung.** It named one video; a second opinion from another
+- **A LINK never reaches it.** It named one video; a second opinion from another
   corpus would play something the user did not ask for.
 - **The candidate has to be the ask.** Music search NEVER answers with nothing — asked
   for something with no matches it returns its loosest associations, so a candidate
@@ -846,7 +852,12 @@ Four properties are load-bearing:
   98765` and `the zzzqqq nonexistent track 999` are declined, and `just your doll snow
   strippers` resolves to the official upload rather than the karaoke one. A declined
   candidate leaves the ask with the answer it already had, and sets `ytdl.music_no_match`
-  on the span.
+  on the span. Every attempt sets `ytdl.music_fallback`; `ytdl.search_kind` becomes
+  `music` only when the candidate is the answer, so a declined or failed attempt keeps
+  the ladder's kind.
+
+The queued song keeps the ask's `user_input`, never the candidate's watch URL — that is
+the needle `-remove` matches, and nobody typed the watch URL.
 
 **Both legs are best-effort**, under one guard: a failure of either is logged and the ask
 keeps the answer it earned. Each has its own way of taking it — an age-restricted candidate
@@ -856,11 +867,11 @@ for an `expected` error, and the music ask's own `unsupported` branch names the 
 
 Cookies would fix the wall at its source and are what yt-dlp's own wiki recommends for
 age-restricted content, but the same wiki warns that using an account "run[s] the risk of
-it being banned (temporarily or permanently)" and that the failure mode includes IP bans
-— which on a self-hosted bot would cost playback entirely, a worse outcome than the bug.
-PO tokens do not help: they buy format access, not age verification. The official Data
-API's `safeSearch=none` does not filter results, but `search.list` costs 100 of a
-10,000-unit daily quota, so ~100 searches a day.
+it being banned (temporarily or permanently)" — and the account is the one the bot's
+playback then depends on, a worse outcome than the bug. PO tokens do not help: they buy
+format access, not age verification. The official Data API's `safeSearch=none` does not
+filter results, but `search.list` draws on a bucket of its own, 100 calls a day, so
+~100 searches a day.
 
 The song music search found is cached twice: under the candidate's watch URL, by the
 link path that resolves it, and under the ask's first term, by `yt_source`. The second is
@@ -869,8 +880,34 @@ than the walled search, the music ask and the candidate's hit (~0.85 s and two p
 measured, before this was cached). It is an ordinary `ytdl:source` entry: 24 h TTL, and
 past the freshness window it is revalidated behind the reply like any search — a
 revalidation that finds the search still walled writes nothing, so the entry stands until
-its TTL. A search that genuinely has no matches pays the flat music ask (~0.8 s measured)
-and then declines, on a path that was already failing; nothing is cached for it.
+its TTL. A search that genuinely has no matches pays the flat music ask and then
+declines, on a path that was already failing; nothing is cached for it.
+
+#### What the fallback costs
+
+Measured live on 2026-10-05, per leg: a failing `ytsearch` 0.25–0.49 s, the flat music
+ask 0.41–0.49 s (one outlier at 0.83 s), the candidate's resolve 1.06–1.13 s.
+
+- **A genuine miss** pays the music ask on top of what it always paid, because no
+  evidence of the wall reaches the bot (above): a full-path miss goes from ~0.25–0.5 s to
+  ~0.65–1.0 s before its error embed. A FLAT (`TAIL`/`NEXT`) miss does not: an empty flat
+  page is final for its term, because the processed re-search behind it re-sent the same
+  search POST and got the same empty page (measured on two walled and two genuine
+  queries). So a flat miss is one search POST plus the music ask, where it was two
+  search POSTs — about the same. The guild's resolve permits are held per extraction, so
+  a burst of failing searches holds them for the music asks too; on the flat path that
+  is what the dropped re-search already cost.
+- **A walled `TAIL` enqueue** answers in ~1.8–2.1 s, not the ~0.6 s flat budget: the
+  candidate resolves processed, because music search's flat entries carry only `id`,
+  `title` and `url` — no duration, uploader or thumbnail — and the flat path refuses an
+  entry without a duration. A walled song is one that previously did not queue at all,
+  and its repeats are a source-cache hit.
+- **At dequeue**, an unresolved collection item whose ISRC and title terms both miss
+  pays up to four extractions — both terms, the music ask, and a candidate declined on
+  length — ~2.0–2.6 s at worst, inside `_IN_BAND_RESOLVE_TIMEOUT_SECS` (300 s) with two
+  orders of magnitude to spare. The loop's one-ahead prefetch resolves the item while the
+  song before it plays, so this is dead air only when the item reaches the loop
+  unprefetched.
 
 ---
 
@@ -899,7 +936,7 @@ flowchart LR
 
 **Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 24 h, see [Source-cache freshness](#source-cache-freshness)) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss it takes one of two paths, chosen by the caller through `ResolveMode` (see [Resolve mode](#resolve-mode)):
 
-- **Flat** (`flat=True`, `_YTDL_FLAT_SEARCH_OPTS`) for a search or a Spotify track under an ordinary placement: one search POST yields id, title, duration, uploader and thumbnail — enough for the card and the queue entry — and **no stream URL**, so only `ytdl:source` is written. Measured at 0.65 s against the full path's 2.46 s. An entry the mapper cannot describe as a plain song (live, upcoming, or duration-less) returns `None` and the query falls through to the full path, which produces exactly what it produced before the flat path existed — at the cost of both rounds. `ytsearch:` returns a single entry, so the full path re-fetches the same declined video: `-play lofi hip hop radio`, whose top hit is a live stream, pays ~0.65 s + ~2.46 s and two pool jobs where it used to pay one.
+- **Flat** (`flat=True`, `_YTDL_FLAT_SEARCH_OPTS`) for a search or a Spotify track under an ordinary placement: one search POST yields id, title, duration, uploader and thumbnail — enough for the card and the queue entry — and **no stream URL**, so only `ytdl:source` is written. Measured at 0.65 s against the full path's 2.46 s. An entry the mapper cannot describe as a plain song (live, upcoming, or duration-less) returns `None` and the query falls through to the full path, which produces exactly what it produced before the flat path existed — at the cost of both rounds. `ytsearch:` returns a single entry, so the full path re-fetches the same declined video: `-play lofi hip hop radio`, whose top hit is a live stream, pays ~0.65 s + ~2.46 s and two pool jobs where it used to pay one. A search that answers with no entries at all is the exception: the full path would re-send the same search POST and get the same empty page, so the flat miss is final for that term (see [What the fallback costs](#what-the-fallback-costs)).
 - **Full** (`_YTDL_STREAM_SEARCH_OPTS`, hardcoded `process=True` — unprocessed extraction would do no format selection and leave nothing to cache) for every link, every interjection head, every **cold start** (its song plays immediately, so the stream extraction is on the path to audio either way and a flat resolve would only move the failure past the join), and every unresolved item resolving at dequeue: identity plus a selected stream URL, with `_probe_and_cache` writing the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity.
 
 Returns a `QueueObject`.

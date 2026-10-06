@@ -1993,6 +1993,188 @@ class TestMusicSearchFallback:
         ]
         assert kinds[-1] == "music"
 
+    @staticmethod
+    def _attributes(span: MagicMock, name: str) -> list[Any]:
+        return [
+            c.args[1]
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == name
+        ]
+
+    @pytest.mark.parametrize(
+        "answers",
+        [
+            # The candidate is declined on length (a Spotify ask, 244 s vs 300 s).
+            {
+                _MUSIC_URL: _MUSIC_RESULT,
+                "https://www.youtube.com/watch?v=kSAEcjWWuew": _FOUND,
+            },
+            # Music search offered nothing that passes the gate.
+            {_MUSIC_URL: {"entries": []}},
+        ],
+        ids=["duration-declined", "no-candidate"],
+    )
+    async def test_a_fallback_that_finds_nothing_keeps_the_ladders_kind(
+        self, mock_ctx: MagicMock, answers: dict[str, Any]
+    ) -> None:
+        """`ytdl.search_kind` names the rung that answered. A fallback that did not
+        answer is recorded as an attempt, and the kind stays the ladder's."""
+        span = MagicMock()
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract(answers, [])),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+                expected_duration=300,
+            )
+
+        assert self._attributes(span, "ytdl.search_kind")[-1] != "music"
+        assert self._attributes(span, "ytdl.music_fallback") == [True]
+
+    async def test_a_declined_music_answer_is_recorded_on_the_span(self) -> None:
+        span = MagicMock()
+        unrelated = {
+            "entries": [
+                {"ie_key": "Youtube", "id": "NHmXV8GXN4a", "title": "Unrelated"}
+            ]
+        }
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract({self._MUSIC_URL: unrelated}, []),
+            ),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+        assert self._attributes(span, "ytdl.music_no_match") == [True]
+
+    @pytest.mark.parametrize(
+        "result",
+        [None, {"title": "a result with no entries"}, {"entries": None}],
+        ids=["no-result", "no-entries-key", "null-entries"],
+    )
+    async def test_a_music_answer_holding_nothing_is_no_candidate(
+        self, result: Optional[dict[str, Any]]
+    ) -> None:
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: result}, []),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+    async def test_a_null_entry_is_skipped_not_fatal(self) -> None:
+        """yt-dlp can emit a null entry; the track behind it is still the answer."""
+        result = {
+            "entries": [
+                None,
+                {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+            ]
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: result}, []),
+        ):
+            got = await _ytmusic_candidate_url("ytsearch:xvi akiaura")
+        assert got == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+
+    @pytest.mark.parametrize("search", ["ytsearch:", "ytsearch5:   ", "  "])
+    async def test_an_empty_query_asks_nothing(self, search: str) -> None:
+        """`music.youtube.com/search?q=` with nothing after it is not a question."""
+        asked: list[str] = []
+        with patch("src.youtube._extract_for_source", new=self._extract({}, asked)):
+            assert await _ytmusic_candidate_url(search) is None
+        assert asked == []
+
+    async def test_an_empty_ladder_is_a_bug_not_a_miss(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        with (
+            patch("src.youtube._search_terms", return_value=[]),
+            pytest.raises(AssertionError, match="empty ladder"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+            )
+
+    @pytest.mark.parametrize(
+        ("user_input", "needle"),
+        [
+            ("xvi akiaura", "xvi akiaura"),
+            # A Spotify collection item carries its link, never the generated term.
+            (
+                "https://open.spotify.com/playlist/37i9dQZF1DX0XUsuxWHRQd",
+                "https://open.spotify.com/playlist/37i9dQZF1DX0XUsuxWHRQd",
+            ),
+            (None, "ytsearch:xvi akiaura"),
+        ],
+        ids=["typed", "collection-link", "none-falls-back-to-the-ask"],
+    )
+    async def test_the_fallback_keeps_the_needle_remove_matches_on(
+        self, mock_ctx: MagicMock, user_input: Optional[str], needle: str
+    ) -> None:
+        """The candidate resolves as a watch URL, which nobody typed: `-remove`
+        matches `user_input`, so the queued song has to carry the ask's."""
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch("src.youtube._extract_for_source", new=self._extract(answers, [])):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=user_input,
+            )
+
+        assert result.webpage_url == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+        assert result.user_input == needle
+
+    async def test_an_empty_flat_search_is_not_asked_again_processed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An empty page is the search's whole answer, walled or genuine; the
+        processed path would re-send the same search POST and get it again."""
+        asked: list[str] = []
+        answers = {
+            'ytsearch:"GBAHS1600463"': {"entries": []},
+            "ytsearch3:xvi akiaura": {"entries": []},
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+                flat=True,
+                isrc="GBAHS1600463",
+                expected_duration=244,
+            )
+
+        assert result.title == "XVI"
+        assert asked == [
+            'ytsearch:"GBAHS1600463"',
+            "ytsearch3:xvi akiaura",
+            self._MUSIC_URL,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        ]
+
 
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
