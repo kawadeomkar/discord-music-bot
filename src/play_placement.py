@@ -33,6 +33,7 @@ from src.util import (
     ECHO_ROW_MAX,
     get_logger,
     PoolSlotUnavailable,
+    cancel_task,
     channel_claim,
     join_task,
     notice_embed,
@@ -310,18 +311,21 @@ def check_voice_permissions(
 ) -> Optional[str]:
     """Returns an error message if validation fails, None if OK. Plain -play is
     exempt from the same-channel rule (appending costs listeners elsewhere
-    nothing); queue control is gated like -skip/-shuffle/-remove/-clear."""
+    nothing); queue control is gated like -skip/-shuffle/-remove/-clear. -join is
+    exempt while no human is in the bot's channel: the rule protects listeners."""
     if isinstance(author, discord.User):
         return f"You must be a member of this channel {author}"
     if not author.voice or not author.voice.channel:
         return f"You are not connected to a voice channel, you silly baka {author}"
-    if (
-        (command_name != "play" or queue_control)
-        and voice_client is not None
-        and voice_client.channel != author.voice.channel
+    if voice_client is None or voice_client.channel == author.voice.channel:
+        return None
+    if command_name == "play" and not queue_control:
+        return None
+    if command_name == "join" and not any(
+        not m.bot for m in voice_client.channel.members
     ):
-        return f"Bot is already being used in channel {voice_client.channel}"
-    return None
+        return None
+    return f"Bot is already being used in channel {voice_client.channel}"
 
 
 def voice_refusal(ctx: commands.Context, *, queue_control: bool) -> Optional[str]:
@@ -708,6 +712,22 @@ class PlayRegistry:
             task.add_done_callback(_done)
             return task, True
         return plays.join, False
+
+    async def cancel_join(self, guild_id: int) -> None:
+        """Cancel the guild's in-flight cold join, so a teardown cannot leave one
+        running behind it. A surviving connector sends op 4 naming the channel the
+        teardown just cleared, and its own timeout then pops the guild's voice
+        client by id alone — which by then may be a NEWER, connected one.
+        See docs/ARCHITECTURE.md#voice-teardown.
+
+        Never cancels the calling task, so a teardown that runs on the join's own
+        task finishes. Await it directly: inside asyncio.gather, current_task() is
+        the gather's child and the guard sees a stranger.
+        """
+        plays = self._guilds.get(guild_id)
+        join = plays.join if plays is not None else None
+        if join is not None and join is not asyncio.current_task():
+            await cancel_task(join)
 
     @contextlib.asynccontextmanager
     async def place(self, req: PlayRequest) -> AsyncGenerator[PlaceResult]:

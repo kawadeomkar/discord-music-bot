@@ -429,6 +429,77 @@ class TestPlayRegistry:
         await settle()
         assert not music_bot._plays._guilds
 
+    async def test_cancel_join_stops_the_in_flight_connector(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A teardown that leaves the join running races its own disconnect: the
+        connector sends op 4 naming the channel the teardown just cleared, and its
+        own timeout then pops the guild's voice client by id alone."""
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+        started = asyncio.Event()
+
+        async def _join(*_a: Any, **_k: Any) -> None:
+            started.set()
+            await asyncio.Event().wait()  # a handshake that never lands
+
+        mock_ctx.invoke = AsyncMock(side_effect=_join)
+        music_bot._restore_tasks = set()
+        join, _owns = music_bot._plays.cold_join(
+            req,
+            joiner=lambda: mock_ctx.invoke(music_bot.join),
+            tracked=music_bot._restore_tasks,
+        )
+        await started.wait()
+
+        await music_bot._plays.cancel_join(req.guild_id)
+
+        assert join.cancelled()
+
+    async def test_cancel_join_never_cancels_its_own_caller(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A teardown running on the join's own task would cancel itself and
+        abandon every step after it. Awaited directly, as cleanup() does; through
+        asyncio.gather the guard sees the gather's child instead (pinned in
+        test_musicbot)."""
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+        returned = asyncio.Event()
+
+        async def _join(*_a: Any, **_k: Any) -> None:
+            await music_bot._plays.cancel_join(req.guild_id)
+            returned.set()
+
+        mock_ctx.invoke = AsyncMock(side_effect=_join)
+        music_bot._restore_tasks = set()
+        join, _owns = music_bot._plays.cold_join(
+            req,
+            joiner=lambda: mock_ctx.invoke(music_bot.join),
+            tracked=music_bot._restore_tasks,
+        )
+        await join
+
+        assert returned.is_set() and not join.cancelled()
+
+    async def test_cancel_join_is_inert_for_an_unregistered_guild(
+        self, music_bot: MusicBot
+    ) -> None:
+        guild_id = 999000000000000001
+        await music_bot._plays.cancel_join(guild_id)
+        assert not music_bot._plays.join_in_flight(guild_id)
+        assert guild_id not in music_bot._plays._guilds
+
+    async def test_cancel_join_is_inert_for_a_guild_resolving_warm(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A registered guild whose requests took the warm path has no join; its
+        resolving requests are not the cancel's to touch."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        await music_bot._plays.cancel_join(req.guild_id)
+        assert not req.settled.is_set() and not req.dropped_by
+        assert music_bot._plays._guilds[req.guild_id].inflight == [req]
+
     async def test_the_cap_raise_escapes_the_command_body(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

@@ -7,12 +7,14 @@ owns both the extracted module and the cog surface that reaches it.
 """
 
 import asyncio
+import time
 from typing import Any, Optional, cast
 from collections.abc import Coroutine
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import orjson
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 import pytest
 import redis.asyncio as aioredis
 from discord.ext import commands
@@ -20,12 +22,15 @@ from redis.asyncio import Redis
 
 from src.guild_state import GuildConfig
 from src.musicbot import MusicBot
+import src.recovery as recovery
 from src.recovery import (
     VoiceWatchdog,
     _Countdown,
     _countdown_embed,
     _seconds_left,
+    discord_holds_voice_state,
     join_succeeded,
+    leave_voice,
     restore_guild,
 )
 from src.util import BAR_WIDTH, drain_bar
@@ -554,12 +559,78 @@ class TestVoiceStateConsistency:
         before.channel = MagicMock()
         after = MagicMock(spec=discord.VoiceState)
         after.channel = MagicMock()  # moved to a new channel, not ejected
+        after.channel.members = [MagicMock(spec=discord.Member, bot=True)]
 
         with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()):
             await music_bot_with_redis.on_voice_state_update(member, before, after)
 
         timer.cancel.assert_called_once()
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._countdowns
+
+    async def test_bot_muted_in_place_leaves_the_countdown_running(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A mute or deafen of the alone bot keeps its channel: not a move, so the
+        countdown neither cancels (the bot would stay alone for good) nor ends."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        timer = make_mock_task()
+        rejoined = asyncio.Event()
+        music_bot_with_redis.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=timer, rejoined=rejoined
+        )
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        channel = MagicMock()
+        channel.members = [MagicMock(spec=discord.Member, bot=True)]
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = channel
+
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        timer.cancel.assert_not_called()
+        assert not rejoined.is_set()
+        assert mock_guild.id in music_bot_with_redis.voice_watchdog._countdowns
+        mock_cleanup.assert_not_awaited()
+
+    async def test_bot_moved_beside_a_listener_ends_the_countdown_on_its_card(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A -join that pulls the alone bot to its author signals the countdown
+        rather than cancelling it, so the card's last frame says someone is back."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        timer = make_mock_task()
+        rejoined = asyncio.Event()
+        music_bot_with_redis.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=timer, rejoined=rejoined
+        )
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = MagicMock()
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = MagicMock()
+        after.channel.members = [
+            MagicMock(spec=discord.Member, bot=True),
+            MagicMock(spec=discord.Member, bot=False),
+        ]
+
+        with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()):
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        assert rejoined.is_set()
+        timer.cancel.assert_not_called()
+        assert mock_guild.id in music_bot_with_redis.voice_watchdog._countdowns
 
     async def test_member_in_inactive_guild_ignored(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
@@ -1358,3 +1429,105 @@ class TestJoinSucceeded:
 
     def test_non_voice_client_fails(self) -> None:
         assert join_succeeded(self._ctx(MagicMock())) is False
+
+
+class TestDiscordHoldsVoiceState:
+    """What decides whether a disconnect is forced. Each False shape is one where a
+    forced clear would wait on a VOICE_STATE_UPDATE Discord never sends."""
+
+    @staticmethod
+    def _guild(voice: Optional[discord.VoiceState]) -> MagicMock:
+        guild = MagicMock(spec=discord.Guild)
+        guild.me = MagicMock(spec=discord.Member)
+        guild.me.voice = voice
+        return guild
+
+    def test_a_voice_state_with_a_channel_holds(self) -> None:
+        voice = MagicMock(spec=discord.VoiceState)
+        voice.channel = MagicMock(spec=discord.VoiceChannel)
+        assert discord_holds_voice_state(self._guild(voice)) is True
+
+    def test_no_voice_state_does_not_hold(self) -> None:
+        assert discord_holds_voice_state(self._guild(None)) is False
+
+    def test_a_voice_state_without_a_channel_does_not_hold(self) -> None:
+        # What an unmatched channel=None update inserts.
+        voice = MagicMock(spec=discord.VoiceState)
+        voice.channel = None
+        assert discord_holds_voice_state(self._guild(voice)) is False
+
+    def test_no_bot_member_does_not_hold(self) -> None:
+        guild = MagicMock(spec=discord.Guild)
+        guild.me = None
+        assert discord_holds_voice_state(guild) is False
+
+
+class TestLeaveVoice:
+    """Driven through the pinned discord.py's own VoiceClient.disconnect and
+    VoiceConnectionState: the wait being capped is the state machine's, and the
+    cap only holds if a cancellation landing there still unregisters the client."""
+
+    @staticmethod
+    def _voice_client() -> tuple[discord.VoiceClient, VoiceConnectionState, AsyncMock]:
+        """A real VoiceClient over a real connection state parked short of
+        `connected`. __new__, because __init__ demands PyNaCl and davey;
+        SocketReader.start is patched out because nothing here feeds it a socket."""
+        vc = object.__new__(discord.VoiceClient)
+        change_voice_state = AsyncMock()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 924267988138483772
+        guild.change_voice_state = change_voice_state
+        channel = MagicMock(spec=discord.VoiceChannel)
+        channel.id = 925632451882143764
+        channel.guild = guild
+        vc.channel = channel
+        vc.stop = cast(Any, MagicMock())
+        vc.cleanup = cast(Any, MagicMock())
+        with patch("discord.voice_state.SocketReader.start"):
+            state = VoiceConnectionState(vc)
+        state.state = ConnectionFlowState.got_both_voice_updates
+        vc._connection = state
+        return vc, state, change_voice_state
+
+    async def test_an_unanswered_clear_is_cut_at_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """discord.py's own wait is its whole connection timeout, inside cleanup()'s
+        window with the guild's player already popped. Timed rather than guarded by
+        asyncio.timeout: that wait swallows the cancellation, so a guard expiring
+        there returns normally instead of failing the test."""
+        vc, state, change_voice_state = self._voice_client()
+        state.timeout = 2.0  # stands in for restore_guild's 30s
+        monkeypatch.setattr(recovery, "VOICE_CLEAR_WAIT_SECS", 0.05)
+
+        started = time.monotonic()
+        await leave_voice(vc, force=True)
+
+        assert time.monotonic() - started < 1.0
+
+        change_voice_state.assert_awaited_once_with(channel=None)
+        assert state.state is ConnectionFlowState.disconnected
+        cast(MagicMock, vc.cleanup).assert_called()
+
+    async def test_an_answered_clear_returns_on_the_confirmation(self) -> None:
+        vc, state, change_voice_state = self._voice_client()
+        change_voice_state.side_effect = lambda **_: (
+            asyncio.get_running_loop().call_soon(state._disconnected.set)
+        )
+
+        started = time.monotonic()
+        await leave_voice(vc, force=True)
+
+        assert time.monotonic() - started < recovery.VOICE_CLEAR_WAIT_SECS / 2
+        change_voice_state.assert_awaited_once_with(channel=None)
+        cast(MagicMock, vc.cleanup).assert_called()
+
+    async def test_an_unforced_disconnect_below_connected_sends_nothing(
+        self,
+    ) -> None:
+        vc, _state, change_voice_state = self._voice_client()
+
+        await leave_voice(vc, force=False)
+
+        change_voice_state.assert_not_awaited()
+        cast(MagicMock, vc.cleanup).assert_called_once()

@@ -17,6 +17,44 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.55.3 — 2026-10-02
+
+**Two ways a half-connected bot used to go unnoticed, both closed.** discord.py registers
+a voice client before the handshake lands, so an abandoned one stays registered and
+answers as if the bot had joined. Nothing checked.
+
+- **The bot no longer rejoins a channel after you stopped it.** `-stop`, the alone timer,
+  an eject and `-resume` all tore the session down without cancelling a join that was
+  still running, so that join could land afterwards and put the bot back in the channel
+  — silent, with no queue and nothing playing, after the saved connection had already
+  been cleared. Worse, when that stale join finally timed out it dropped whatever voice
+  client the guild held by then, which could be a healthy one a later `-play` had just
+  made. That one presented as the bot being in the channel while every command insisted
+  it was not. A stop that lands in the instant the bot is asking Discord to join now
+  tells Discord it left as well, and a stop never waits more than 3 seconds on Discord
+  confirming it.
+- **`-join` repairs a half-connected bot instead of half-working.** Handed an abandoned
+  client it skipped its own connect, reported nothing, saved the channel and started
+  playback — and every song then failed one at a time, emptying the queue in memory while
+  Redis still held it. It now drops the abandoned client and connects properly. If that
+  connection does not complete either, it says "Couldn't finish connecting to your voice
+  channel" and asks for another `-join`, saves nothing, and leaves the queue alone. A
+  `-play` that joins for you reports the same way it always did.
+- **`-join` brings the bot to you when nobody is listening where it is.** It used to
+  answer "Bot is already being used in channel X" even from an empty channel — the
+  bot sat alone until the alone timer disconnected it. It now moves, and the song
+  playing carries on in your channel. A channel with someone still in it keeps the bot,
+  as before.
+- **Muting the bot no longer keeps it in an empty channel for good.** Server-muting or
+  deafening the bot while it counted down to leaving an empty channel stopped the
+  countdown, so it never left. The countdown now runs on.
+- **Nothing to do**, and no state to clean up: both windows were in memory only. If you
+  have a server where the bot shows as connected but answers "I'm not in a voice
+  channel", `-join` once after deploying this.
+- **Roll back freely**, to any 2.54.x.
+
+## 2.54.6 — 2026-10-01
+
 ## 2.55.2 — 2026-10-02
 
 **A `-play` whose song lookup fails no longer breaks the next one.** When the lookup
