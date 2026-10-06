@@ -311,8 +311,13 @@ class VoiceWatchdog:
                         )
                         await cog.cleanup(guild)
             elif before.channel is not None and after.channel is not None:
-                # Moved — cancel any timer counting down the old channel.
-                self.cancel(guild.id)
+                # Moved. Beside a listener (a -join from them) the countdown ends on
+                # its rejoined frame; otherwise any timer for the old channel is
+                # cancelled.
+                if any(not m.bot for m in after.channel.members):
+                    self._signal_rejoin(guild.id)
+                else:
+                    self.cancel(guild.id)
             return
 
         # ── Case B: a human member's voice state changed ──────────────────────

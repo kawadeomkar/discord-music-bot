@@ -188,6 +188,38 @@ class TestCheckVoicePermissions:
         vc.channel = channel_b
         assert check_voice_permissions(member, vc, "skip") is not None
 
+    @staticmethod
+    def _elsewhere(*members_are_bots: bool) -> tuple[MagicMock, MagicMock]:
+        """A member in one channel and a voice client in another, whose members
+        are bots or humans as given."""
+        member = MagicMock(spec=discord.Member)
+        member.voice = MagicMock()
+        member.voice.channel = MagicMock(spec=discord.VoiceChannel)
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.members = [
+            MagicMock(spec=discord.Member, bot=is_bot) for is_bot in members_are_bots
+        ]
+        return member, vc
+
+    def test_join_takes_the_bot_from_a_channel_with_no_listener(self) -> None:
+        member, vc = self._elsewhere(True)  # only the bot itself
+        assert check_voice_permissions(member, vc, "join") is None
+
+    def test_join_ignores_other_bots_when_counting_listeners(self) -> None:
+        member, vc = self._elsewhere(True, True)
+        assert check_voice_permissions(member, vc, "join") is None
+
+    def test_join_leaves_the_bot_with_a_listener(self) -> None:
+        member, vc = self._elsewhere(True, False)
+        assert "already being used" in str(check_voice_permissions(member, vc, "join"))
+
+    def test_only_join_is_exempt_in_an_empty_channel(self) -> None:
+        """Nothing but -join moves the bot, so -skip from elsewhere would act on a
+        channel its author is not in, listener or not."""
+        member, vc = self._elsewhere(True)
+        assert check_voice_permissions(member, vc, "skip") is not None
+
     def test_allows_play_in_different_channel(self) -> None:
         member = MagicMock(spec=discord.Member)
         member.voice = MagicMock()

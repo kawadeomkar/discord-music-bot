@@ -40,6 +40,11 @@ answers as if the bot had joined. Nothing checked.
   connection does not complete either, it says "Couldn't finish connecting to your voice
   channel" and asks for another `-join`, saves nothing, and leaves the queue alone. A
   `-play` that joins for you reports the same way it always did.
+- **`-join` brings the bot to you when nobody is listening where it is.** It used to
+  answer "Bot is already being used in channel X" even from an empty channel — the
+  bot sat alone until the alone timer disconnected it. It now moves, and the song
+  playing carries on in your channel. A channel with someone still in it keeps the bot,
+  as before.
 - **Nothing to do**, and no state to clean up: both windows were in memory only. If you
   have a server where the bot shows as connected but answers "I'm not in a voice
   channel", `-join` once after deploying this.

@@ -311,18 +311,21 @@ def check_voice_permissions(
 ) -> Optional[str]:
     """Returns an error message if validation fails, None if OK. Plain -play is
     exempt from the same-channel rule (appending costs listeners elsewhere
-    nothing); queue control is gated like -skip/-shuffle/-remove/-clear."""
+    nothing); queue control is gated like -skip/-shuffle/-remove/-clear. -join is
+    exempt while no human is in the bot's channel: the rule protects listeners."""
     if isinstance(author, discord.User):
         return f"You must be a member of this channel {author}"
     if not author.voice or not author.voice.channel:
         return f"You are not connected to a voice channel, you silly baka {author}"
-    if (
-        (command_name != "play" or queue_control)
-        and voice_client is not None
-        and voice_client.channel != author.voice.channel
+    if voice_client is None or voice_client.channel == author.voice.channel:
+        return None
+    if command_name == "play" and not queue_control:
+        return None
+    if command_name == "join" and not any(
+        not m.bot for m in voice_client.channel.members
     ):
-        return f"Bot is already being used in channel {voice_client.channel}"
-    return None
+        return None
+    return f"Bot is already being used in channel {voice_client.channel}"
 
 
 def voice_refusal(ctx: commands.Context, *, queue_control: bool) -> Optional[str]:

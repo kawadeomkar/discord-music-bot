@@ -914,8 +914,9 @@ class MusicBot(commands.Cog):
         help=(
             "Connects the bot to the voice channel you are in and reports its "
             "latency. You rarely need this — `-play` and `-resume` join for you.\n\n"
-            "If the bot is already playing in a different voice channel it stays "
-            "there rather than abandoning that listener."
+            "If the bot is in a different voice channel it moves to yours, queue "
+            "and current song included — unless someone is still listening "
+            "there, in which case it stays rather than abandoning them."
         ),
         extras={"category": "Utility", "examples": ["-join", "-summon"]},
     )

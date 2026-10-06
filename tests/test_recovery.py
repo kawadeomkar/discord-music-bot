@@ -559,12 +559,45 @@ class TestVoiceStateConsistency:
         before.channel = MagicMock()
         after = MagicMock(spec=discord.VoiceState)
         after.channel = MagicMock()  # moved to a new channel, not ejected
+        after.channel.members = [MagicMock(spec=discord.Member, bot=True)]
 
         with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()):
             await music_bot_with_redis.on_voice_state_update(member, before, after)
 
         timer.cancel.assert_called_once()
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._countdowns
+
+    async def test_bot_moved_beside_a_listener_ends_the_countdown_on_its_card(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A -join that pulls the alone bot to its author signals the countdown
+        rather than cancelling it, so the card's last frame says someone is back."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        timer = make_mock_task()
+        rejoined = asyncio.Event()
+        music_bot_with_redis.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=timer, rejoined=rejoined
+        )
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = MagicMock()
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = MagicMock()
+        after.channel.members = [
+            MagicMock(spec=discord.Member, bot=True),
+            MagicMock(spec=discord.Member, bot=False),
+        ]
+
+        with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()):
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        assert rejoined.is_set()
+        timer.cancel.assert_not_called()
+        assert mock_guild.id in music_bot_with_redis.voice_watchdog._countdowns
 
     async def test_member_in_inactive_guild_ignored(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
