@@ -1791,7 +1791,6 @@ class TestMusicSearchFallback:
         [
             # The artist is in the artist column, the song in the title.
             ("xvi akiaura", "XVI", "akiaura, LONOWN & DJ Pointless", True),
-            ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", "ARCADIA", True),
             # Live, 2026-10-06: the original is titled without its artist.
             ("just your doll snow strippers", "Just Your Doll", "Snow Strippers", True),
             # Every title below is one music search really answered these with.
@@ -1848,7 +1847,6 @@ class TestMusicSearchFallback:
         ],
         ids=[
             "artist-in-its-column",
-            "artist-in-the-title",
             "title-without-artist",
             "stopword-in-a-url",
             "stopwords-only",
@@ -1870,7 +1868,7 @@ class TestMusicSearchFallback:
         named = youtube._match_tokens(query) & youtube._match_tokens(artists)
         assert (
             _music_candidate_matches(
-                query, title, artists, ask_artists=frozenset(named)
+                query, title, artists, ask_artists=frozenset(named), corroborated=True
             )
             is wanted
         )
@@ -2560,7 +2558,14 @@ class TestRelevanceGate:
              {"yoasobi"}, False, False),
             # Script: the ask's own script matches; a romanised ask can only take
             # the corroborated pick by its artist.
-            ("夜に駆ける", "夜に駆ける", "YOASOBI", set(), False, True),
+            ("夜に駆ける", "夜に駆ける", "YOASOBI", set(), True, True),
+            # An ask naming no artist has only its words, which any song sharing a
+            # title with a tutorial carries: music search has to back the pick.
+            ("how to tie a tie", "How To Tie A Tie", "Stellar Core", set(), False, False),
+            ("how to tie a tie", "How To Tie A Tie", "Stellar Core", set(), True, True),
+            # The ask's artist named only in an upload's title is not its credit.
+            ("radiohead weird fishes", "Radiohead - Weird Fishes [OFFICIAL VIDEO]",
+             "avalanchealonso", {"radiohead"}, True, False),
             ("夜に駆ける", "Yoru ni Kakeru VOSTFR", "fansub", set(), False, False),
             ("yoru ni kakeru yoasobi", "夜に駆ける", "YOASOBI", {"yoasobi"}, True, True),
             ("yoru ni kakeru yoasobi", "夜に駆ける", "YOASOBI", {"yoasobi"}, False, False),
@@ -2581,7 +2586,7 @@ class TestRelevanceGate:
             ("the weeknd blinding lights remix", "Blinding Lights", "The Weeknd",
              {"weeknd"}, True, False),
             ("blinding lights remix", "Blinding Lights (Remix)", "The Weeknd & ROSALÍA",
-             set(), False, True),
+             set(), True, True),
             ("tame impala let it happen", "Let It Happen (Live)", "Tame Impala",
              {"tame", "impala"}, True, False),
             ("zzzzqqqq no such song anywhere 98765", "ispiunauhezkipqq", "qqqq",
@@ -2590,6 +2595,7 @@ class TestRelevanceGate:
         ids=[
             "artist-column", "artist-column-many", "slash-title", "ugc-names-artist",
             "artist-not-song", "only-artist", "other-act", "same-script",
+            "no-artist-uncorroborated", "no-artist-corroborated", "artist-only-in-title",
             "other-script-ugc", "romanised-card", "romanised-row", "romanised-other-act",
             "cyrillic", "artist-other-script", "two-of-three-no-artist",
             "one-of-two-no-artist", "episode-of-the-wrong-show", "card-half",
@@ -2640,6 +2646,19 @@ class TestRelevanceGate:
             ("joe rogan experience 2000", "all", (), None, None),
             ("hbomberguy plagiarism and you", "all", (), None, None),
             ("kurzgesagt black holes", "all", (), None, None),
+            # Non-music asks: every word is in some song's title, and nothing
+            # music search ranks backs the song.
+            ("how to tie a tie", "all", (), None, None),
+            ("lofi 1 hour", "all", (), None, None),
+            ("coffin dance meme", "all", (), None, None),
+            ("markiplier fnaf 1", "all", (), None, None),
+            ("ocarina of time full soundtrack", "all", (), None, None),
+            # ...and the ones it does back: the card's live cut is a rendition the
+            # ask did not name, and the card's artist backs the studio row.
+            ("bohemian rhapsody", "all", (), None, "BSTsnWoslP4"),
+            ("hotel california", "all", (), None, "BciS5krYL80"),
+            # A podcast is credited to its show, which the ask names.
+            ("lex fridman podcast elon musk", "all", (), None, "JN3KPFbWCy8"),
         ],
     )
     def test_the_pick_over_a_recorded_answer(
@@ -2659,19 +2678,42 @@ class TestRelevanceGate:
         assert (got.get("id") if got is not None else None) == picked
 
     def test_an_artist_word_is_one_the_answer_names_as_an_artist(self) -> None:
-        """ "yoasobi" names an artist in the result set, so a cover by someone else
-        is a rendition even though it shares the song's words."""
+        """ "yoasobi" is the whole name of an act the answer credits, so a cover by
+        someone else is a rendition even though it shares the song's words."""
         entries: list[Any] = [
             {"ie_key": "Youtube", "id": "cover123456", "title": "Yoru ni Kakeru",
-             "artists": "MyReminiscence"},
+             "artists": "MyReminiscence", "music_top": True},
             {"ie_key": "Youtube", "id": "orig1234567", "title": "Racing Into The Night",
              "artists": "YOASOBI"},
         ]  # fmt: skip
         assert youtube._music_pick("yoru ni kakeru yoasobi", entries) is None
-        # Without the second entry nothing names YOASOBI an artist: the cover's
-        # title carries every word but the artist's, which is not all of them.
-        assert youtube._music_pick("yoru ni kakeru yoasobi", entries[:1]) is None
+        # Nothing credits YOASOBI: an ask naming no artist, backed by the card.
         assert youtube._music_pick("yoru ni kakeru", entries[:1]) is not None
+
+    def test_an_artist_is_named_only_by_its_whole_name(self) -> None:
+        """An ask's word that is one word of a credit does not make the ask that
+        act's: read so, "tie" would be an artist word here, the slip-knot track
+        credited to it, and "how" the whole song."""
+        entries: list[Any] = [
+            {"ie_key": "Youtube", "id": "knot1234567",
+             "title": "How To Tie A Slip Knot (Intro)", "artists": "Tie Fighter"},
+        ]  # fmt: skip
+        assert youtube._music_pick("how to tie a tie", entries) is None
+        # A credit naming several acts: each is a whole name of its own.
+        many: list[Any] = [
+            {"ie_key": "Youtube", "id": "xvi12345678", "title": "XVI",
+             "artists": "akiaura, LONOWN & DJ Pointless"},
+        ]  # fmt: skip
+        assert youtube._music_pick("xvi akiaura", many) is not None
+
+    def test_an_episode_is_credited_to_its_show(self) -> None:
+        episode = next(
+            e
+            for e in _music_entries("lex fridman podcast elon musk")
+            if e["id"] == "JN3KPFbWCy8"
+        )
+        assert episode["music_kind"] == "episode"
+        assert episode["artists"] == "Lex Fridman Podcast"
 
 
 class TestAgeRestrictedSearch:

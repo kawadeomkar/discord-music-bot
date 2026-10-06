@@ -172,9 +172,11 @@ sends one music search POST through `ExtractRequest(music_search=True)`: the wor
 yt-dlp's own request (`_music_search`, two private yt-dlp methods) and parses the answer
 itself (`_music_search_entries`), because yt-dlp's parser keeps only a row's title and
 drops the top-result card. `_music_pick` takes the card first, then the rows, and
-`_music_candidate_matches` gates each on the ask's artist words (read off the answer's
-artist column), its song words (tokenized script-aware: NFKC, case-folded, CJK/Thai as
-character pairs) and, for a Spotify ask, its length. The winner's watch URL resolves
+`_music_candidate_matches` gates each on the ask's artist words (the whole name of an
+act the answer credits; the candidate must be credited to it, not merely name it in its
+title), its song words (tokenized script-aware: NFKC, case-folded, CJK/Thai as character
+pairs) and, for a Spotify ask, its length. An ask naming no artist needs the pick backed
+by music search itself (the top card, the card's artist, or a matching length). The winner's watch URL resolves
 processed. The parser is pinned by recorded responses in `tests/data/ytmusic_search.json`
 — re-record them (and re-read `_music_search_entries`) when a yt-dlp bump or a YouTube
 change moves the renderer shapes. Why each of those, and what it costs:

@@ -646,6 +646,9 @@ def _music_entry(
     if segments and segments[0].casefold() in _MUSIC_ROW_KINDS:
         kind = segments.pop(0).casefold()
     durations = [secs for s in segments if (secs := _music_clock_secs(s)) is not None]
+    # An episode's first segment is its date; the show after it is its credit.
+    credits = segments[1:] if kind == "episode" else segments
+    credit = credits[0] if credits else ""
     video_type = str(
         _dig(
             endpoint,
@@ -666,7 +669,7 @@ def _music_entry(
             for run in _dig(title, "runs") or []
             if isinstance(run, dict)
         ),
-        "artists": segments[0] if segments else "",
+        "artists": credit,
         "music_kind": kind,
         "music_video_type": video_type,
         "music_top": top,
@@ -1873,11 +1876,13 @@ def _music_candidate_matches(
     """Whether a music-search result is plausibly the answer to `query`.
 
     `ask_artists` are the ask's words that name an artist somewhere in the result
-    set; the candidate has to carry one of them, so another act's rendition fails.
+    set; the candidate has to be credited to one of them, so another act's
+    rendition, or an upload that only names the artist in its title, fails.
     The ask's other words are the song, and the title has to carry all of them when
     no artist was named, two thirds when one was, half when the candidate is also
-    `corroborated` (music search's top card, or its length is the one the ask
-    knows). A corroborated candidate by the ask's artist whose title is in a script
+    `corroborated` (music search's top card, by the card's artist, or its length is
+    the one the ask knows). An ask naming no artist needs the corroboration: words
+    alone match any song that shares a title with a tutorial or a meme. A corroborated candidate by the ask's artist whose title is in a script
     the ask did not type passes on that alone. A rendition (karaoke, live) passes
     only when the ask names it too. See docs/ARCHITECTURE.md#the-relevance-gate."""
     wanted = _match_tokens(_SEARCH_PREFIX_RE.sub("", query))
@@ -1888,7 +1893,7 @@ def _music_candidate_matches(
         return False
     artist_tokens = _match_tokens(artists)
     named = wanted & ask_artists
-    if named and not named & (artist_tokens | title_tokens):
+    if named and not named & artist_tokens:
         return False
     song_words = wanted - named
     if not song_words:
@@ -1899,7 +1904,7 @@ def _music_candidate_matches(
             return True
     shared = len(song_words & title_tokens)
     if not named:
-        return shared == len(song_words)
+        return corroborated and shared == len(song_words)
     if corroborated:
         return shared > 0 and 2 * shared >= len(song_words)
     return shared > 0 and 3 * shared >= 2 * len(song_words)
@@ -1911,6 +1916,11 @@ def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bo
     if expected is None or duration is None:
         return True
     return abs(int(duration) - expected) <= _MUSIC_DURATION_TOLERANCE_SECS
+
+
+# Where one credited artist ends and the next begins in an artist segment
+# ("akiaura, LONOWN & DJ Pointless", "Pritam feat. Arijit Singh").
+_CREDIT_SPLIT_RE = re.compile(r",|&|/|\bfeat\.?|\bft\.|\s+x\s+", re.IGNORECASE)
 
 
 def _music_pick(
@@ -1934,11 +1944,21 @@ def _music_pick(
         and len(str(entry.get("id") or "")) == _VIDEO_ID_LEN
         and entry.get("id") not in exclude
     ]
-    # An ask's word that names an artist anywhere in the answer is an artist word,
-    # and a candidate by someone else is a rendition. See the gate's docstring.
-    named = _match_tokens(query) & frozenset().union(
-        *(_match_tokens(entry.get("artists") or "") for entry in tracks)
-    )
+    # The ask names an artist when it carries the whole name of one the answer
+    # credits; its words are then artist words, and a candidate by someone else is a
+    # rendition. Whole names, so "tie" in a credit does not make "how to tie a tie"
+    # an artist's ask. See the gate's docstring.
+    asked = _match_tokens(query)
+    named: set[str] = set()
+    for entry in tracks:
+        for credit in _CREDIT_SPLIT_RE.split(entry.get("artists") or ""):
+            tokens = _match_tokens(credit)
+            if tokens and tokens <= asked:
+                named |= tokens
+    # The artist music search's own top card credits — read before `exclude`, since
+    # a card that cannot play still says whose song the ask is.
+    card = next((e for e in entries if e and e.get("music_top")), None)
+    card_artists = _match_tokens(card.get("artists") or "") if card else set()
     for entry in tracks:
         duration = entry.get("duration")
         if duration is not None and not _music_duration_fits(
@@ -1946,12 +1966,15 @@ def _music_pick(
         ):
             continue
         timed = duration is not None and expected_duration is not None
+        artists = entry.get("artists") or ""
         if _music_candidate_matches(
             query,
             entry.get("title"),
-            entry.get("artists") or "",
+            artists,
             ask_artists=frozenset(named),
-            corroborated=bool(entry.get("music_top")) or timed,
+            corroborated=bool(entry.get("music_top"))
+            or timed
+            or bool(card_artists & _match_tokens(artists)),
         ):
             return entry
     return None

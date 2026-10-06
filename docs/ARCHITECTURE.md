@@ -965,7 +965,7 @@ the socket timeout stay yt-dlp's. Only `_music_search_entries` is the bot's: a p
 function over the response, tested against recorded answers
 (`tests/data/ytmusic_search.json`). It yields the card first, then the rows, each id once,
 as flat entries with four more fields — `artists` (the subtitle's artist segment as
-shown), `music_kind` (`song`, `video` or `episode`; a songs-section row carries no label
+shown; an episode's show), `music_kind` (`song`, `video` or `episode`; a songs-section row carries no label
 and is a song), `music_video_type`, `music_top` — plus `duration` where the subtitle
 prints a clock (the card and every songs-section row; an unfiltered row prints plays or
 views instead) and the thumbnail. The request runs in the pool like every other search,
@@ -1006,18 +1006,27 @@ anything — and `_MIN_MATCH_WORD_OTHER` (2) in any other script, where `좋은`
 two-letter Cyrillic word carries more. `_MATCH_STOPWORDS` (`the`, `you`, `song`,
 `official`…) drop out of both sides.
 
-The ask's tokens split in two. **Artist words** are the ones some result in the answer
-credits as an artist (`_music_pick` reads every candidate's `artists`); the rest are the
-**song words**. A candidate:
+The ask's tokens split in two. **Artist words** are the tokens of an act the answer
+credits whose WHOLE name is in the ask — `_music_pick` splits every candidate's credit at
+`,`, `&`, `/`, `feat.` and ` x ` (`_CREDIT_SPLIT_RE`), so `akiaura` is named by
+`xvi akiaura` out of "akiaura, LONOWN & DJ Pointless". Whole names, because a songs answer
+for `how to tie a tie` credits an act called "tie a tie", and one shared word would have
+made "tie" an artist word. The rest are the **song words**. A podcast episode's subtitle
+leads with its date, so its credit is the show after it ("Lex Fridman Podcast"). A
+candidate:
 
-- **carries one of the artist words**, in its artist column or its title (UGC uploads put
-  the artist in the title). So a cover by another act is a rendition: `yoru ni kakeru
+- **is credited to one of the artist words**, in its artist column — not its title, where
+  a re-upload ("Radiohead - Weird Fishes [OFFICIAL VIDEO]" by avalanchealonso) or a fan mix
+  names the act it is not. So a cover by another act is a rendition: `yoru ni kakeru
   yoasobi` declines "Yoru ni Kakeru 「夜に駆ける」" by MyReminiscence;
-- **carries the song words in its title** — all of them when the ask named no artist, two
-  thirds when it did, and half when the candidate is also **corroborated**: music search's
-  own top card, or a length that matches the one a Spotify ask knows. Without the artist
-  column a title could never carry an ask's artist half, so "Not Like Us" failed
-  `Kendrick Lamar - Not Like Us` on one word of three and a street clip naming him won;
+- **carries the song words in its title** — two thirds of them when the ask named an
+  artist, half when the candidate is also **corroborated**, and all of them, corroborated,
+  when the ask named none. Corroborated means music search backs the candidate itself:
+  it is the top-result card, it is credited to the card's artist (read before `exclude`,
+  since a restricted card still says whose song the ask is), or its printed length
+  matches the one a Spotify ask knows. Without the artist column a title could never
+  carry an ask's artist half, so "Not Like Us" failed `Kendrick Lamar - Not Like Us` on
+  one word of three and a street clip naming him won;
 - **is no rendition the ask did not name, and the rendition it did name**:
   `_MATCH_VARIANT_WORDS` (`karaoke`, `nightcore`, `live`, `remix`, `cover`, `reacts`…) has
   to be the same set on both sides. Measured on 2026-10-06, music search ranked "Snow
@@ -1025,21 +1034,41 @@ credits as an artist (`_music_pick` reads every candidate's `artists`); the rest
   between calls, so the gate cannot lean on order;
 - **or, corroborated and by the ask's artist, has a title in a script the ask's song words
   are not written in.** `yoru ni kakeru yoasobi` cannot share a token with "夜に駆ける";
-  YOASOBI's own top card can still be the answer. Transliteration is not attempted, so an
-  Arabic or Thai ask whose answer is credited and titled in Latin declines.
+  YOASOBI's own top card can still be the answer.
+
+**An ask that names no artist needs music search to back the pick**, because its words
+alone are no evidence: every word of `how to tie a tie` is in "How To Tie A Tie", an art
+track by Stellar Core, and the gate cannot know the ask is not a song. Music search
+returns no card for it, and nothing it ranks is by a card's artist, so it declines. A
+title-only song ask keeps its answer through the card: `bohemian rhapsody`'s card is a
+live cut the ask did not name, and the studio track below it is by the card's artist.
+The kind and `musicVideoType` music search reports were weighed for this and do not
+separate the two: the tutorial's namesake is an `ATV` song, and the right answer to
+`lex fridman podcast elon musk` is an `episode`.
+
+**Transliteration was weighed and not built.** Matching a romanised ask against a native
+title (or Arabic against Latin) needs a romaniser per script, and the ones tried on
+2026-10-06 are unsound where it matters: `unidecode` reads kanji as Chinese pinyin
+("夜に駆ける" → "Ye niQu keru") and drops Arabic's unwritten vowels ("تملي معاك" →
+"tmly m`k", against the credited "Tamally Maak"); the dictionary-backed `pykakasi` gives
+"yoru ni kake ru", which still misses the ask's "kakeru" token, and is a new dependency. The
+corroborated-card exception above already covers the case that comes up — the act's own
+card — so an Arabic or Thai ask whose answer is credited and titled in Latin declines.
 
 Over the research's 46-query set — music search's answers recorded on 2026-10-06 and
 replayed through both gates (`docs/ytm_research/gate_eval.py`) — against the title-only
 gate: `Kendrick Lamar - Not Like Us`, `kesariya arijit singh`,
 `Radiohead - Weird Fishes/Arpeggi`, `yoru ni kakeru yoasobi`, `夜に駆ける`,
 `кино группа крови` and `minecraft sweden c418` now take the artist's own recording where
-they took a lyric upload, a re-upload, a fan sub, a fan edit or nothing;
-`joe rogan experience 2000`, `hbomberguy plagiarism and you` and `kurzgesagt black holes`
-now decline where they took a rap song, a reaction video and another band's song; every
-nonsense ask still declines. Still wrong: `how to tie a tie` takes a song of that name and
-`among us drip theme` a fan remix — the ask's words are all there, and only a classifier
-of non-music asks could tell, which music search's corpus makes moot for the walled asks
-this path exists for.
+they took a lyric upload, a re-upload, a fan sub, a fan edit or nothing; `joe rogan
+experience 2000`, `hbomberguy plagiarism and you`, `kurzgesagt black holes`,
+`how to tie a tie`, `among us drip theme`, `markiplier fnaf 1` and `coffin dance meme`
+now decline where they took a rap song, a reaction, another band's song, a namesake song,
+fan remixes or a cover; every nonsense ask still declines. What the stricter rules give
+up, on this set: `blinding lights remix`, `rain sounds 10 hours`, `ocarina of time full
+soundtrack`, `tame impala let it happen live`, `hotel california live 1977` and
+`creep cover postmodern jukebox` now decline where they took an acceptable upload — all
+asks a working `ytsearch` answers, and this path runs only when it does not.
 
 #### What the fallback costs
 
