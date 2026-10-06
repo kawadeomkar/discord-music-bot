@@ -55,6 +55,13 @@ RUN test -d /app/.venv/lib/python*/site-packages \
 # Used by the container-test CI job. Never pushed to GHCR.
 FROM builder AS test
 
+# The runtime stage's ffmpeg, from the same base and the same apt package, so the ffmpeg
+# tier tests the binary the bot ships. Its timings are version-specific: see
+# docs/ARCHITECTURE.md#mid-song-reconnects.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
 # The rm shares this RUN deliberately. nodejs-wheel-binaries (pulled by pyright's
 # `nodejs` extra — see pyproject.toml) ships 65MB of C headers for building native
 # Node addons, and pyright is pure JavaScript that compiles nothing. Deleting them

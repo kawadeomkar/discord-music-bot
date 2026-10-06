@@ -142,8 +142,9 @@ just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
 just test-ffmpeg    # opt-in real-ffmpeg tier (needs ffmpeg on PATH, no Docker)  ~11s
+just container-test-ffmpeg  # the same tier against the image's ffmpeg (what CI runs)
 just container-test # build test image, run suite inside it (spec cache OFF) ~1min
-just ci             # check + container-test + test-pg + test-redis + test-ffmpeg — mirrors CI
+just ci             # check + container-test + test-pg + test-redis + container-test-ffmpeg — mirrors CI
 
 # Test selection (args forward to pytest). ANY argument means a subset run: serial,
 # no coverage gate. The no-args form is the only parallel one and the only gated one —

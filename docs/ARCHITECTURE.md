@@ -2068,6 +2068,14 @@ song and on every one of its attempts — so the floor is an ffmpeg no older tha
 runtime image installs Debian's, unpinned; `-ping` reports the version a deployment actually
 has.
 
+**The timings above are ffmpeg 7.1's**, the image's, and also hold on 9.0. Ubuntu 24.04's
+6.1 behaves differently on both rows, measured by CI's first run of the tier against it: it
+retries a mid-song 503 *without* the flag (all 153 packets), and with the flag it keeps
+retrying a death answered with 403 for about 12 seconds before ending the song. A `just
+run` on 6.1 therefore recovers the same songs but gives up on an unrecoverable one about
+12 seconds late rather than 4. This is why the ffmpeg tier runs in the test image, whose
+ffmpeg is the runtime stage's own package, in CI and in `just container-test-ffmpeg`.
+
 `-reconnect_on_network_error` was measured alongside and is **not** set: every network-level
 death in these cases was already retried by `-reconnect`, so it changed nothing.
 

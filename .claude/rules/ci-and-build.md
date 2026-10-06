@@ -117,7 +117,7 @@ other; main commits each get their own group so no build is ever dropped.
 `todo-to-issue.yml` converts TODO comments to issues — write new `TODO:`/`FIXME:`
 markers with that in mind (multi-line context is picked up).
 
-Docker: three-stage build (builder → test → runtime; runtime has ffmpeg, no Poetry).
+Docker: three-stage build (builder → test → runtime; test and runtime both install the same ffmpeg package, runtime has no Poetry).
 Deploys are separate from builds — `just up <sha>` deploys any locally-present image tag
 and refuses to build; dirty trees produce `<sha>-dirty.<digest>` tags so a tag never lies
 about its commit. `just restart` restarts the existing container and does NOT pick up a
