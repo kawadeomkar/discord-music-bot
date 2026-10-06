@@ -108,14 +108,23 @@ on the nearest webm cluster, measured **5–10s early**, which `position_secs` w
 overstate everywhere. Volume via `-filter:a volume=` (which is why `-volume` applies from the
 song after next — the prefetch has already built the next one at the old level, and
 rebuilding it would re-request a signed URL that may since have been revoked).
+**Encode bitrate**: `_encode_bitrate_kbps` raises the encoder's 128k target to the voice
+channel's own ceiling (capped at 384k) for a LOSSLESS source only — read from `acodec` and
+`ext`, since a direct WAV arrives with no acodec. An Opus serve saturates, so raising its
+target buys 0.0–0.3 dB; an AAC one 0.6–2.0 dB, not worth doubling its traffic; a lossless
+one gains 2 dB at 256k. `ext` is a cached field for the
+same reason `audio_channels` is.
 **Opus passthrough**: `codec="copy"` remuxes instead of re-encoding. `_passthrough_codec`
 is the gate and all four clauses are required, because `-c:a copy` also discards the
-`-ac 2 -ar 48000 -b:a 128k` discord.py always emits: `acodec` opus; no filter (ffmpeg
+`-ac 2 -ar 48000 -b:a 128k -fec -packet_loss` discord.py always emits (the last two are
+overridden on the encode path — docs/ARCHITECTURE.md#encoder-mode): `acodec` opus; no filter (ffmpeg
 refuses copy alongside a filtergraph — exit 234, zero bytes — so `yt_stream` asks
 `_audio_filters` what it produced rather than re-testing volume); `audio_channels` in
 (1, 2) (a 5.1 serve reaches Discord as multistream and clients decode only the front
-pair); and `format_id` in `{249, 250, 251}`, which stands in for the 20 ms frame
-duration the info-dict does not report. Absent fields mean re-encode.
+pair); and a `format_id` that is itag 249, 250 or 251 — bare, or with the `-N` track
+number a multi-audio-track video carries (`251-23`) — which stands in for the 20 ms frame
+duration the info-dict does not report. Any other suffix (`251-drc`) and absent fields
+mean re-encode.
 `read()` counts AUDIO frames (the first two packets are OpusHead and OpusTags, which
 discord.py yields like any other) → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, paused card, history,
