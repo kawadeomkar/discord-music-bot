@@ -17,6 +17,15 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.55.1 — 2026-10-06
+
+**A security update to one of the bot's libraries.** `multidict`, which the bot's HTTP
+client (aiohttp) uses for headers, moves from 6.7.1 to 6.9.1 for CVE-2026-104874. No
+behaviour changes.
+
+- **Nothing to do** beyond deploying the new image.
+- **Roll back freely**: only the library version changes.
+
 ## 2.55.0 — 2026-10-02
 
 **Spotify links now play the album recording, not the music video.** A Spotify track
