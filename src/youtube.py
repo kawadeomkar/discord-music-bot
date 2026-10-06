@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
 from typing import Any, Final, Optional, TypedDict, Union, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import aiohttp
 import discord
@@ -1468,9 +1468,50 @@ class _NothingFound(Exception):
         self.public = public
 
 
+def _nothing_playable(search: str) -> _NothingFound:
+    """The miss for a term whose result holds no playable entry."""
+    log.warning(f"no playable result for {search!r}")
+    return _NothingFound(
+        ExtractionError("Couldn't find anything playable for that.", expected=True)
+    )
+
+
 _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
+_SEARCH_KIND_MUSIC: Final[str] = "music"
+
+# A YouTube video id. Music search answers with album (`MPREb_…`) and channel
+# (`UC…`) ids beside the tracks, and length is what separates them.
+_VIDEO_ID_LEN: Final[int] = 11
+
+# Shortest query word that can carry a match. Three, because "xvi" is a real ask
+# and a two-letter word ("u2") is shared by too much to mean anything.
+_MIN_MATCH_WORD: Final[int] = 3
+_WORD_RE = re.compile(r"[a-z0-9]+")
+# Words that carry no identity, so sharing one is no evidence: a stranger's title
+# matched "song", "the" or "you" in a nonsense query. Kept out of both sides.
+_MATCH_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "the", "and", "you", "your", "for", "with", "from", "that", "this", "are",
+        "not", "does", "was", "but", "all", "out", "now", "into", "about", "what",
+        "song", "songs", "track", "music", "official", "video", "audio", "lyrics",
+        "lyric", "feat", "version", "full", "hd", "new",
+    }
+)  # fmt: skip
+# Renditions of a song that are not the song. Music search can rank one first —
+# measured, a karaoke upload ahead of the original — so a title carrying one is
+# passed over unless the ask names it too.
+_MATCH_VARIANT_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "karaoke", "nightcore", "instrumental", "cover", "remix", "slowed", "sped",
+        "reverb", "8d", "live", "acapella", "acoustic", "piano", "tutorial", "reaction",
+    }
+)  # fmt: skip
+# How far a candidate may run from the length the ask already knows (Spotify's)
+# and still be that recording. A judgment, not a measurement: re-encodes and
+# re-uploads land within seconds, and an edit or extended cut lands well outside.
+_MUSIC_DURATION_TOLERANCE_SECS: Final[int] = 10
 
 # How many results a length gets to choose between. One search POST costs the same
 # for one result as for five (0.51 s either way), but a PROCESSED search extracts
@@ -1514,6 +1555,73 @@ def _search_terms(
     else:
         terms.append((_SEARCH_KIND_TITLE, search))
     return terms
+
+
+def _match_words(text: str) -> set[str]:
+    """The words of `text` that can carry a match: long enough, and not stopwords."""
+    return {
+        word
+        for word in _WORD_RE.findall(text.lower())
+        if len(word) >= _MIN_MATCH_WORD and word not in _MATCH_STOPWORDS
+    }
+
+
+def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
+    """Whether a music-search title is plausibly an answer to `query`: it shares at
+    least half the ask's identifying words and is no rendition (karaoke, a live set)
+    the ask did not name. See docs/ARCHITECTURE.md#the-music-search-fallback."""
+    wanted = _match_words(query)
+    if not wanted:
+        return False
+    words = set(_WORD_RE.findall((title or "").lower()))
+    if (words & _MATCH_VARIANT_WORDS) - set(_WORD_RE.findall(query.lower())):
+        return False
+    shared = wanted & words
+    return bool(shared) and 2 * len(shared) >= len(wanted)
+
+
+def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bool:
+    """Whether a resolved candidate's length is the recording the ask knows. Music
+    search's flat entries carry no duration, so this is read after the resolve."""
+    if expected is None or duration is None:
+        return True
+    return abs(int(duration) - expected) <= _MUSIC_DURATION_TOLERANCE_SECS
+
+
+async def _ytmusic_candidate_url(
+    search: str,
+    *,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+) -> Optional[str]:
+    """The watch URL of the first track music.youtube.com answers `search` with that
+    passes the relevance gate, or None. FLAT only: processed, one age-restricted
+    track in the result set raises for the whole search.
+    See docs/ARCHITECTURE.md#the-music-search-fallback."""
+    query = _SEARCH_PREFIX_RE.sub("", search).strip()
+    if not query:
+        return None
+    url = "https://music.youtube.com/search?q=" + quote_plus(query)
+    data = await _extract_for_source(
+        _inflight_key(_source_cache_key(url), "music"),
+        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS),
+        url,
+        pool_slot=pool_slot,
+    )
+    for entry in (data or {}).get("entries") or []:
+        # Music search interleaves album and channel pages with the tracks, as
+        # `YoutubeTab` entries carrying an `MPREb_`/`UC` id and no title.
+        # select_search_entry cannot tell them apart — they are not `_type`
+        # "playlist" — and queueing one plays nothing.
+        if not entry or entry.get("ie_key") != "Youtube":
+            continue
+        video_id = str(entry.get("id") or "")
+        if len(video_id) != _VIDEO_ID_LEN:
+            continue
+        if not _music_candidate_matches(query, entry.get("title")):
+            continue
+        return f"https://www.youtube.com/watch?v={video_id}"
+    trace.get_current_span().set_attribute("ytdl.music_no_match", True)
+    return None
 
 
 def _first_video_entry(
@@ -2174,39 +2282,105 @@ class YTDL(discord.FFmpegOpusAudio):
 
         `isrc` and `expected_duration` are what a Spotify track knows about itself,
         and they decide WHICH term resolves: see _search_terms. Each term caches
-        under its own key, so a fallback is spent once per track per TTL.
+        under its own key, so a fallback is spent once per track per TTL; a song
+        only music search found is cached under the first term too.
         """
         terms = _search_terms(
             search, isrc=isrc, expected_duration=expected_duration, flat=flat
         )
+        resolve = partial(
+            cls._resolve_term,
+            requester,
+            expected_duration=expected_duration,
+            query_source=query_source,
+            queued_at=queued_at,
+            queue_position=queue_position,
+            user_input=user_input,
+            download=download,
+            ts=ts,
+            redis=redis,
+            pool_slot=pool_slot,
+        )
+        last_miss: Optional[_NothingFound] = None
         for index, (kind, term) in enumerate(terms):
             trace.get_current_span().set_attribute("ytdl.search_kind", kind)
             try:
-                return await cls._resolve_term(
-                    requester,
-                    term,
-                    expected_duration=expected_duration,
-                    query_source=query_source,
-                    queued_at=queued_at,
-                    queue_position=queue_position,
-                    user_input=user_input,
-                    download=download,
-                    ts=ts,
-                    redis=redis,
-                    flat=flat,
-                    pool_slot=pool_slot,
-                )
+                return await resolve(term, flat=flat)
             except _NothingFound as miss:
-                if index == len(terms) - 1:
-                    # The ask is out of terms, so this miss is the answer. Raised
-                    # as the failure the caller has always seen, `from None`
-                    # because the wrapper is this method's private business.
-                    raise miss.public from None
-                log.info(
-                    f"{kind} search {term!r} found nothing; "
-                    f"falling back to {terms[index + 1][1]!r}"
-                )
-        raise AssertionError("_search_terms never returns an empty ladder")
+                last_miss = miss
+                if index < len(terms) - 1:
+                    log.info(
+                        f"{kind} search {term!r} found nothing; "
+                        f"falling back to {terms[index + 1][1]!r}"
+                    )
+        if last_miss is None:
+            raise AssertionError("_search_terms never returns an empty ladder")
+
+        # Every ytsearch term missed. For a SEARCH that can mean YouTube withheld
+        # the results rather than holding none, which music search is not subject
+        # to. A LINK is excluded: it named one video, and a second opinion on a
+        # different corpus would play something the user did not ask for.
+        if not is_link(search.strip()):
+            trace.get_current_span().set_attribute("ytdl.music_fallback", True)
+            try:
+                watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
+                if watch_url is not None:
+                    log.info(
+                        f"search {search!r} found nothing; music search found {watch_url}"
+                    )
+                    # Never flat: the candidate is a link now, and the link path is
+                    # what fills both caches from one round. The needle is the ask's,
+                    # not the watch URL's, so -remove still matches what was typed.
+                    found = await resolve(
+                        watch_url,
+                        flat=False,
+                        user_input=user_input if user_input is not None else search,
+                    )
+                    if _music_duration_fits(found.duration, expected_duration):
+                        # Stamped only here: an attempt that declined or failed is
+                        # `ytdl.music_fallback` alone, still the ladder's kind.
+                        trace.get_current_span().set_attribute(
+                            "ytdl.search_kind", _SEARCH_KIND_MUSIC
+                        )
+                        # Under the term the next ask reads first, or every repeat
+                        # re-asks the walled search and music search before reaching
+                        # the watch URL's own entry.
+                        if redis is not None:
+                            await cache_set(
+                                redis,
+                                _source_cache_key(terms[0][1]),
+                                _source_cache_value(
+                                    SourceIdentity(
+                                        webpage_url=found.webpage_url,
+                                        title=found.title,
+                                        duration=found.duration,
+                                        uploader=found.uploader,
+                                        thumbnail=found.thumbnail,
+                                    )
+                                ),
+                                _YT_SOURCE_TTL,
+                            )
+                        return found
+                    # A Spotify ask knows its length, and music search's pick ran
+                    # too far from it to be that recording: declined like any miss.
+                    trace.get_current_span().set_attribute(
+                        "ytdl.music_duration_mismatch", True
+                    )
+                    log.info(
+                        f"music search's candidate {watch_url} for {search!r} runs "
+                        f"{found.duration}s against {expected_duration}s; declined"
+                    )
+            except Exception as e:
+                # BOTH legs are best-effort: the ask keeps the answer it earned. Each
+                # leg has its own way of replacing it — a candidate raises yt-dlp's
+                # cookies boilerplate, which user_message shows verbatim for an
+                # `expected` error, and the music ask's unsupported branch names the
+                # internal search URL in text a user reads.
+                log.warning(f"music fallback for {search!r} failed: {e!r}")
+
+        # Raised as the failure the caller has always seen, `from None` because the
+        # wrapper is this method's private business.
+        raise last_miss.public from None
 
     @classmethod
     async def _resolve_term(
@@ -2287,6 +2461,11 @@ class YTDL(discord.FFmpegOpusAudio):
                 search,
                 pool_slot=pool_slot,
             )
+            if flat_data is not None and flat_data.get("entries") == []:
+                # The search answered with no results at all. The full path below
+                # would re-send the same search POST and get the same empty page,
+                # so this miss is final for the term.
+                raise _nothing_playable(search)
             flat_entry = (
                 _first_video_entry(flat_data, expected_duration=expected_duration)
                 if flat_data is not None
@@ -2325,8 +2504,8 @@ class YTDL(discord.FFmpegOpusAudio):
                         _YT_SOURCE_TTL,
                     )
                 return flat_qobj
-            # A live entry, one without a duration, or no result: take the full path
-            # on top of the flat POST already spent, re-fetching the same video.
+            # A live entry, one without a duration, or no video among the entries:
+            # take the full path on top of the flat POST already spent.
             trace.get_current_span().set_attribute("ytdl.flat_fallback", True)
 
         # The only path for a link: one stream-opts call yields identity AND a
@@ -2355,12 +2534,7 @@ class YTDL(discord.FFmpegOpusAudio):
         ):
             # Refused before the cache write below: an identity that is not a page
             # URL cannot be streamed, and cached it fails every play for 24h.
-            log.warning(f"no playable result for {search!r}")
-            raise _NothingFound(
-                ExtractionError(
-                    "Couldn't find anything playable for that.", expected=True
-                )
-            )
+            raise _nothing_playable(search)
         if not selected.get("url"):
             # This path runs processed, so a result with no stream URL is one
             # yt-dlp could select no format for. It fails at stream time, where

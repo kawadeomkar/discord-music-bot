@@ -159,6 +159,15 @@ queued card and the `--now` path turn into a notice. `parse_url` drops a share l
 with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 `ValueError`, which `parse_input` would turn into a YouTube search for the link.
 
+**Music search answers a search every term missed.** It is not a rung of
+`_search_terms`: once the ladder is exhausted, `yt_source` asks it once, for a search
+only, because a signed-out `ytsearch` whose top results hold age-restricted content
+comes back EMPTY with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url`
+asks music.youtube.com flat, filters to `ie_key` `Youtube` with an 11-character id,
+gates on relevance (and on length for a Spotify ask), and hands back a watch URL that
+resolves processed. Why each of those, and what it costs:
+ARCHITECTURE.md#the-music-search-fallback.
+
 ## Concurrency primitives
 
 | Primitive | Protects |

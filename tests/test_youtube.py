@@ -50,7 +50,10 @@ from src.youtube import (
     _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
     _mine_audio_candidates,
+    ExtractionError,
+    _music_candidate_matches,
     _search_terms,
+    _ytmusic_candidate_url,
     select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
@@ -1516,6 +1519,661 @@ class TestYTSourceTermLadder:
         # The ISRC miss is not cached — only a resolve writes an entry — so it is
         # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
+
+
+class TestMusicSearchFallback:
+    """A signed-out `ytsearch` whose top results hold age-restricted content comes
+    back EMPTY — `estimatedResults: 0` and a "Confirm your age" card — and yt-dlp
+    hands the caller no way to tell that from a query with no matches. Music search
+    answers the same query normally, so an exhausted ladder asks it once.
+    See docs/ARCHITECTURE.md#the-music-search-fallback."""
+
+    _MUSIC_URL = "https://music.youtube.com/search?q=xvi+akiaura"
+    _FOUND = {
+        "webpage_url": "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        "title": "XVI",
+        "url": "https://cdn/xvi",
+        "duration": 244,
+    }
+    # The shape music search answers with: album and channel pages interleaved with
+    # the tracks, ahead of them.
+    _MUSIC_RESULT = {
+        "entries": [
+            {"ie_key": "YoutubeTab", "id": "MPREb_2Kryrn9iVK0", "title": None},
+            {"ie_key": "YoutubeTab", "id": "UCTuxLS8YPPDUn8xtwItOt_g", "title": None},
+            # A titled album page with an eleven-character id: the relevance gate
+            # and the length check both admit it, so the kind is the only thing
+            # that rejects it. Music search titles album results like this.
+            {"ie_key": "YoutubeTab", "id": "OLAK5uy_abc", "title": "XVI"},
+            # Right kind and a matching title, wrong id: only the length check
+            # rejects it, and watch?v=short resolves to nothing.
+            {"ie_key": "Youtube", "id": "short", "title": "XVI akiaura"},
+            {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+            {"ie_key": "Youtube", "id": "UH8OV1D091Q", "title": "also playable"},
+        ]
+    }
+
+    def _extract(
+        self,
+        answers: dict[str, Any],
+        asked: list[str],
+        requests: Optional[list[tuple[str, Any]]] = None,
+    ) -> Any:
+        """The extraction double: answers by search string, records what was asked,
+        and, given `requests`, the single-flight key and request of every call."""
+
+        async def extract(key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if requests is not None:
+                requests.append((key, request))
+            return answers.get(search)
+
+        return extract
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["dequeue", "fast-ack"])
+    async def test_the_music_ask_is_flat_and_the_candidate_is_not(
+        self, mock_ctx: MagicMock, flat: bool
+    ) -> None:
+        """FLAT is what keeps one age-restricted track in the result set from
+        raising for the whole search; the candidate is a link and resolves
+        processed. Both hold from the fast-ack shape (flat=True) too."""
+        asked: list[str] = []
+        requests: list[tuple[str, Any]] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract(answers, asked, requests),
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                flat=flat,
+            )
+
+        assert result.title == "XVI"
+        music = [(k, r) for k, r in requests if r.url == self._MUSIC_URL]
+        assert len(music) == 1
+        key, request = music[0]
+        assert request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+        assert key.endswith("|music")
+        candidate = [r for _k, r in requests if "kSAEcjWWuew" in r.url]
+        assert len(candidate) == 1
+        assert candidate[0].opts is youtube._YTDL_STREAM_SEARCH_OPTS
+
+    async def test_a_song_music_search_found_is_cached_under_the_ask(
+        self, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        """The candidate's own entry is keyed by its watch URL, which a repeat of
+        the same ask never reads: without this every repeat pays the walled
+        search and music search again, for exactly the songs people replay."""
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            first = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                redis=fake_redis,
+            )
+            asked.clear()
+            again = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                redis=fake_redis,
+            )
+
+        assert asked == []
+        assert again.webpage_url == first.webpage_url
+        assert again.title == "XVI"
+        ttl = await fake_redis.ttl(youtube._source_cache_key("ytsearch:xvi akiaura"))
+        assert 0 < ttl <= youtube._YT_SOURCE_TTL
+
+    async def test_an_exhausted_ladder_resolves_what_music_search_found(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert result.title == "XVI"
+        assert result.duration == 244
+        # The ytsearch term first, then music search, then the candidate as a LINK.
+        assert asked == [
+            "ytsearch:xvi akiaura",
+            self._MUSIC_URL,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        ]
+
+    async def test_the_album_and_channel_entries_are_never_chosen(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """They are not `_type` "playlist", so select_search_entry would take one,
+        and queueing it plays nothing. The two tracks sit BEHIND them in the
+        fixture, so a filter that only skipped `_type` would return an album."""
+        asked: list[str] = []
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: self._MUSIC_RESULT}, asked),
+        ):
+            got = await _ytmusic_candidate_url("ytsearch:xvi akiaura")
+        assert got == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+
+    async def test_a_result_holding_no_track_is_no_candidate(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        only_albums = {
+            "entries": [{"ie_key": "YoutubeTab", "id": "MPREb_x", "title": None}]
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: only_albums}, asked),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+    @pytest.mark.parametrize(
+        ("query", "title", "wanted"),
+        [
+            ("xvi akiaura", "XVI", True),
+            ("xvi drake", "Reflections - Drake's Head", True),
+            ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", True),
+            # Live, 2026-10-06: the original is titled without its artist.
+            ("just your doll snow strippers", "Just Your Doll", True),
+            # Every title below is one music search really answered these with.
+            # The old one-shared-word gate took the first three: "song", "favorite"
+            # adjacent, and "999".
+            (
+                "zzzzqqqq no such song anywhere 98765",
+                "Listen from https://audiomack.com/ugobueze/song/ijere-mmanwu",
+                False,
+            ),
+            (
+                "my favourite song that does not exist",
+                "This Is Not The Song I Wrote (feat. Joey Dosik & Jacob Jeffries)",
+                False,
+            ),
+            ("the zzzqqq nonexistent track 999", "999 (feat. K9rdz21)", False),
+            # Three of four words shared, and every one of them a stopword: counted,
+            # they would carry the half on their own.
+            ("you and the night", "You And The Song", False),
+            ("zzzzqqqq no such song anywhere 98765", "Nursery Songs ", False),
+            ("u2", "Beautiful Day", False),  # no word long enough to carry a match
+            # What the floor is FOR: a two-letter word is shared by too much to
+            # mean anything, and matching on it plays the wrong artist entirely.
+            ("u2 akiaura", "U2 - With Or Without You", False),
+            ("xvi akiaura", None, False),  # an album page, were one to get this far
+            # Renditions the ask did not name: music search ranked these first.
+            (
+                "just your doll snow strippers",
+                "Snow Strippers  - Just Your Doll (karaoke)",
+                False,
+            ),
+            (
+                "just your doll snow strippers",
+                "NIGHTCORE - Snow Strippers - Just Your Doll",
+                False,
+            ),
+            (
+                "just your doll snow strippers",
+                "Snow Strippers - Live at Washington D.C [FULL SET | 1/8/26]",
+                False,
+            ),
+            # ...and one the ask did name.
+            (
+                "just your doll karaoke",
+                "Snow Strippers - Just Your Doll (karaoke)",
+                True,
+            ),
+        ],
+        ids=[
+            "short-word",
+            "across-punctuation",
+            "prefixed",
+            "title-without-artist",
+            "stopword-in-a-url",
+            "stopwords-only",
+            "one-of-three",
+            "only-stopwords-shared",
+            "plural-of-a-stopword",
+            "no-usable-word",
+            "short-word-is-not-a-match",
+            "titleless",
+            "karaoke",
+            "nightcore",
+            "live-set",
+            "rendition-asked-for",
+        ],
+    )
+    def test_a_candidate_has_to_share_a_word_with_the_ask(
+        self, query: str, title: Any, wanted: bool
+    ) -> None:
+        assert _music_candidate_matches(query, title) is wanted
+
+    async def test_an_unrelated_candidate_is_declined(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Music search never answers with nothing, so "a candidate exists" cannot be
+        the test — the ask keeps the answer it earned instead of playing a stranger."""
+        asked: list[str] = []
+        # The title music search really answered this nonsense with. It shares
+        # "song" with the ask, which the one-shared-word gate accepted.
+        unrelated = {
+            "entries": [
+                {
+                    "ie_key": "Youtube",
+                    "id": "NHmXV8GXN4a",
+                    "title": "Listen from https://audiomack.com/ugobueze/song/ijere-mmanwu",
+                }
+            ]
+        }
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract(
+                    {
+                        "https://music.youtube.com/search?q=zzzzqqqq+no+such+song+anywhere+98765": unrelated
+                    },
+                    asked,
+                ),
+            ),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:zzzzqqqq no such song anywhere 98765",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        # The candidate was never resolved — only the ytsearch term and the music ask.
+        assert asked == [
+            "ytsearch:zzzzqqqq no such song anywhere 98765",
+            "https://music.youtube.com/search?q=zzzzqqqq+no+such+song+anywhere+98765",
+        ]
+
+    @pytest.mark.parametrize(
+        ("expected", "kept"),
+        [
+            (244, True),
+            (244 + 10, True),
+            (244 + 11, False),
+            (244 - 11, False),
+            (None, True),
+        ],
+        ids=["exact", "at-tolerance", "too-long", "too-short", "no-length-known"],
+    )
+    async def test_a_candidate_of_the_wrong_length_is_declined(
+        self, mock_ctx: MagicMock, expected: Optional[int], kept: bool
+    ) -> None:
+        """Music search's flat entries carry no duration, so a Spotify ask's own
+        length is checked once the candidate has resolved. One that runs far from
+        it is a different recording, and the ask keeps the answer it earned."""
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,  # 244 s
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            ask = YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+                expected_duration=expected,
+            )
+            if kept:
+                assert (await ask).title == "XVI"
+            else:
+                with pytest.raises(Exception, match="Couldn't find|Could not find"):
+                    await ask
+
+    async def test_a_link_that_finds_nothing_does_not_ask_music_search(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A link named one video. A second opinion on another corpus would play
+        something the user did not ask for."""
+        asked: list[str] = []
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract({}, asked)),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "https://www.youtube.com/watch?v=gone1234567",
+                query_source="link",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert asked == ["https://www.youtube.com/watch?v=gone1234567"]
+
+    async def test_a_failing_fallback_raises_the_original_answer(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An age-restricted candidate raises yt-dlp's cookies boilerplate, which
+        user_message shows verbatim for an `expected` error. The ask keeps the
+        answer it earned."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search == self._MUSIC_URL:
+                return self._MUSIC_RESULT
+            if search.startswith("https://www.youtube.com/watch"):
+                raise ExtractionError(
+                    "ERROR: [youtube] kSAEcjWWuew: Sign in to confirm your age. "
+                    "Use --cookies-from-browser",
+                    expected=True,
+                )
+            return None
+
+        with (
+            patch("src.youtube._extract_for_source", new=extract),
+            pytest.raises(Exception, match="Could not find song") as raised,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert "cookies" not in str(raised.value)
+
+    @pytest.mark.parametrize(
+        ("raised", "must_not_leak"),
+        [
+            (
+                ExtractionError(
+                    "ERROR: [youtube:music:search_url] Sign in to confirm you're not "
+                    "a bot. Use --cookies-from-browser",
+                    expected=True,
+                ),
+                "cookies",
+            ),
+            (
+                Exception(
+                    "This link isn't from a site I can play: "
+                    "https://music.youtube.com/search?q=xvi+akiaura"
+                ),
+                "music.youtube.com",
+            ),
+        ],
+        ids=["expected-extraction-error", "unsupported-url"],
+    )
+    async def test_a_failing_music_ask_keeps_the_original_answer(
+        self, mock_ctx: MagicMock, raised: Exception, must_not_leak: str
+    ) -> None:
+        """The music ask is a second extraction on an already-failing path, so it owns
+        a way to replace the answer the ask earned: an `expected` ExtractionError
+        reaches the user through user_message verbatim, and _extract_for_source's
+        unsupported branch names the internal search URL. Neither may be what a user
+        who typed a song name reads."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search == self._MUSIC_URL:
+                raise raised
+            return None
+
+        with (
+            patch("src.youtube._extract_for_source", new=extract),
+            pytest.raises(Exception, match="Could not find song") as caught,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert must_not_leak not in str(caught.value)
+        # The candidate was never reached, so the ask ends on its own miss.
+        assert asked == ["ytsearch:xvi akiaura", self._MUSIC_URL]
+
+    async def test_the_span_names_the_music_kind(self, mock_ctx: MagicMock) -> None:
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        span = MagicMock()
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract(answers, asked)),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        kinds = [
+            c.args[1]
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == "ytdl.search_kind"
+        ]
+        assert kinds[-1] == "music"
+
+    @staticmethod
+    def _attributes(span: MagicMock, name: str) -> list[Any]:
+        return [
+            c.args[1]
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == name
+        ]
+
+    @pytest.mark.parametrize(
+        "answers",
+        [
+            # The candidate is declined on length (a Spotify ask, 244 s vs 300 s).
+            {
+                _MUSIC_URL: _MUSIC_RESULT,
+                "https://www.youtube.com/watch?v=kSAEcjWWuew": _FOUND,
+            },
+            # Music search offered nothing that passes the gate.
+            {_MUSIC_URL: {"entries": []}},
+        ],
+        ids=["duration-declined", "no-candidate"],
+    )
+    async def test_a_fallback_that_finds_nothing_keeps_the_ladders_kind(
+        self, mock_ctx: MagicMock, answers: dict[str, Any]
+    ) -> None:
+        """`ytdl.search_kind` names the rung that answered. A fallback that did not
+        answer is recorded as an attempt, and the kind stays the ladder's."""
+        span = MagicMock()
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract(answers, [])),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+                expected_duration=300,
+            )
+
+        assert self._attributes(span, "ytdl.search_kind")[-1] != "music"
+        assert self._attributes(span, "ytdl.music_fallback") == [True]
+
+    async def test_a_declined_music_answer_is_recorded_on_the_span(self) -> None:
+        span = MagicMock()
+        unrelated = {
+            "entries": [
+                {"ie_key": "Youtube", "id": "NHmXV8GXN4a", "title": "Unrelated"}
+            ]
+        }
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract({self._MUSIC_URL: unrelated}, []),
+            ),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+        assert self._attributes(span, "ytdl.music_no_match") == [True]
+
+    @pytest.mark.parametrize(
+        "result",
+        [None, {"title": "a result with no entries"}, {"entries": None}],
+        ids=["no-result", "no-entries-key", "null-entries"],
+    )
+    async def test_a_music_answer_holding_nothing_is_no_candidate(
+        self, result: Optional[dict[str, Any]]
+    ) -> None:
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: result}, []),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+    async def test_a_null_entry_is_skipped_not_fatal(self) -> None:
+        """yt-dlp can emit a null entry; the track behind it is still the answer."""
+        result = {
+            "entries": [
+                None,
+                {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+            ]
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: result}, []),
+        ):
+            got = await _ytmusic_candidate_url("ytsearch:xvi akiaura")
+        assert got == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+
+    @pytest.mark.parametrize("search", ["ytsearch:", "ytsearch5:   ", "  "])
+    async def test_an_empty_query_asks_nothing(self, search: str) -> None:
+        """`music.youtube.com/search?q=` with nothing after it is not a question."""
+        asked: list[str] = []
+        with patch("src.youtube._extract_for_source", new=self._extract({}, asked)):
+            assert await _ytmusic_candidate_url(search) is None
+        assert asked == []
+
+    async def test_an_empty_ladder_is_a_bug_not_a_miss(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        with (
+            patch("src.youtube._search_terms", return_value=[]),
+            pytest.raises(AssertionError, match="empty ladder"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+            )
+
+    @pytest.mark.parametrize(
+        ("user_input", "needle"),
+        [
+            ("xvi akiaura", "xvi akiaura"),
+            # A Spotify collection item carries its link, never the generated term.
+            (
+                "https://open.spotify.com/playlist/37i9dQZF1DX0XUsuxWHRQd",
+                "https://open.spotify.com/playlist/37i9dQZF1DX0XUsuxWHRQd",
+            ),
+            (None, "ytsearch:xvi akiaura"),
+        ],
+        ids=["typed", "collection-link", "none-falls-back-to-the-ask"],
+    )
+    async def test_the_fallback_keeps_the_needle_remove_matches_on(
+        self, mock_ctx: MagicMock, user_input: Optional[str], needle: str
+    ) -> None:
+        """The candidate resolves as a watch URL, which nobody typed: `-remove`
+        matches `user_input`, so the queued song has to carry the ask's."""
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch("src.youtube._extract_for_source", new=self._extract(answers, [])):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=user_input,
+            )
+
+        assert result.webpage_url == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+        assert result.user_input == needle
+
+    async def test_an_empty_flat_search_is_not_asked_again_processed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An empty page is the search's whole answer, walled or genuine; the
+        processed path would re-send the same search POST and get it again."""
+        asked: list[str] = []
+        answers = {
+            'ytsearch:"GBAHS1600463"': {"entries": []},
+            "ytsearch3:xvi akiaura": {"entries": []},
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input="xvi akiaura",
+                flat=True,
+                isrc="GBAHS1600463",
+                expected_duration=244,
+            )
+
+        assert result.title == "XVI"
+        assert asked == [
+            'ytsearch:"GBAHS1600463"',
+            "ytsearch3:xvi akiaura",
+            self._MUSIC_URL,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        ]
 
 
 class TestYTSourceUnifiedExtraction:

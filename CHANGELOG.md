@@ -17,6 +17,38 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.0 — 2026-10-02
+
+**Searches that YouTube refused to answer now play.** Some searches came back as
+"Couldn't find anything playable for that." for songs that exist and play fine. The cause
+was not the bot and not yt-dlp: when the top of a result set holds age-restricted content,
+YouTube serves a signed-out client an empty page — a "Confirm your age" card where the
+videos would be — and reports zero results. `xvi akiaura` is one; `akiaura xvi`, the same
+two words reordered, returns tens of thousands. Nothing in what yt-dlp hands back
+distinguishes that from a query with no matches, which is why the bot believed it.
+
+Such a search now gets one more try through YouTube Music, which answers it normally, and
+plays the first track it names.
+
+- **Nothing to do.** No setting, no key, no account, no new service. It uses the
+  music.youtube.com search yt-dlp already supports.
+- **Only a search that found NOTHING reaches it**, so no search that works today changes
+  its answer. A link never reaches it at all.
+- **It costs about 1.5 seconds** on top of the failed search, about 2 seconds in all,
+  and only on a request that previously failed outright. The answer is remembered
+  against the words you typed for a day, so a repeat of the same wording starts as fast
+  as any other cached search.
+- **A search that genuinely has no matches still says so**, with the same wording as
+  before, about half a second later than it used to — except a search queued while the
+  bot is already in voice, which skips a search it used to send twice and answers about
+  as fast as it always did. YouTube Music always offers *something*, so a track is only accepted when
+  its title carries at least half of the meaningful words you asked for, is not a
+  karaoke, nightcore, live or similar version you did not ask for, and — for a Spotify
+  link — runs within ten seconds of the length Spotify gives. A typo gets the same
+  "couldn't find anything" it always got, not a stranger's song.
+- **Roll back freely**, to any 2.55.x. The one thing written to Redis is an ordinary
+  day-long search cache entry, which any 2.55.x reads as it reads its own.
+
 ## 2.55.3 — 2026-10-02
 
 **Two ways a half-connected bot used to go unnoticed, both closed.** discord.py registers
@@ -51,9 +83,7 @@ answers as if the bot had joined. Nothing checked.
 - **Nothing to do**, and no state to clean up: both windows were in memory only. If you
   have a server where the bot shows as connected but answers "I'm not in a voice
   channel", `-join` once after deploying this.
-- **Roll back freely**, to any 2.54.x.
-
-## 2.54.6 — 2026-10-01
+- **Roll back freely**, to any earlier 2.55.x.
 
 ## 2.55.2 — 2026-10-02
 
@@ -71,7 +101,7 @@ arrive. Twenty seconds, then a red **Command failed** embed naming a bare
 - **The old symptom read as contagion**: one bad song appeared to poison the song after
   it, and only that one. The failed join's own teardown forced the clear on its way
   out, so a third `-play` connected normally.
-- **Roll back freely**, to any 2.54.x. Nothing here changes what is written to Redis
+- **Roll back freely**, to 2.55.1 or earlier. Nothing here changes what is written to Redis
   or Postgres.
 
 ## 2.55.1 — 2026-10-06
