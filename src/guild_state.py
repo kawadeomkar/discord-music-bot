@@ -674,6 +674,11 @@ class QueueEntryField:
     YTSEARCH: Final[str] = "ytsearch"
     # The recording an unresolved item names, written only while it has one.
     ISRC: Final[str] = "isrc"
+    # The search a resolved Spotify item came from (QueueObject.resolved_from),
+    # written only while it has one.
+    RESOLVED_TERM: Final[str] = "resolved_term"
+    RESOLVED_ISRC: Final[str] = "resolved_isrc"
+    RESOLVED_SECS: Final[str] = "resolved_secs"
 
 
 # The wire discriminator, kept verbatim from the original serializer.
@@ -724,12 +729,18 @@ class SongQueueEntry:
     # The recording the walk named, which the resolve searches before the term.
     # Written only while the item has one, so a resolved entry's bytes never move.
     isrc: str | None = None
+    # QueueObject.resolved_from, flat. "" = none; written only when set, so an
+    # entry without one serializes to the bytes it always did.
+    resolved_term: str = ""
+    resolved_isrc: str | None = None
+    resolved_secs: int | None = None
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
         """Snapshot a live queue item for persistence. The card flattens to its
         three wire fields; no card is 0/0/False."""
         card = item.np_card
+        asked = item.resolved_from
         return cls(
             webpage_url=item.webpage_url,
             title=item.title,
@@ -752,6 +763,9 @@ class SongQueueEntry:
             np_dedicated=card.dedicated if card is not None else False,
             search=item.search,
             isrc=item.isrc,
+            resolved_term=asked.term if asked is not None else "",
+            resolved_isrc=asked.isrc if asked is not None else None,
+            resolved_secs=asked.secs if asked is not None else None,
         )
 
     @classmethod
@@ -830,6 +844,10 @@ class SongQueueEntry:
             fields[QueueEntryField.YTSEARCH] = self.search
         if self.isrc is not None:
             fields[QueueEntryField.ISRC] = self.isrc
+        if self.resolved_term:
+            fields[QueueEntryField.RESOLVED_TERM] = self.resolved_term
+            fields[QueueEntryField.RESOLVED_ISRC] = self.resolved_isrc
+            fields[QueueEntryField.RESOLVED_SECS] = self.resolved_secs
         return orjson.dumps(fields)
 
 
@@ -876,6 +894,9 @@ def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
             # where item_label strips the term's prefix.
             search=d.get(QueueEntryField.YTSEARCH) or "",
             isrc=d.get(QueueEntryField.ISRC),
+            resolved_term=d.get(QueueEntryField.RESOLVED_TERM) or "",
+            resolved_isrc=d.get(QueueEntryField.RESOLVED_ISRC),
+            resolved_secs=d.get(QueueEntryField.RESOLVED_SECS),
         )
     except Exception as e:
         return None, str(e)

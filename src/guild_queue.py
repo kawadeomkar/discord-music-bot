@@ -40,7 +40,7 @@ from src.guild_state import SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
-from src.queue_item import NpCard, QueueObject
+from src.queue_item import NpCard, QueueObject, SearchAsk
 
 log = get_logger(__name__)
 
@@ -862,4 +862,13 @@ class GuildQueue:
             # and the stream attempt fails on it.
             search=entry.search,
             isrc=entry.isrc,
+            resolved_from=(
+                SearchAsk(
+                    term=entry.resolved_term,
+                    isrc=entry.resolved_isrc,
+                    secs=entry.resolved_secs,
+                )
+                if entry.resolved_term
+                else None
+            ),
         )

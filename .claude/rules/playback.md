@@ -89,7 +89,8 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   re-pointed instead: `YTDL.rescue_age_restricted` runs where its stream fails (the
   enqueue warm, whose item `_warm_stream` swaps into the slot, or `yt_stream` at
   play time), asks music search for the ask, and replaces the ask's source-cache
-  entry. docs/ARCHITECTURE.md#an-age-restricted-top-hit.
+  entry. A Spotify item rebuilds its ask from `QueueObject.resolved_from` (term,
+  ISRC, length), which `yt_source` stamps and `_resolve_source` keeps. docs/ARCHITECTURE.md#an-age-restricted-top-hit.
   An EMPTY page is final for its term (the processed search would re-send the same
   POST). A search every term misses asks
   music search once: a walled search answers in ~1.8–2.1s, and a genuine miss

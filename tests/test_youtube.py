@@ -31,7 +31,7 @@ from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
-from src.queue_item import NpCard, NpHostRef, QueueObject
+from src.queue_item import NpCard, NpHostRef, QueueObject, SearchAsk
 from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
@@ -417,6 +417,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
                     message=MagicMock(spec=discord.Message), own_embeds=[]
                 ),
             ),
+            resolved_from=SearchAsk(term="typed", isrc="GBAHS1600463", secs=234),
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
         )
@@ -3131,6 +3132,165 @@ class TestAgeRescueAtStreamTime:
             pytest.raises(ExtractionError, match="confirm your age"),
         ):
             await YTDL.yt_stream(self._queued(mock_ctx), channel)
+
+
+class TestSpotifyAgeRescue:
+    """A Spotify track's `user_input` is its link (or its collection's), which
+    cannot rebuild the search it resolved through, so the item carries that
+    search as `resolved_from`, and the rescue re-asks it."""
+
+    _TERM = "夜に駆ける YOASOBI"
+    _ISRC = "JPP301900716"
+    _OMV = "https://www.youtube.com/watch?v=x8VYWazR5mE"
+    _ATV = "https://www.youtube.com/watch?v=by4SYYWlhEs"
+    _MUSIC_URL = (
+        "https://music.youtube.com/search?q="
+        "%E5%A4%9C%E3%81%AB%E9%A7%86%E3%81%91%E3%82%8B+YOASOBI"
+    )
+    _FLAT = {
+        "entries": [
+            {"id": "x8VYWazR5mE", "title": "YOASOBI「夜に駆ける」 Official Music Video",
+             "duration": 276, "uploader": "Ayase / YOASOBI"},
+        ]
+    }  # fmt: skip
+
+    @pytest.mark.parametrize("flat", [True, False], ids=["tail", "full"])
+    async def test_a_spotify_ask_resolves_carrying_its_search(
+        self, mock_ctx: MagicMock, flat: bool
+    ) -> None:
+        answers = {
+            f'ytsearch:"{self._ISRC}"': self._FLAT if flat else {"entries": []},
+            f"ytsearch3:{self._TERM}": self._FLAT,
+            self._TERM: TestAgeRestrictedSearch._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(answers, []),
+        ):
+            got = await YTDL.yt_source(
+                mock_ctx.author, self._TERM, query_source="open.spotify.com",
+                **_ANALYTICS, user_input="https://open.spotify.com/track/abc",
+                flat=flat, isrc=self._ISRC, expected_duration=258,
+            )  # fmt: skip
+        assert got.resolved_from == SearchAsk(
+            term=self._TERM, isrc=self._ISRC, secs=258
+        )
+
+    async def test_a_music_answer_carries_it_too(self, mock_ctx: MagicMock) -> None:
+        answers = {
+            f'ytsearch:"{self._ISRC}"': {"entries": []},
+            self._TERM: {"entries": []},
+            self._MUSIC_URL: {"entries": _music_entries("夜に駆ける")},
+            self._ATV: TestAgeRestrictedSearch._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(answers, []),
+        ):
+            got = await YTDL.yt_source(
+                mock_ctx.author, self._TERM, query_source="open.spotify.com",
+                **_ANALYTICS, user_input=None, isrc=self._ISRC,
+                expected_duration=258,
+            )  # fmt: skip
+        assert got.webpage_url == self._ATV
+        assert got.resolved_from is not None
+
+    @pytest.mark.parametrize(
+        "search", ["ytsearch:夜に駆ける", "https://www.youtube.com/watch?v=by4SYYWlhEs"]
+    )
+    async def test_a_typed_search_or_link_carries_none(
+        self, mock_ctx: MagicMock, search: str
+    ) -> None:
+        """A typed search rebuilds from `user_input`; a link is the video."""
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(
+                {search: TestAgeRestrictedSearch._FOUND}, []
+            ),
+        ):
+            got = await YTDL.yt_source(
+                mock_ctx.author, search, query_source="search", **_ANALYTICS,
+                user_input=search,
+            )  # fmt: skip
+        assert got.resolved_from is None
+
+    @pytest.mark.parametrize(
+        ("isrc", "keys"),
+        [
+            # The ISRC term leads both ladders: one key to overwrite.
+            ("JPP301900716", ['ytsearch:"JPP301900716"']),
+            # No ISRC: the TAIL ladder's widened term and the dequeue's plain one.
+            (None, ["ytsearch3:夜に駆ける YOASOBI", "夜に駆ける YOASOBI"]),
+        ],
+        ids=["isrc", "no-isrc"],
+    )
+    async def test_a_spotify_item_is_re_asked_by_its_search(
+        self,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+        isrc: Optional[str],
+        keys: list[str],
+    ) -> None:
+        for key in keys:
+            await fake_redis.set(
+                _source_cache_key(key), orjson.dumps({"webpage_url": self._OMV})
+            )
+        queued = QueueObject(
+            webpage_url=self._OMV,
+            title="YOASOBI「夜に駆ける」 Official Music Video",
+            requester=mock_ctx.author,
+            user_input="https://open.spotify.com/track/abc",
+            query_source="open.spotify.com",
+            resolved_from=SearchAsk(term=self._TERM, isrc=isrc, secs=258),
+        )
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: {"entries": _music_entries("夜に駆ける")},
+            self._ATV: TestAgeRestrictedSearch._FOUND,
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(answers, asked),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                queued, TestAgeRestrictedSearch._age_error(), fake_redis
+            )
+            await _settle_stream_warms()
+
+        assert got is not None
+        assert got.webpage_url == self._ATV
+        assert got.user_input == "https://open.spotify.com/track/abc"
+        assert got.resolved_from == queued.resolved_from
+        assert asked == [self._MUSIC_URL, self._ATV]
+        for key in keys:
+            raw = await fake_redis.get(_source_cache_key(key))
+            assert raw is not None
+            assert orjson.loads(raw)["webpage_url"] == self._ATV
+
+    async def test_the_re_ask_holds_the_pick_to_the_asks_length(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Spotify's length rides `resolved_from`: an answer too far from it is
+        declined, as it would be on the ask's own resolve."""
+        queued = QueueObject(
+            webpage_url=self._OMV,
+            title="OMV",
+            requester=mock_ctx.author,
+            user_input="https://open.spotify.com/track/abc",
+            resolved_from=SearchAsk(term=self._TERM, secs=120),
+        )
+        answers = {
+            self._MUSIC_URL: {"entries": _music_entries("夜に駆ける")},
+            self._ATV: TestAgeRestrictedSearch._FOUND,  # 261 s
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(answers, []),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                queued, TestAgeRestrictedSearch._age_error(), None
+            )
+        assert got is None
 
 
 class TestYTSourceUnifiedExtraction:

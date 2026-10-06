@@ -36,8 +36,20 @@ class NpCard:
     host_ref: Optional[NpHostRef] = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SearchAsk:
+    """The search a resolved item came from, kept when `user_input` cannot rebuild
+    it (a Spotify track: the link, or the collection's): the term, the ISRC searched
+    before it, and the length the ask knew. Read by YTDL.rescue_age_restricted to
+    re-ask a song whose video turned out to be age-restricted."""
+
+    term: str
+    isrc: Optional[str] = None
+    secs: Optional[int] = None
+
+
 # slots: a 10,000-track Spotify playlist holds one of these per track while its
-# searches wait to resolve — 200 B each by sys.getsizeof on this interpreter,
+# searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
 # against 344 B for the same instance carrying a __dict__. Keep the class off
 # asdict (it deep-copies requester), vars (it raises) and any pickle path.
 # eq=False: an item is one ask, so it compares and hashes by identity — two asks
@@ -113,6 +125,9 @@ class QueueObject:
     # resolve, which searches it before the term (youtube._search_terms) and
     # clears it with the term.
     isrc: Optional[str] = None
+    # The search this item resolved through, when `user_input` cannot rebuild it.
+    # Set by YTDL.yt_source for a Spotify-shaped ask; None on everything else.
+    resolved_from: Optional[SearchAsk] = None
 
     @property
     def unresolved(self) -> bool:

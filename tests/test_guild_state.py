@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.queue_item import NpCard, QueueObject
+from src.queue_item import NpCard, QueueObject, SearchAsk
 from src.youtube import YTDL
 from tests.helpers import give_queue_object
 from src.guild_state import (
@@ -838,6 +838,65 @@ class TestSongQueueEntryWire:
             isrc="GBAHS1600463",
         )
         assert SongQueueEntry.from_queue_object(item).isrc == "GBAHS1600463"
+
+
+class TestResolvedFromOnTheWire:
+    """A resolved Spotify item keeps the search it came from, so a stream that fails
+    its age check can be re-asked; `user_input` (the link) cannot rebuild it."""
+
+    _ASK = SearchAsk(term="Kesariya Arijit Singh", isrc="INS172203702", secs=268)
+
+    def _resolved(self, **over: Any) -> QueueObject:
+        return QueueObject(
+            webpage_url="https://www.youtube.com/watch?v=NJAv_7lHUIU",
+            title="Kesariya",
+            requester=_requester_stub(424242424242424242),
+            user_input="https://open.spotify.com/track/abc",
+            **over,
+        )
+
+    def test_an_entry_without_one_writes_the_bytes_it_always_did(self) -> None:
+        """An entry already on the list must re-serialize to its own bytes, or its
+        LREM misses and the whole list rebuilds."""
+        assert b"resolved_" not in _SEARCH_ENTRY.to_redis()
+        assert _SEARCH_ENTRY.to_redis() == _GOLDEN_QOBJ_SEARCH
+
+    def test_it_round_trips(self) -> None:
+        entry = SongQueueEntry.from_queue_object(
+            self._resolved(resolved_from=self._ASK)
+        )
+        assert (entry.resolved_term, entry.resolved_isrc, entry.resolved_secs) == (
+            "Kesariya Arijit Singh",
+            "INS172203702",
+            268,
+        )
+        assert parse_queue_entry(entry.to_redis()) == entry
+
+    def test_a_term_alone_round_trips(self) -> None:
+        entry = SongQueueEntry.from_queue_object(
+            self._resolved(resolved_from=SearchAsk(term="x y"))
+        )
+        back = parse_queue_entry(entry.to_redis())
+        assert back is not None
+        assert (back.resolved_term, back.resolved_isrc, back.resolved_secs) == (
+            "x y",
+            None,
+            None,
+        )
+
+    def test_reader_defaults_it_on_a_pre_feature_entry(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_QOBJ_SEARCH)
+        assert isinstance(entry, SongQueueEntry)
+        assert (entry.resolved_term, entry.resolved_isrc, entry.resolved_secs) == (
+            "",
+            None,
+            None,
+        )
+
+    def test_the_parked_song_keeps_it(self, ytdl_instance: Callable[..., Any]) -> None:
+        """A crash-recovered song streams again, and can fail its age check then."""
+        song = ytdl_instance(None, resolved_from=self._ASK)
+        assert SongQueueEntry.from_song(song).resolved_term == "Kesariya Arijit Singh"
 
 
 class TestParseQueueEntryCorrupt:

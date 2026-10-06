@@ -23,7 +23,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
-from src.queue_item import NpCard, QueueObject
+from src.queue_item import NpCard, QueueObject, SearchAsk
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import YTSource, is_link, is_mix, parse_input
 from src.telemetry import get_tracer
@@ -2041,6 +2041,20 @@ async def _cache_music_answer(
     )
 
 
+def _typed_search(user_input: Optional[str]) -> Optional[SearchAsk]:
+    """The search a typed `-play <words>` resolved through, rebuilt from what was
+    typed, or None for a link, a Spotify page or nothing."""
+    try:
+        source = parse_input(user_input) if user_input else None
+    except Exception:
+        # A link parse_input refuses (an unsupported Spotify page) was never a
+        # typed search, and the rescue runs inside its caller's error handling.
+        return None
+    if not isinstance(source, YTSource) or source.ytsearch is None:
+        return None
+    return SearchAsk(term=source.ytsearch)
+
+
 def _video_id_of(webpage_url: str) -> str:
     """The `v=` of a watch URL, or "" for any other shape."""
     return (parse_qs(urlparse(webpage_url).query).get("v") or [""])[0]
@@ -2305,6 +2319,10 @@ class YTDL(discord.FFmpegOpusAudio):
     @property
     def np_card(self) -> Optional[NpCard]:
         return self.queued.np_card
+
+    @property
+    def resolved_from(self) -> Optional[SearchAsk]:
+        return self.queued.resolved_from
 
     @property
     def played_at(self) -> float:
@@ -2725,7 +2743,7 @@ class YTDL(discord.FFmpegOpusAudio):
         terms = _search_terms(
             search, isrc=isrc, expected_duration=expected_duration, flat=flat
         )
-        resolve = partial(
+        resolve_term = partial(
             cls._resolve_term,
             requester,
             expected_duration=expected_duration,
@@ -2738,6 +2756,19 @@ class YTDL(discord.FFmpegOpusAudio):
             redis=redis,
             pool_slot=pool_slot,
         )
+        # A Spotify-shaped ask, whose user_input (a link) cannot rebuild the search:
+        # every item it resolves to carries it, for rescue_age_restricted.
+        asked = (
+            SearchAsk(term=search, isrc=isrc, secs=expected_duration)
+            if (isrc is not None or expected_duration is not None)
+            and not is_link(search.strip())
+            else None
+        )
+
+        async def resolve(term: str, **kwargs: Any) -> QueueObject:
+            found = await resolve_term(term, **kwargs)
+            return found if asked is None else replace(found, resolved_from=asked)
+
         last_miss: Optional[_NothingFound] = None
         # Videos a term landed on that refused a signed-out client its age check.
         age_gated: set[str] = set()
@@ -2790,7 +2821,7 @@ class YTDL(discord.FFmpegOpusAudio):
             found = await cls._music_answer(
                 search,
                 resolve,
-                cache_term=terms[0][1],
+                cache_terms=(terms[0][1],),
                 user_input=user_input,
                 redis=redis,
                 pool_slot=pool_slot,
@@ -2809,7 +2840,7 @@ class YTDL(discord.FFmpegOpusAudio):
         search: str,
         resolve: Callable[..., Awaitable[QueueObject]],
         *,
-        cache_term: str,
+        cache_terms: tuple[str, ...],
         user_input: Optional[str],
         redis: Optional[aioredis.Redis],
         pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]],
@@ -2817,7 +2848,7 @@ class YTDL(discord.FFmpegOpusAudio):
         exclude: frozenset[str],
     ) -> Optional[QueueObject]:
         """What music search answers `search` with, resolved through `resolve` as a
-        link and cached under `cache_term`, or None. Never raises: both legs are
+        link and cached under each of `cache_terms`, or None. Never raises: both legs are
         best-effort, and the ask keeps the answer it earned."""
         try:
             watch_url = await _ytmusic_candidate_url(
@@ -2853,7 +2884,8 @@ class YTDL(discord.FFmpegOpusAudio):
             trace.get_current_span().set_attribute(
                 "ytdl.search_kind", _SEARCH_KIND_MUSIC
             )
-            await _cache_music_answer(redis, cache_term, found)
+            for cache_term in cache_terms:
+                await _cache_music_answer(redis, cache_term, found)
             return found
         except Exception as e:
             # A candidate raises yt-dlp's cookies boilerplate, which user_message
@@ -2871,29 +2903,25 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis],
     ) -> Optional[QueueObject]:
         """`qo` re-pointed at what music search answers its ask with, when its
-        stream failed for an age check and the ask was a typed search; else None.
+        stream failed for an age check and the ask can be rebuilt — the search it
+        resolved from (`resolved_from`, a Spotify track), or a typed one; else None.
 
-        A flat resolve cannot see an age gate (it makes no player call), so a
-        restricted top hit queues and fails here. The answer replaces the ask's
-        source-cache entry, which still names the restricted video.
+        A flat resolve cannot see an age gate (it makes no player call), and a
+        cached answer can name a video that has since been restricted, so either
+        queues and fails here. The answer replaces the ask's source-cache entries,
+        which still name the restricted video.
         See docs/ARCHITECTURE.md#an-age-restricted-top-hit."""
         if not isinstance(error, ExtractionError) or not error.age_restricted:
             return None
-        try:
-            source = parse_input(qo.user_input) if qo.user_input else None
-        except Exception:
-            # A link parse_input refuses (an unsupported Spotify page) was never
-            # a typed search, and this runs inside its caller's error handling.
+        asked = qo.resolved_from or _typed_search(qo.user_input)
+        if asked is None:
             return None
-        if not isinstance(source, YTSource) or source.ytsearch is None:
-            return None
-        term = source.ytsearch
         span = trace.get_current_span()
         span.set_attribute("ytdl.music_fallback", True)
         span.set_attribute("ytdl.music_fallback_trigger", "age_restricted_stream")
         failed = {error.video_id, _video_id_of(qo.webpage_url)} - {""}
         found = await cls._music_answer(
-            term,
+            asked.term,
             partial(
                 cls._resolve_term,
                 qo.requester,
@@ -2902,11 +2930,24 @@ class YTDL(discord.FFmpegOpusAudio):
                 queue_position=qo.queue_position,
                 redis=redis,
             ),
-            cache_term=term,
+            # The first term of both ladders the ask could have taken (flat for a
+            # TAIL, full at dequeue): whichever served the restricted video, the
+            # next ask reads that one first.
+            cache_terms=tuple(
+                dict.fromkeys(
+                    _search_terms(
+                        asked.term,
+                        isrc=asked.isrc,
+                        expected_duration=asked.secs,
+                        flat=flat,
+                    )[0][1]
+                    for flat in (True, False)
+                )
+            ),
             user_input=qo.user_input,
             redis=redis,
             pool_slot=None,
-            expected_duration=None,
+            expected_duration=asked.secs,
             exclude=frozenset(failed),
         )
         if found is None:
