@@ -7,7 +7,7 @@ from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
 from src.ping import send_latency_line
-from src.recovery import discord_holds_voice_state, join_succeeded
+from src.recovery import discord_holds_voice_state, join_succeeded, leave_voice
 from src.util import get_logger, notice_embed, spawn_background
 
 log = get_logger(__name__)
@@ -47,25 +47,34 @@ async def run(
         log.warning(
             f"join replacing an unconnected voice client in guild {ctx.guild.id}"
         )
-        await parked.disconnect(force=discord_holds_voice_state(ctx.guild))
+        await leave_voice(parked, force=discord_holds_voice_state(ctx.guild))
     if not ctx.voice_client:
-        await channel.connect(timeout=10.0)
-    vc = ctx.voice_client
-    if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
-        await vc.move_to(channel)
-    # Reported and returned rather than raised, which is the same thing a failed
-    # join tells its creator, and ahead of set_connection so on_ready cannot recover
-    # a guild this never joined.
+        try:
+            await channel.connect(timeout=10.0)
+        except asyncio.CancelledError:
+            # Op 4 may be out with its VOICE_STATE_UPDATE still in flight: the bot
+            # member has no voice state yet, so cleanup()'s disconnect would go
+            # unforced and send no clear. Forced here, where the connect is known
+            # to have started.
+            if ctx.voice_client is not None:
+                await leave_voice(ctx.voice_client, force=True)
+            raise
+    # Ahead of move_to, which on an unconnected client sends op 4 and then waits
+    # 30s for a state nothing drives; and ahead of set_connection, so on_ready
+    # cannot recover a guild this never joined. The next -join replaces the client.
     if not join_succeeded(ctx):
         log.warning(f"join found an unconnected voice client in guild {ctx.guild.id}")
         await ctx.send(
             embed=notice_embed(
-                "Couldn't finish connecting to your voice channel — try again in a "
-                "moment.",
+                "Couldn't finish connecting to your voice channel. Run `-join` "
+                "again to retry with a fresh connection.",
                 discord.Color.red(),
             )
         )
         return
+    vc = ctx.voice_client
+    if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
+        await vc.move_to(channel)
     await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True)
 
     if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):

@@ -79,7 +79,12 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.recovery import VoiceWatchdog, discord_holds_voice_state, restore_guild
+from src.recovery import (
+    VoiceWatchdog,
+    discord_holds_voice_state,
+    leave_voice,
+    restore_guild,
+)
 from src.settings import GuildSettings
 from src.telemetry import get_tracer
 from src.util import (
@@ -303,18 +308,28 @@ class MusicBot(commands.Cog):
             # gather: it is the one task that can put the bot BACK in the channel
             # after the disconnect below, and cancel_join's self-guard reads
             # current_task(), which in a gather child is the child.
-            await self._plays.cancel_join(guild.id)
+            try:
+                await self._plays.cancel_join(guild.id)
+            except Exception as e:
+                # The join runs a whole command; what it raises on the way out is
+                # logged, so the disconnect and clear_connection() still run.
+                self._log_teardown_error("cold join", e)
             # Cancel before disconnecting so the loop cannot start the next song
             # between voice_client.stop() and cancellation.
-            teardown = [
-                cancel_task(mp._prefetch_task),
-                cancel_task(mp._progress_task),
-                cancel_task(mp._heartbeat_task),
-                cancel_task(mp._pause_debounce_task),
-                cancel_task(mp._player),
-                cancel_task(mp._restore_task),
-            ]
-            await asyncio.gather(*teardown)
+            teardown = {
+                "prefetch": mp._prefetch_task,
+                "progress": mp._progress_task,
+                "heartbeat": mp._heartbeat_task,
+                "pause debounce": mp._pause_debounce_task,
+                "player": mp._player,
+                "restore": mp._restore_task,
+            }
+            results = await asyncio.gather(
+                *(cancel_task(t) for t in teardown.values()), return_exceptions=True
+            )
+            for name, result in zip(teardown, results):
+                if isinstance(result, Exception):
+                    self._log_teardown_error(name, result)
             # Tasks are down, so no tick can race this.
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
@@ -322,8 +337,8 @@ class MusicBot(commands.Cog):
                 # `connected` an unforced disconnect skips the op-4 clear, and
                 # VoiceClient.cleanup() then unregisters the only object that
                 # could send it. docs/ARCHITECTURE.md#voice-teardown
-                await guild.voice_client.disconnect(
-                    force=discord_holds_voice_state(guild)
+                await leave_voice(
+                    guild.voice_client, force=discord_holds_voice_state(guild)
                 )
             if pending_history is not None:
                 # After the disconnect: Redis IO ahead of it delays the silence
@@ -340,6 +355,13 @@ class MusicBot(commands.Cog):
         except Exception as e:
             record_span_error(trace.get_current_span(), e)
             log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
+
+    @staticmethod
+    def _log_teardown_error(task: str, e: Exception) -> None:
+        """A task cleanup() cancelled raised rather than stopping; the teardown
+        carries on past it."""
+        record_span_error(trace.get_current_span(), e)
+        log.error(f"cleanup: {task} task raised {type(e).__name__}: {e}", exc_info=e)
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
         """discord.py hook run before every command: binds log context, opens

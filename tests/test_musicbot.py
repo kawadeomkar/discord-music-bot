@@ -14,6 +14,7 @@ from discord.ext import commands
 from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 
 import src.debug as debug_mode
+import src.recovery as recovery
 from src.config import SpotifyStatus
 from src.guild_state import HistoryEntry
 from src.recovery import _Countdown
@@ -23,6 +24,7 @@ from src.sources import UnsupportedSpotifyLinkError
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
     Ask,
+    admit,
     described,
     make_mock_task,
 )
@@ -463,6 +465,8 @@ class TestCleanup:
         TestVoiceDisconnectContract pins that the flag is what decides it."""
         self._make_minimal_mp(music_bot, mock_guild)
         mock_guild.voice_client.disconnect = AsyncMock()
+        mock_guild.me.voice = MagicMock(spec=discord.VoiceState)
+        mock_guild.me.voice.channel = MagicMock(spec=discord.VoiceChannel)
 
         await music_bot.cleanup(mock_guild)
 
@@ -473,7 +477,9 @@ class TestCleanup:
         [
             lambda g: setattr(g, "me", None),
             lambda g: setattr(g.me, "voice", None),
-            lambda g: setattr(g.me.voice, "channel", None),
+            lambda g: setattr(
+                g.me, "voice", MagicMock(spec=discord.VoiceState, channel=None)
+            ),
         ],
         ids=["no-bot-member", "no-voice-state", "state-without-channel"],
     )
@@ -492,6 +498,30 @@ class TestCleanup:
 
         mock_guild.voice_client.disconnect.assert_awaited_once_with(force=False)
 
+    async def test_an_unconfirmed_disconnect_cannot_hold_the_teardown(
+        self,
+        music_bot: MusicBot,
+        mock_guild: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stale voice state forces a clear Discord never confirms. The guild has
+        no player for as long as the disconnect waits, so the wait is capped."""
+        store = MagicMock()
+        store.clear_connection = AsyncMock()
+        store.refresh_ttl = AsyncMock()
+        self._make_minimal_mp(music_bot, mock_guild, store=store)
+
+        async def _never_confirmed(**_: Any) -> None:
+            await asyncio.Event().wait()
+
+        mock_guild.voice_client.disconnect = AsyncMock(side_effect=_never_confirmed)
+        monkeypatch.setattr(recovery, "VOICE_CLEAR_WAIT_SECS", 0.05)
+
+        async with asyncio.timeout(5):
+            await music_bot.cleanup(mock_guild)
+
+        store.clear_connection.assert_awaited_once()
+
     async def test_cancels_the_in_flight_cold_join(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -505,6 +535,103 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
 
         music_bot._plays.cancel_join.assert_awaited_once_with(mock_guild.id)
+
+    async def test_a_live_cold_join_is_cancelled_before_the_disconnect(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        """Through the real registry: a join registered the way -play registers it.
+        Cancelled after the disconnect, it could still send op 4 and put the bot
+        back in the channel the teardown just cleared."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        req = admit(music_bot, mock_ctx, mp)
+        started = asyncio.Event()
+
+        async def _join() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()  # a handshake that never lands
+            except asyncio.CancelledError:
+                order.append("join cancelled")
+                raise
+
+        tracked: set[asyncio.Task[Any]] = set()
+        join, _owns = music_bot._plays.cold_join(req, joiner=_join, tracked=tracked)
+        await started.wait()
+        mock_guild.voice_client.disconnect = AsyncMock(
+            side_effect=lambda **_: order.append("disconnect")
+        )
+        mock_guild.me.voice = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert join.cancelled()
+        assert order == ["join cancelled", "disconnect"]
+
+    async def test_a_join_that_raises_on_cancel_still_lets_the_teardown_finish(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        """The join task runs a whole command, so its way out can raise something
+        other than CancelledError. The disconnect and clear_connection() after it
+        are what stop the bot and keep on_ready from recovering the guild."""
+        store = MagicMock()
+        store.clear_connection = AsyncMock()
+        store.refresh_ttl = AsyncMock()
+        mp = self._make_minimal_mp(music_bot, mock_guild, store=store)
+        req = admit(music_bot, mock_ctx, mp)
+        started = asyncio.Event()
+
+        async def _join() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("join's own teardown failed") from None
+
+        tracked: set[asyncio.Task[Any]] = set()
+        music_bot._plays.cold_join(req, joiner=_join, tracked=tracked)
+        await started.wait()
+        mock_guild.voice_client.disconnect = AsyncMock()
+
+        await music_bot.cleanup(mock_guild)
+
+        mock_guild.voice_client.disconnect.assert_awaited_once()
+        store.clear_connection.assert_awaited_once()
+
+    async def test_a_task_that_raises_on_cancel_does_not_stop_the_others(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        cancelled: list[str] = []
+
+        async def _raises_on_cancel() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("prefetch teardown failed") from None
+
+        async def _parks() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append("player")
+                raise
+
+        prefetch = asyncio.ensure_future(_raises_on_cancel())
+        player = asyncio.ensure_future(_parks())
+        await asyncio.sleep(0)
+        store = MagicMock()
+        store.clear_connection = AsyncMock()
+        store.refresh_ttl = AsyncMock()
+        self._make_minimal_mp(
+            music_bot, mock_guild, _prefetch_task=prefetch, _player=player, store=store
+        )
+        mock_guild.voice_client.disconnect = AsyncMock()
+
+        await music_bot.cleanup(mock_guild)
+
+        assert cancelled == ["player"] and player.cancelled()
+        mock_guild.voice_client.disconnect.assert_awaited_once()
+        store.clear_connection.assert_awaited_once()
 
     async def test_cancels_the_join_on_its_own_task_not_a_gather_child(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -881,22 +1008,25 @@ class TestVoiceDisconnectContract:
         one: both voice updates in, websocket never finished, so `is_connected()`
         is False.
 
-        The client is a bare MagicMock because `channel` is set in __init__ and
-        `spec=discord.VoiceClient` therefore refuses it. SocketReader.start is
-        patched out because __init__ starts that thread unconditionally: nothing
-        here feeds it a socket, and stopping it afterwards races its own
-        `_end.clear()` into a daemon thread parked for the run.
+        `channel` is assigned rather than read off the spec, which lists only
+        class attributes. SocketReader.start is patched out because __init__
+        starts that thread unconditionally: nothing here feeds it a socket, and
+        stopping it afterwards races its own `_end.clear()` into a daemon thread
+        parked for the run.
         """
         change_voice_state = AsyncMock()
-        voice_client = MagicMock()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 924267988138483772
+        guild.change_voice_state = change_voice_state
+        voice_client = MagicMock(spec=discord.VoiceClient)
+        voice_client.channel = MagicMock(spec=discord.VoiceChannel)
         voice_client.channel.id = 925632451882143764
-        voice_client.channel.guild.change_voice_state = change_voice_state
-        voice_client.guild.id = 924267988138483772
+        voice_client.channel.guild = guild
 
         # The real VoiceClient.guild is a property returning self.channel.guild;
         # two unrelated mock children would make an upstream switch between the
         # two spellings read as a behaviour change.
-        voice_client.guild = voice_client.channel.guild
+        voice_client.guild = guild
 
         with patch("discord.voice_state.SocketReader.start"):
             state = VoiceConnectionState(voice_client)

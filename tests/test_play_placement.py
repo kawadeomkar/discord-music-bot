@@ -482,10 +482,23 @@ class TestPlayRegistry:
 
         assert returned.is_set() and not join.cancelled()
 
-    async def test_cancel_join_is_inert_for_a_guild_with_no_join(
+    async def test_cancel_join_is_inert_for_an_unregistered_guild(
         self, music_bot: MusicBot
     ) -> None:
-        await music_bot._plays.cancel_join(999000000000000001)
+        guild_id = 999000000000000001
+        await music_bot._plays.cancel_join(guild_id)
+        assert not music_bot._plays.join_in_flight(guild_id)
+        assert guild_id not in music_bot._plays._guilds
+
+    async def test_cancel_join_is_inert_for_a_guild_resolving_warm(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A registered guild whose requests took the warm path has no join; its
+        resolving requests are not the cancel's to touch."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        await music_bot._plays.cancel_join(req.guild_id)
+        assert not req.settled.is_set() and not req.dropped_by
+        assert music_bot._plays._guilds[req.guild_id].inflight == [req]
 
     async def test_the_cap_raise_escapes_the_command_body(
         self, music_bot: MusicBot, mock_ctx: MagicMock

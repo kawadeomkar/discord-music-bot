@@ -1,8 +1,10 @@
 """Tests for `-join` (src/commands/join.py)."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
 from redis.asyncio import Redis
 
 from src.musicbot import MusicBot
@@ -50,10 +52,7 @@ class TestJoinChannelPersistence:
 
         # join is a @commands.command — call the underlying callback directly.
         mock_ctx.voice_client = None  # bot not yet in channel
-        with (
-            patch.object(discord.VoiceChannel, "connect", new=AsyncMock()),
-            patch.object(mock_ctx, "invoke", new=AsyncMock()),
-        ):
+        with patch.object(mock_ctx, "invoke", new=AsyncMock()):
             music_bot_with_redis.get_mp = MagicMock(return_value=mp)
             await command_callback(MusicBot.join)(music_bot_with_redis, mock_ctx)
 
@@ -129,7 +128,7 @@ class TestJoinReplacesAParkedClient:
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
         voice_channel, parked = self._parked(mock_ctx, mock_guild)
-        mock_guild.me.voice = MagicMock(channel=voice_channel)
+        mock_guild.me.voice = MagicMock(spec=discord.VoiceState, channel=voice_channel)
         self._player(music_bot)
 
         await command_callback(MusicBot.join)(music_bot, mock_ctx)
@@ -163,4 +162,124 @@ class TestJoinReplacesAParkedClient:
         mock_guild.change_voice_state.assert_not_awaited()
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "Couldn't finish connecting" in described(embed)
+        assert "`-join` again" in described(embed)
         assert embed.color == discord.Color.red()
+
+    async def test_a_parked_client_in_another_channel_is_replaced_not_moved(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        """move_to on a client whose handshake never landed sends op 4 and then
+        waits 30s for a state nothing drives."""
+        voice_channel, parked = self._parked(mock_ctx, mock_guild)
+        parked.channel = MagicMock(spec=discord.VoiceChannel)
+        mock_guild.me.voice = None
+        mp = self._player(music_bot)
+
+        await command_callback(MusicBot.join)(music_bot, mock_ctx)
+
+        parked.disconnect.assert_awaited_once_with(force=False)
+        parked.move_to.assert_not_awaited()
+        voice_channel.connect.assert_awaited_once()
+        mp.open_playback_gate.assert_called_once()
+
+    async def test_a_connected_client_in_another_channel_is_moved(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        voice_channel, connected = self._parked(mock_ctx, mock_guild)
+        connected.is_connected.return_value = True
+        connected.channel = MagicMock(spec=discord.VoiceChannel)
+        mp = self._player(music_bot)
+
+        await command_callback(MusicBot.join)(music_bot, mock_ctx)
+
+        connected.move_to.assert_awaited_once_with(voice_channel)
+        connected.disconnect.assert_not_awaited()
+        mp.open_playback_gate.assert_called_once()
+
+    async def test_an_unconnected_client_is_refused_before_any_move(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        """discord.py rewrites the client's channel when the bot is moved while
+        connecting, so a handshake that never lands can name another channel."""
+        voice_channel, _parked = self._parked(
+            mock_ctx, mock_guild, handshake_lands=False
+        )
+        mock_guild.me.voice = None
+        elsewhere = MagicMock(spec=discord.VoiceChannel)
+        connect = voice_channel.connect.side_effect
+
+        def _connect_elsewhere(*a: object, **k: object) -> None:
+            connect(*a, **k)
+            mock_ctx.voice_client.channel = elsewhere
+
+        voice_channel.connect.side_effect = _connect_elsewhere
+        self._player(music_bot)
+
+        await command_callback(MusicBot.join)(music_bot, mock_ctx)
+
+        mock_ctx.voice_client.move_to.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Couldn't finish connecting" in described(embed)
+
+
+class TestJoinCancelledMidHandshake:
+    """A teardown cancels the cold join, and the cancel can land after op 4 went
+    out but before Discord's VOICE_STATE_UPDATE came back. The bot member has no
+    voice state yet, so cleanup()'s disconnect would go unforced and send no clear;
+    the join's own cancellation path forces it."""
+
+    async def test_the_cancelled_connect_forces_the_clear(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        voice_channel = MagicMock(spec=discord.VoiceChannel)
+        mock_ctx.author.voice.channel = voice_channel
+        mock_ctx.voice_client = None
+        mock_guild.voice_client = None
+        mock_guild.me.voice = None  # op 4 sent, its VOICE_STATE_UPDATE not yet in
+        handshaking = MagicMock(spec=discord.VoiceClient)
+        handshaking.is_connected.return_value = False
+        handshaking.disconnect = AsyncMock()
+        op4_sent = asyncio.Event()
+
+        async def _connect(*_a: object, **_k: object) -> None:
+            # discord.py registers the client before the handshake it waits on.
+            mock_ctx.voice_client = handshaking
+            op4_sent.set()
+            await asyncio.Event().wait()
+
+        voice_channel.connect = AsyncMock(side_effect=_connect)
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        join = asyncio.ensure_future(
+            command_callback(MusicBot.join)(music_bot, mock_ctx)
+        )
+        await op4_sent.wait()
+        join.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await join
+
+        handshaking.disconnect.assert_awaited_once_with(force=True)
+
+    async def test_a_cancel_before_any_client_registers_has_nothing_to_clear(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
+    ) -> None:
+        voice_channel = MagicMock(spec=discord.VoiceChannel)
+        mock_ctx.author.voice.channel = voice_channel
+        mock_ctx.voice_client = None
+        entered = asyncio.Event()
+
+        async def _connect(*_a: object, **_k: object) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        voice_channel.connect = AsyncMock(side_effect=_connect)
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        join = asyncio.ensure_future(
+            command_callback(MusicBot.join)(music_bot, mock_ctx)
+        )
+        await entered.wait()
+        join.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await join
+        assert join.cancelled()

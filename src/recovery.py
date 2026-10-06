@@ -4,9 +4,10 @@ restore_guild() is the join side (crash recovery,
 docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the
 alone-disconnect countdown, posted as a card that ticks down and then says which
 way it went), and its bot-was-ejected arm routes straight to cog.cleanup(). The
-two cold-start helpers at the bottom are what -play and -resume both do about a
-join that produced no usable voice client; they live here so the two commands'
-checks cannot diverge.
+voice helpers at the bottom are shared so their callers' checks cannot diverge:
+join_succeeded and abandon_cold_start are what -play and -resume do about a join
+that produced no usable voice client, and discord_holds_voice_state and
+leave_voice are how -join and cleanup() take a client down.
 
 Both take the MusicBot cog as an explicit parameter, the way MusicPlayer does.
 
@@ -50,6 +51,11 @@ _tracer = get_tracer(__name__)
 # rather than decrementing a counter, so an edit the rate limiter paces late costs
 # a frame instead of quoting a number the clock has already passed.
 _COUNTDOWN_TICK_SECS = 1.0
+
+# How long leave_voice waits for Discord to confirm a clear. A confirmed clear takes
+# one gateway round trip; a confirmation arriving after this reaches whatever client
+# the guild registers next.
+VOICE_CLEAR_WAIT_SECS = 3.0
 
 
 def _seconds_left(deadline: float, now: float) -> int:
@@ -522,6 +528,18 @@ def discord_holds_voice_state(guild: discord.Guild) -> bool:
     me = guild.me
     voice = me.voice if me is not None else None
     return voice is not None and voice.channel is not None
+
+
+async def leave_voice(vc: discord.VoiceProtocol, *, force: bool) -> None:
+    """`vc.disconnect(force=force)`, its wait for Discord to confirm the clear capped
+    at VOICE_CLEAR_WAIT_SECS. discord.py's own wait is its whole connection timeout
+    (10s, 30s after restore_guild), which a stale voice state never ends; the client
+    is unregistered either way. docs/ARCHITECTURE.md#voice-teardown"""
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(VOICE_CLEAR_WAIT_SECS) as bound:
+            await vc.disconnect(force=force)
+    if bound.expired():
+        log.warning(f"voice clear unconfirmed after {VOICE_CLEAR_WAIT_SECS}s")
 
 
 async def abandon_cold_start(

@@ -30,15 +30,16 @@ answers as if the bot had joined. Nothing checked.
   been cleared. Worse, when that stale join finally timed out it dropped whatever voice
   client the guild held by then, which could be a healthy one a later `-play` had just
   made. That one presented as the bot being in the channel while every command insisted
-  it was not.
+  it was not. A stop that lands in the instant the bot is asking Discord to join now
+  tells Discord it left as well, and a stop never waits more than 3 seconds on Discord
+  confirming it.
 - **`-join` repairs a half-connected bot instead of half-working.** Handed an abandoned
   client it skipped its own connect, reported nothing, saved the channel and started
   playback — and every song then failed one at a time, emptying the queue in memory while
   Redis still held it. It now drops the abandoned client and connects properly. If that
   connection does not complete either, it says "Couldn't finish connecting to your voice
-  channel", saves nothing, and leaves the queue alone. A `-play` that joins for you
-  reports the same way it always did.
-
+  channel" and asks for another `-join`, saves nothing, and leaves the queue alone. A
+  `-play` that joins for you reports the same way it always did.
 - **Nothing to do**, and no state to clean up: both windows were in memory only. If you
   have a server where the bot shows as connected but answers "I'm not in a voice
   channel", `-join` once after deploying this.

@@ -464,14 +464,17 @@ sequenceDiagram
     participant VC as Discord VoiceClient
 
     User->>Bot: -join
+    Bot->>MP: cog_before_invoke: get_mp(ctx) → MusicPlayer.from_context()
+    MP->>MP: start() → create_task(_restore_state()), create_task(loop());<br/>gate opens only for a CONNECTED client
     Bot->>Bot: validate_commands()
+    Bot->>VC: leave_voice(parked client) — only when one is registered but unconnected
     Bot->>VC: channel.connect(timeout=10.0) — skipped if a client is registered
     VC-->>Bot: VoiceClient connected
     Bot->>Bot: join_succeeded(ctx) — else report and return
+    Bot->>VC: move_to(channel) — only when connected elsewhere
     Bot->>VC: guild.change_voice_state(self_deaf=True)
-    Bot->>MP: get_mp(ctx) → MusicPlayer.from_context()
-    MP->>MP: start() → create_task(_restore_state()), create_task(loop())
     Bot->>Redis: store.set_connection(voice_channel_id, text_channel_id)
+    Bot->>MP: open_playback_gate()
     Bot->>User: 👋 reaction + ping embed
 ```
 
@@ -483,9 +486,13 @@ the bot in a channel, see [Voice teardown](#voice-teardown)) and connects a fres
 runs in `cog_before_invoke`, before the command body, and opens the gate only for a
 CONNECTED client, so the loop cannot consume the queue onto the parked one in between —
 its own check is only an `isinstance`, and an open gate there costs a song per iteration.
-If the fresh handshake still does not land, `join_succeeded(ctx)` refuses: the deafen,
-`set_connection` and the playback gate are held behind it, because persisting a channel
-the bot is not in makes `on_ready` recover a guild that never connected. `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
+If the fresh handshake still does not land, `join_succeeded(ctx)` refuses and the reply
+says to `-join` again, which replaces the client once more. The move, the deafen,
+`set_connection` and the playback gate are held behind it: `move_to` on an unconnected
+client sends op 4 and then waits 30s for a state nothing drives, and persisting a
+channel the bot is not in makes `on_ready` recover a guild that never connected. A
+teardown that cancels the join mid-connect is answered by the join itself, which forces
+the clear on its way out — see [Voice teardown](#voice-teardown). `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
 
 ---
 
@@ -1273,12 +1280,14 @@ sequenceDiagram
     Trigger->>MusicBot: cleanup(guild)
     MusicBot->>MusicBot: cancel alone-timer; atomic mps.pop(guild.id)
     Note over MusicBot: pop-first gate — a concurrent cleanup call gets None and returns
-    MusicBot->>MP: gather-cancel: the guild's cold join, then _prefetch_task,<br/>_progress_task, _heartbeat_task, _pause_debounce_task, _player, _restore_task
-    Note over MusicBot: the join goes first of those — it is the one task that can<br/>put the bot back in the channel after the disconnect below
+    MusicBot->>MusicBot: cancel_join(guild.id) — awaited alone, on cleanup's own task
+    Note over MusicBot: it is the one task that can put the bot back<br/>in the channel after the disconnect below
+    MusicBot->>MP: gather-cancel: _prefetch_task, _progress_task, _heartbeat_task,<br/>_pause_debounce_task, _player, _restore_task
+    Note over MusicBot: all settle before the disconnect; one that raises<br/>is logged and the teardown carries on
     MusicBot->>MP: retire_np_host_on_stop()
     Note over MP: no task can race this; dedicated NP msg deleted,<br/>command-response host strip-edited
-    MusicBot->>VC: voice_client.disconnect(force=bot still in a channel?)
-    Note over VC: forced only when there is a voice state to clear —<br/>see [Voice teardown](#voice-teardown)
+    MusicBot->>VC: leave_voice(voice_client, force=bot still in a channel?)
+    Note over VC: forced only when there is a voice state to clear,<br/>its confirmation wait capped — see Voice teardown below
     MusicBot->>Redis: store.clear_connection() + refresh_ttl()
 ```
 
@@ -2411,9 +2420,10 @@ jar died with it.
 
 ### Voice teardown
 
-`cleanup()` is an unconditional teardown, so its disconnect passes `force=True`.
-discord.py's default is the other one, and below `ConnectionFlowState.connected` that
-default is silently a no-op:
+`cleanup()` is an unconditional teardown, so its disconnect is forced whenever Discord
+still has the bot in a channel. `VoiceClient.disconnect` defaults to `force=False` and
+hands the flag to the state machine below, where an unforced disconnect short of
+`ConnectionFlowState.connected` is silently a no-op:
 
 ```python
 # discord/voice_state.py — VoiceConnectionState
@@ -2461,10 +2471,29 @@ which is what the predicate reads.
 
 That wait is not free to get wrong. `cleanup()` pops the guild out of `mps` before any
 of this, so for its whole duration the guild has a registered-but-dead voice client and
-no player — and a `-play` landing there reads `cold_start = not ctx.voice_client` as
-False, takes the warm path, never joins, and hands its song to a loop whose `vc.play()`
-raises. Keeping the force off when there is nothing to clear keeps that window at one
-round trip.
+no player — and a `-play` landing there reads
+`cold_start = not ctx.voice_client or in_flight_join` as False (the teardown has
+already cancelled the join), takes the warm path, never joins, and hands its song to a
+loop whose `vc.play()` raises. With the force off the disconnect returns at once; the
+forced case costs one gateway round trip.
+
+**`leave_voice` caps the wait at `VOICE_CLEAR_WAIT_SECS` (3s)**, so a voice state that
+is stale — the member mirror says the bot is in a channel Discord no longer has it in —
+cannot hold that window open for the 10s or 30s above. Every disconnect `-join` and
+`cleanup()` make goes through it. The cap lands inside discord.py's wait, which
+swallows the cancellation and still runs `voice_client.cleanup()`, so the client is
+unregistered either way. The price is the race that wait exists for: a confirmation
+arriving after the cap reaches whichever client the guild registers next, and
+discord.py reads an unexpected `channel=None` update as an external disconnect.
+
+**The predicate has one blind window, and the join closes it.** Between the join's op 4
+and Discord's `VOICE_STATE_UPDATE` (about one round trip) the bot member has no voice
+state yet, so a teardown cancelling the join there would disconnect unforced, send no
+clear, and unregister the client — the leak, with nothing left to reconcile it. The
+join's own cancellation path is the one place that knows the connect started: when
+`channel.connect` raises `CancelledError`, `-join` forces the clear through
+`leave_voice` before re-raising. A cancel that lands before the connector's first step
+has sent nothing, and its forced clear goes unanswered until the cap.
 
 **The teardown also cancels the guild's cold join**, through
 `PlayRegistry.cancel_join`. A join left running outlives the teardown that was supposed
@@ -2477,7 +2506,12 @@ a fresh, connected client in the meantime loses it to that pop, which is the sam
 bot-gone-locally/still-in-channel split described above. The cancel runs first, awaited
 on `cleanup()`'s own task rather than inside the gather of the other cancels, and never
 cancels the task that called it — a check that reads `current_task()`, which inside
-`asyncio.gather` is the gather's child. A `-play` waiting on the cancelled join gets
+`asyncio.gather` is the gather's child. The join task runs a whole command, so an
+exception other than `CancelledError` on its way out is logged and the teardown carries
+on, as it does for any of the gathered cancels (`return_exceptions=True`): the
+disconnect and `clear_connection()` are what end the session. The await itself is
+bounded by what the join's cancellation path awaits — discord.py's `soft_disconnect`,
+whose websocket close aiohttp times out, and the capped `leave_voice` above. A `-play` waiting on the cancelled join gets
 the cancellation out of its `asyncio.shield`; it tells that apart from its own by
 `cancelling()`, and reports the drop (``-stop` ran while it was resolving``) instead of
 letting the error reach discord.py's dispatcher, which would discard it silently.
