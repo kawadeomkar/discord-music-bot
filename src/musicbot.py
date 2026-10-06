@@ -79,7 +79,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.recovery import VoiceWatchdog, restore_guild
+from src.recovery import VoiceWatchdog, discord_holds_voice_state, restore_guild
 from src.settings import GuildSettings
 from src.telemetry import get_tracer
 from src.util import (
@@ -313,7 +313,13 @@ class MusicBot(commands.Cog):
             # Tasks are down, so no tick can race this.
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
-                await guild.voice_client.disconnect(force=False)
+                # Forced only while Discord still has the bot in a channel: below
+                # `connected` an unforced disconnect skips the op-4 clear, and
+                # VoiceClient.cleanup() then unregisters the only object that
+                # could send it. docs/ARCHITECTURE.md#voice-teardown
+                await guild.voice_client.disconnect(
+                    force=discord_holds_voice_state(guild)
+                )
             if pending_history is not None:
                 # After the disconnect: Redis IO ahead of it delays the silence
                 # -stop asked for, unboundedly against a stalled host.

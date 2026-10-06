@@ -513,6 +513,17 @@ def join_succeeded(ctx: commands.Context) -> bool:
     return isinstance(vc, discord.VoiceClient) and vc.is_connected()
 
 
+def discord_holds_voice_state(guild: discord.Guild) -> bool:
+    """Does DISCORD still have the bot in a voice channel? The bot member's own
+    voice state is the local mirror of that view: every VOICE_STATE_UPDATE
+    maintains it whether or not a voice client is still registered to receive one,
+    and a channel=None update drops it. `channel` is read too — an unmatched
+    channel=None update inserts a state carrying no channel."""
+    me = guild.me
+    voice = me.voice if me is not None else None
+    return voice is not None and voice.channel is not None
+
+
 async def abandon_cold_start(
     cog: MusicBot, ctx: commands.Context, mp: MusicPlayer
 ) -> None:

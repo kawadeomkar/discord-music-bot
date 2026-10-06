@@ -17,6 +17,25 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.55.2 — 2026-10-02
+
+**A `-play` whose song lookup fails no longer breaks the next one.** When the lookup
+raised on a bot that was not yet in a voice channel — nothing found for the search, a
+link it could not read, a lookup that ran out of time — the bot abandoned the
+half-finished voice handshake without telling Discord it was leaving. Discord went on
+listing it in the channel, so the NEXT `-play` in that server could not join at all: it
+asked for the channel it was already in, got no answer, and sat out a 10-second
+handshake timeout plus another 10 waiting for a confirmation that could no longer
+arrive. Twenty seconds, then a red **Command failed** embed naming a bare
+`TimeoutError` — for a request that was perfectly fine.
+
+- **Nothing to do.** No setting, no migration, no state to clear.
+- **The old symptom read as contagion**: one bad song appeared to poison the song after
+  it, and only that one. The failed join's own teardown forced the clear on its way
+  out, so a third `-play` connected normally.
+- **Roll back freely**, to any 2.54.x. Nothing here changes what is written to Redis
+  or Postgres.
+
 ## 2.55.1 — 2026-10-06
 
 **A security update to one of the bot's libraries.** `multidict`, which the bot's HTTP
