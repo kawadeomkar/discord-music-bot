@@ -1548,7 +1548,12 @@ class TestMusicSearchFallback:
             # Right kind and a matching title, wrong id: only the length check
             # rejects it, and watch?v=short resolves to nothing.
             {"ie_key": "Youtube", "id": "short", "title": "XVI akiaura"},
-            {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+            {
+                "ie_key": "Youtube",
+                "id": "kSAEcjWWuew",
+                "title": "XVI",
+                "artists": "akiaura, LONOWN & DJ Pointless",
+            },
             {"ie_key": "Youtube", "id": "UH8OV1D091Q", "title": "also playable"},
         ]
     }
@@ -1601,6 +1606,7 @@ class TestMusicSearchFallback:
         assert len(music) == 1
         key, request = music[0]
         assert request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+        assert request.music_search is True
         assert key.endswith("|music")
         candidate = [r for _k, r in requests if "kSAEcjWWuew" in r.url]
         assert len(candidate) == 1
@@ -1701,63 +1707,68 @@ class TestMusicSearchFallback:
             assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
 
     @pytest.mark.parametrize(
-        ("query", "title", "wanted"),
+        ("query", "title", "artists", "wanted"),
         [
-            ("xvi akiaura", "XVI", True),
-            ("xvi drake", "Reflections - Drake's Head", True),
-            ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", True),
+            # The artist is in the artist column, the song in the title.
+            ("xvi akiaura", "XVI", "akiaura, LONOWN & DJ Pointless", True),
+            ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", "ARCADIA", True),
             # Live, 2026-10-06: the original is titled without its artist.
-            ("just your doll snow strippers", "Just Your Doll", True),
+            ("just your doll snow strippers", "Just Your Doll", "Snow Strippers", True),
             # Every title below is one music search really answered these with.
-            # The old one-shared-word gate took the first three: "song", "favorite"
+            # The one-shared-word gate took the first three: "song", "favorite"
             # adjacent, and "999".
             (
                 "zzzzqqqq no such song anywhere 98765",
                 "Listen from https://audiomack.com/ugobueze/song/ijere-mmanwu",
+                "",
                 False,
             ),
             (
                 "my favourite song that does not exist",
                 "This Is Not The Song I Wrote (feat. Joey Dosik & Jacob Jeffries)",
+                "",
                 False,
             ),
-            ("the zzzqqq nonexistent track 999", "999 (feat. K9rdz21)", False),
+            ("the zzzqqq nonexistent track 999", "999 (feat. K9rdz21)", "", False),
             # Three of four words shared, and every one of them a stopword: counted,
-            # they would carry the half on their own.
-            ("you and the night", "You And The Song", False),
-            ("zzzzqqqq no such song anywhere 98765", "Nursery Songs ", False),
-            ("u2", "Beautiful Day", False),  # no word long enough to carry a match
+            # they would carry the ask on their own.
+            ("you and the night", "You And The Song", "", False),
+            ("zzzzqqqq no such song anywhere 98765", "Nursery Songs ", "", False),
+            ("u2", "Beautiful Day", "U2", False),  # no word long enough to match
             # What the floor is FOR: a two-letter word is shared by too much to
             # mean anything, and matching on it plays the wrong artist entirely.
-            ("u2 akiaura", "U2 - With Or Without You", False),
-            ("xvi akiaura", None, False),  # an album page, were one to get this far
+            ("u2 akiaura", "U2 - With Or Without You", "", False),
+            ("xvi akiaura", None, "akiaura", False),  # an album page
             # Renditions the ask did not name: music search ranked these first.
             (
                 "just your doll snow strippers",
                 "Snow Strippers  - Just Your Doll (karaoke)",
+                "Lemmy Caution Karaoke",
                 False,
             ),
             (
                 "just your doll snow strippers",
                 "NIGHTCORE - Snow Strippers - Just Your Doll",
+                "NinjaspeedPD",
                 False,
             ),
             (
                 "just your doll snow strippers",
                 "Snow Strippers - Live at Washington D.C [FULL SET | 1/8/26]",
+                "gloss",
                 False,
             ),
             # ...and one the ask did name.
             (
                 "just your doll karaoke",
                 "Snow Strippers - Just Your Doll (karaoke)",
+                "Lemmy Caution Karaoke",
                 True,
             ),
         ],
         ids=[
-            "short-word",
-            "across-punctuation",
-            "prefixed",
+            "artist-in-its-column",
+            "artist-in-the-title",
             "title-without-artist",
             "stopword-in-a-url",
             "stopwords-only",
@@ -1774,9 +1785,15 @@ class TestMusicSearchFallback:
         ],
     )
     def test_a_candidate_has_to_share_a_word_with_the_ask(
-        self, query: str, title: Any, wanted: bool
+        self, query: str, title: Any, artists: str, wanted: bool
     ) -> None:
-        assert _music_candidate_matches(query, title) is wanted
+        named = youtube._match_tokens(query) & youtube._match_tokens(artists)
+        assert (
+            _music_candidate_matches(
+                query, title, artists, ask_artists=frozenset(named)
+            )
+            is wanted
+        )
 
     async def test_an_unrelated_candidate_is_declined(
         self, mock_ctx: MagicMock
@@ -2074,7 +2091,12 @@ class TestMusicSearchFallback:
         result = {
             "entries": [
                 None,
-                {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+                {
+                    "ie_key": "Youtube",
+                    "id": "kSAEcjWWuew",
+                    "title": "XVI",
+                    "artists": "akiaura",
+                },
             ]
         }
         with patch(
@@ -2174,6 +2196,402 @@ class TestMusicSearchFallback:
             self._MUSIC_URL,
             "https://www.youtube.com/watch?v=kSAEcjWWuew",
         ]
+
+
+# Music search responses recorded live (InnerTube WEB_REMIX, hl=en, signed out),
+# trimmed to the keys _music_search_entries reads. Keyed by ask, then "all" (no
+# filter) or "songs" (the songs section).
+_YTMUSIC: dict[str, dict[str, Any]] = orjson.loads(
+    (pathlib.Path(__file__).parent / "data" / "ytmusic_search.json").read_bytes()
+)["responses"]
+
+
+def _music_entries(query: str, section: str = "all") -> list[Any]:
+    return list(youtube._music_search_entries(_YTMUSIC[query][section]))
+
+
+class TestMusicSearchParse:
+    """yt-dlp's music-search parser keeps a row's first column and skips the
+    top-result card; _music_search_entries reads InnerTube's response itself.
+    See docs/ARCHITECTURE.md#reading-music-search."""
+
+    def test_the_top_card_leads_with_its_artist_and_length(self) -> None:
+        """For this ask the card held the C418 track, and the rows below it a fan
+        edit that the title-only gate settled on."""
+        first = _music_entries("minecraft sweden c418")[0]
+        assert first == {
+            "_type": "url",
+            "ie_key": "Youtube",
+            "id": "5w3rRFWzjcM",
+            "url": "https://www.youtube.com/watch?v=5w3rRFWzjcM",
+            "title": "Sweden",
+            "artists": "C418",
+            "music_kind": "song",
+            "music_video_type": "ATV",
+            "music_top": True,
+            "duration": 216,
+            "thumbnail": first["thumbnail"],
+        }
+        assert first["thumbnail"].startswith("https://")
+
+    def test_yt_dlps_own_parse_of_the_same_response_drops_the_card(self) -> None:
+        """What the reader is for, on the yt-dlp this build pins (upstream #15389).
+        The day this fails, yt-dlp reads the card itself."""
+        from yt_dlp.extractor.youtube import YoutubeMusicSearchURLIE
+
+        sections = _YTMUSIC["minecraft sweden c418"]["all"]["contents"][
+            "tabbedSearchResultsRenderer"
+        ]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]
+        ie = YoutubeMusicSearchURLIE(MagicMock())
+        theirs = [e["id"] for e in ie._extract_entries({"contents": sections}, [None])]
+        assert "5w3rRFWzjcM" not in theirs
+        assert "5w3rRFWzjcM" in [
+            e["id"] for e in _music_entries("minecraft sweden c418")
+        ]
+
+    def test_a_songs_row_carries_its_artist_and_length(self) -> None:
+        """A songs-section row has no kind label: its first segment is the artist."""
+        first = _music_entries("Kendrick Lamar - Not Like Us", "songs")[0]
+        assert (first["title"], first["artists"], first["duration"]) == (
+            "Not Like Us",
+            "Kendrick Lamar",
+            275,
+        )
+        assert first["music_kind"] == "song"
+        assert first["music_top"] is False
+
+    def test_an_unfiltered_row_is_labelled_and_carries_no_length(self) -> None:
+        kinds = {
+            (e["id"], e["music_kind"], e.get("duration"))
+            for e in _music_entries("Kendrick Lamar - Not Like Us")
+        }
+        assert ("phLb_SoPBlA", "song", None) in kinds
+        assert ("nwKyt-3WbT0", "episode", None) in kinds
+        # The card is the one row that carries its length.
+        assert ("H58vbez_m4E", "video", 355) in kinds
+
+    @pytest.mark.parametrize("query", sorted(_YTMUSIC))
+    def test_only_videos_come_back_and_each_once(self, query: str) -> None:
+        """Album, artist and playlist rows carry no playlistItemData; queued, one
+        plays nothing."""
+        for section in _YTMUSIC[query]:
+            ids = [e["id"] for e in _music_entries(query, section)]
+            assert ids
+            assert all(len(video_id) == 11 for video_id in ids)
+            assert len(ids) == len(set(ids))
+
+    def test_a_card_repeated_as_a_row_is_kept_once_as_the_card(self) -> None:
+        def row(video_id: str, title: str) -> dict[str, Any]:
+            return {
+                "musicResponsiveListItemRenderer": {
+                    "playlistItemData": {"videoId": video_id},
+                    "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}, {"text": " • "}, {"text": "Band"}]}}},
+                    ],
+                }
+            }  # fmt: skip
+
+        response = {
+            "contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+                {"musicCardShelfRenderer": {
+                    "title": {"runs": [{"text": "Tune", "navigationEndpoint": {"watchEndpoint": {"videoId": "aaaaaaaaaaa"}}}]},
+                    "subtitle": {"runs": [{"text": "Song"}, {"text": " • "}, {"text": "Band"}, {"text": " • "}, {"text": "1:02:05"}]},
+                }},
+                {"itemSectionRenderer": {"contents": [row("aaaaaaaaaaa", "Tune"), row("bbbbbbbbbbb", "Other")]}},
+            ]}}}}]}}
+        }  # fmt: skip
+        entries: list[Any] = list(youtube._music_search_entries(response))
+        assert [(e["id"], e["music_top"]) for e in entries] == [
+            ("aaaaaaaaaaa", True),
+            ("bbbbbbbbbbb", False),
+        ]
+        assert entries[0]["duration"] == 3725
+        assert entries[1]["artists"] == "Band"
+        assert "duration" not in entries[1]
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            None,
+            {},
+            {"contents": []},
+            {"contents": {"tabbedSearchResultsRenderer": {"tabs": "not a list"}}},
+            {"contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [{"itemSectionRenderer": {"contents": [{"musicResponsiveListItemRenderer": {"playlistItemData": {"videoId": "short"}}}, "junk"]}}]}}}}]}}},
+        ],
+        ids=["none", "empty", "wrong-type", "tabs-not-a-list", "bad-rows"],
+    )  # fmt: skip
+    def test_a_response_of_another_shape_yields_nothing(self, response: Any) -> None:
+        assert list(youtube._music_search_entries(response)) == []
+
+    @pytest.mark.parametrize(
+        ("segment", "secs"),
+        [
+            ("3:36", 216),
+            ("1:02:05", 3725),
+            ("0:07", 7),
+            ("1.3B plays", None),
+            ("61", None),
+        ],
+    )
+    def test_a_length_is_read_from_its_clock_segment(
+        self, segment: str, secs: Optional[int]
+    ) -> None:
+        assert youtube._music_clock_secs(segment) == secs
+
+    @pytest.mark.parametrize(
+        ("url", "data"),
+        [
+            (
+                "https://music.youtube.com/search?q=not+like+us",
+                {"query": "not like us"},
+            ),
+            (
+                "https://music.youtube.com/search?q=not+like+us&sp=EgWKAQIIAWoKEAoQAxAEEAkQBQ%3D%3D",
+                {"query": "not like us", "params": youtube._MUSIC_SONGS_PARAMS},
+            ),
+        ],
+        ids=["all", "songs"],
+    )
+    def test_the_request_is_yt_dlps_own_search_call(
+        self, url: str, data: dict[str, str]
+    ) -> None:
+        ie = MagicMock()
+        ie._extract_response.return_value = _YTMUSIC["Kendrick Lamar - Not Like Us"][
+            "all"
+        ]
+        ydl = MagicMock()
+        ydl.get_info_extractor.return_value = ie
+
+        result = youtube._music_search(ydl, url)
+
+        ydl.get_info_extractor.assert_called_once_with("YoutubeMusicSearchURL")
+        ie.generate_api_headers.assert_called_once_with(
+            ytcfg={}, default_client="web_music"
+        )
+        kwargs = ie._extract_response.call_args.kwargs
+        assert kwargs["ep"] == "search"
+        assert kwargs["default_client"] == "web_music"
+        assert kwargs["query"] == data
+        assert kwargs["headers"] is ie.generate_api_headers.return_value
+        assert result.get("entries") == _music_entries("Kendrick Lamar - Not Like Us")
+
+    def test_the_worker_runs_a_music_search_instead_of_extract_info(self) -> None:
+        ydl = MagicMock()
+        with (
+            patch("src.youtube.youtube_dl.YoutubeDL", return_value=ydl),
+            patch("src.youtube._music_search", return_value={"entries": []}) as search,
+        ):
+            got = _ytdlp_extract(
+                ExtractRequest(
+                    url="https://music.youtube.com/search?q=x",
+                    opts=_YTDL_FLAT_SEARCH_OPTS,
+                    music_search=True,
+                )
+            )
+        assert got == {"entries": []}
+        search.assert_called_once_with(ydl, "https://music.youtube.com/search?q=x")
+        ydl.extract_info.assert_not_called()
+
+    def test_a_music_search_failure_crosses_as_an_extraction_error(self) -> None:
+        from yt_dlp.utils import ExtractorError
+
+        ie = MagicMock()
+        ie._extract_response.side_effect = ExtractorError(
+            "Sign in to confirm you're not a bot", expected=True
+        )
+        ydl = MagicMock()
+        ydl.get_info_extractor.return_value = ie
+        with (
+            patch("src.youtube.youtube_dl.YoutubeDL", return_value=ydl),
+            pytest.raises(ExtractionError) as raised,
+        ):
+            _ytdlp_extract(
+                ExtractRequest(
+                    url="https://music.youtube.com/search?q=x",
+                    opts=_YTDL_FLAT_SEARCH_OPTS,
+                    music_search=True,
+                )
+            )
+        assert raised.value.expected is True
+        assert pickle.loads(pickle.dumps(raised.value)).expected is True
+
+    def test_a_music_request_survives_the_trip_to_a_worker(self) -> None:
+        request = ExtractRequest(
+            url="https://music.youtube.com/search?q=x",
+            opts=_YTDL_FLAT_SEARCH_OPTS,
+            music_search=True,
+        )
+        assert pickle.loads(pickle.dumps(request)).music_search is True
+
+
+class TestRelevanceGate:
+    """Music search never answers with nothing, so its answer has to earn its
+    place. See docs/ARCHITECTURE.md#the-relevance-gate."""
+
+    @pytest.mark.parametrize(
+        ("text", "tokens"),
+        [
+            ("Kendrick Lamar - Not Like Us", {"kendrick", "lamar", "like"}),
+            # Scripts without spaces become character pairs.
+            ("夜に駆ける", {"夜に", "に駆", "駆け", "ける"}),
+            ("YOASOBI「夜に駆ける」", {"yoasobi", "夜に", "に駆", "駆け", "ける"}),
+            ("愛", {"愛"}),
+            # Half-width katakana and full-width Latin fold to one spelling.
+            ("ﾖﾙ Ｆｕｌｌ ｗｉｄｔｈ", {"ヨル", "width"}),
+            ("STRASSE straße", {"strasse"}),
+            ("кино группа крови", {"кино", "группа", "крови"}),
+            # The regex word class would end these at their vowel signs.
+            ("कसरिया हिंदी", {"कसरिया", "हिंदी"}),
+            # Two letters carry a match outside Latin; "날" alone does not.
+            ("아이유 좋은 날", {"아이유", "좋은"}),
+            ("u2 xvi", {"xvi"}),
+            ("Drake's Head", {"drake", "head"}),
+        ],
+        ids=[
+            "latin", "cjk-pairs", "mixed", "one-ideograph", "nfkc", "casefold",
+            "cyrillic", "devanagari", "hangul", "latin-floor", "apostrophe",
+        ],
+    )  # fmt: skip
+    def test_tokens(self, text: str, tokens: set[str]) -> None:
+        assert youtube._match_tokens(text) == tokens
+
+    @pytest.mark.parametrize(
+        ("query", "title", "artists", "named", "corroborated", "wanted"),
+        [
+            # The research's misses: a title carries no artist, so the artist half
+            # of the ask has to be read off the artist column.
+            ("Kendrick Lamar - Not Like Us", "Not Like Us", "Kendrick Lamar",
+             {"kendrick", "lamar"}, False, True),
+            ("kesariya arijit singh", 'Kesariya (From "Brahmastra")', "Arijit Singh",
+             {"arijit", "singh"}, False, True),
+            ("Radiohead - Weird Fishes/Arpeggi", "Weird Fishes / Arpeggi", "Radiohead",
+             {"radiohead"}, False, True),
+            # The UGC clip that won instead names the artist, not the song.
+            ("Kendrick Lamar - Not Like Us", "Steezy Kane raps Kendrick Lamar",
+             "Steezy Kane", {"kendrick", "lamar"}, False, False),
+            # The artist alone is not the song.
+            ("kendrick lamar humble", "Not Like Us", "Kendrick Lamar",
+             {"kendrick", "lamar"}, True, False),
+            ("kendrick lamar", "Not Like Us", "Kendrick Lamar",
+             {"kendrick", "lamar"}, True, False),
+            # Another act's rendition carries none of the ask's artist.
+            ("yoru ni kakeru yoasobi", "Yoru ni Kakeru 「夜に駆ける」", "MyReminiscence",
+             {"yoasobi"}, False, False),
+            # Script: the ask's own script matches; a romanised ask can only take
+            # the corroborated pick by its artist.
+            ("夜に駆ける", "夜に駆ける", "YOASOBI", set(), False, True),
+            ("夜に駆ける", "Yoru ni Kakeru VOSTFR", "fansub", set(), False, False),
+            ("yoru ni kakeru yoasobi", "夜に駆ける", "YOASOBI", {"yoasobi"}, True, True),
+            ("yoru ni kakeru yoasobi", "夜に駆ける", "YOASOBI", {"yoasobi"}, False, False),
+            ("yoru ni kakeru yoasobi", "夜に駆ける", "Ayase", {"yoasobi"}, True, False),
+            ("кино группа крови", "Группа крови", "Кино", {"кино"}, True, True),
+            ("земфира искала", "ИСКАЛА", "Zemfira", {"земфира"}, True, False),
+            # Words shared, but not enough of them for no artist named.
+            ("kurzgesagt black holes", "Black Holes", "Aviators", set(), False, False),
+            ("hbomberguy plagiarism and you", "Goodbye Horses - a song by Hbomberguy",
+             "Samhainian", set(), True, False),
+            ("joe rogan experience 2000", "Joe Rogan Experience #1493 - Steve Schirripa",
+             "Jun 17, 2020", {"joe", "rogan"}, False, False),
+            # Corroborated (the top card, or a matching length): half will do.
+            ("minecraft sweden c418", "Sweden", "C418", {"c418"}, True, True),
+            ("minecraft sweden c418", "Sweden", "C418", {"c418"}, False, False),
+            # A rendition has to be named by both. Two of three song words would
+            # carry a corroborated card; the missing one is the rendition asked for.
+            ("the weeknd blinding lights remix", "Blinding Lights", "The Weeknd",
+             {"weeknd"}, True, False),
+            ("blinding lights remix", "Blinding Lights (Remix)", "The Weeknd & ROSALÍA",
+             set(), False, True),
+            ("tame impala let it happen", "Let It Happen (Live)", "Tame Impala",
+             {"tame", "impala"}, True, False),
+            ("zzzzqqqq no such song anywhere 98765", "ispiunauhezkipqq", "qqqq",
+             set(), True, False),
+        ],
+        ids=[
+            "artist-column", "artist-column-many", "slash-title", "ugc-names-artist",
+            "artist-not-song", "only-artist", "other-act", "same-script",
+            "other-script-ugc", "romanised-card", "romanised-row", "romanised-other-act",
+            "cyrillic", "artist-other-script", "two-of-three-no-artist",
+            "one-of-two-no-artist", "episode-of-the-wrong-show", "card-half",
+            "row-needs-more", "remix-asked-not-given", "remix-both", "live-not-asked",
+            "nonsense",
+        ],
+    )  # fmt: skip
+    def test_the_gate(
+        self,
+        query: str,
+        title: str,
+        artists: str,
+        named: set[str],
+        corroborated: bool,
+        wanted: bool,
+    ) -> None:
+        assert (
+            _music_candidate_matches(
+                query,
+                title,
+                artists,
+                ask_artists=frozenset(named),
+                corroborated=corroborated,
+            )
+            is wanted
+        )
+
+    @pytest.mark.parametrize(
+        ("query", "section", "exclude", "expected_duration", "picked"),
+        [
+            ("minecraft sweden c418", "all", (), None, "5w3rRFWzjcM"),
+            ("Kendrick Lamar - Not Like Us", "all", (), None, "H58vbez_m4E"),
+            # The card runs 355 s: a Spotify ask of 275 s takes the art track.
+            ("Kendrick Lamar - Not Like Us", "all", (), 275, "phLb_SoPBlA"),
+            ("Kendrick Lamar - Not Like Us", "songs", (), 275, "phLb_SoPBlA"),
+            ("yoru ni kakeru yoasobi", "all", (), None, "by4SYYWlhEs"),
+            ("夜に駆ける", "all", (), None, "x8VYWazR5mE"),
+            # The card is the age-restricted video that sent the ask here.
+            ("夜に駆ける", "all", ("x8VYWazR5mE",), None, "by4SYYWlhEs"),
+            ("kesariya arijit singh", "all", (), None, "NJAv_7lHUIU"),
+            ("just your doll snow strippers", "all", (), None, "qduZx7rhYlI"),
+            ("Radiohead - Weird Fishes/Arpeggi", "all", (), None, "LUjGtyYEi90"),
+            ("xvi akiaura", "all", (), None, "vBdcvv4ecbU"),
+            ("кино группа крови", "all", (), None, "xtxjm7ciwmc"),
+            ("zzzzqqqq no such song anywhere 98765", "all", (), None, None),
+            ("the zzzqqq nonexistent track 999", "all", (), None, None),
+            ("kendrick lamar some song that does not exist", "all", (), None, None),
+            ("joe rogan experience 2000", "all", (), None, None),
+            ("hbomberguy plagiarism and you", "all", (), None, None),
+            ("kurzgesagt black holes", "all", (), None, None),
+        ],
+    )
+    def test_the_pick_over_a_recorded_answer(
+        self,
+        query: str,
+        section: str,
+        exclude: tuple[str, ...],
+        expected_duration: Optional[int],
+        picked: Optional[str],
+    ) -> None:
+        got = youtube._music_pick(
+            query,
+            _music_entries(query, section),
+            exclude=frozenset(exclude),
+            expected_duration=expected_duration,
+        )
+        assert (got.get("id") if got is not None else None) == picked
+
+    def test_an_artist_word_is_one_the_answer_names_as_an_artist(self) -> None:
+        """ "yoasobi" names an artist in the result set, so a cover by someone else
+        is a rendition even though it shares the song's words."""
+        entries: list[Any] = [
+            {"ie_key": "Youtube", "id": "cover123456", "title": "Yoru ni Kakeru",
+             "artists": "MyReminiscence"},
+            {"ie_key": "Youtube", "id": "orig1234567", "title": "Racing Into The Night",
+             "artists": "YOASOBI"},
+        ]  # fmt: skip
+        assert youtube._music_pick("yoru ni kakeru yoasobi", entries) is None
+        # Without the second entry nothing names YOASOBI an artist: the cover's
+        # title carries every word but the artist's, which is not all of them.
+        assert youtube._music_pick("yoru ni kakeru yoasobi", entries[:1]) is None
+        assert youtube._music_pick("yoru ni kakeru", entries[:1]) is not None
 
 
 class TestYTSourceUnifiedExtraction:

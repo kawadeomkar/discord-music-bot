@@ -163,10 +163,17 @@ with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 `_search_terms`: once the ladder is exhausted, `yt_source` asks it once, for a search
 only, because a signed-out `ytsearch` whose top results hold age-restricted content
 comes back EMPTY with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url`
-asks music.youtube.com flat, filters to `ie_key` `Youtube` with an 11-character id,
-gates on relevance (and on length for a Spotify ask), and hands back a watch URL that
-resolves processed. Why each of those, and what it costs:
-ARCHITECTURE.md#the-music-search-fallback.
+sends one music search POST through `ExtractRequest(music_search=True)`: the worker issues
+yt-dlp's own request (`_music_search`, two private yt-dlp methods) and parses the answer
+itself (`_music_search_entries`), because yt-dlp's parser keeps only a row's title and
+drops the top-result card. `_music_pick` takes the card first, then the rows, and
+`_music_candidate_matches` gates each on the ask's artist words (read off the answer's
+artist column), its song words (tokenized script-aware: NFKC, case-folded, CJK/Thai as
+character pairs) and, for a Spotify ask, its length. The winner's watch URL resolves
+processed. The parser is pinned by recorded responses in `tests/data/ytmusic_search.json`
+— re-record them (and re-read `_music_search_entries`) when a yt-dlp bump or a YouTube
+change moves the renderer shapes. Why each of those, and what it costs:
+ARCHITECTURE.md#the-music-search-fallback, #reading-music-search, #the-relevance-gate.
 
 ## Concurrency primitives
 

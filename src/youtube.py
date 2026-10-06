@@ -4,6 +4,7 @@ import copy
 import os
 import re
 import time
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from functools import partial
@@ -188,10 +189,13 @@ class ExtractionError(Exception):
 
 def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     """Mine the classification that exists only here, inside the worker."""
-    inner = None
+    # extract_info wraps the extractor's error in a DownloadError; a direct call
+    # into an extractor (_music_search) raises it bare.
+    inner: Optional[BaseException] = e
     exc_info = getattr(e, "exc_info", None)
-    if isinstance(exc_info, tuple) and len(exc_info) == 3:
+    if isinstance(exc_info, tuple) and len(exc_info) == 3 and exc_info[1] is not None:
         inner = exc_info[1]
+
     cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
     # extract_info wraps an UnsupportedError in a DownloadError carrying the
     # original in exc_info, so check both.
@@ -288,10 +292,19 @@ class YTDLEntry(YTDLVideoMetadata, total=False):
     webpage_url: str
     id: str
     _type: str
+    ie_key: str
     # Flat-entry fields: `channel` is a lockupViewModel result's `uploader`, and
     # `live_status` is the only warning that a live entry's `duration` is None.
     channel: str
     live_status: str
+    # Music-search fields, read from InnerTube by _music_search_entries: the
+    # artist segment as shown, the row's kind ("song", "video", "episode"), its
+    # musicVideoType minus the prefix ("ATV", "OMV", "UGC"), and whether it is the
+    # top-result card.
+    artists: str
+    music_kind: str
+    music_video_type: str
+    music_top: bool
 
 
 class YTDLExtractResult(YTDLEntry, total=False):
@@ -506,6 +519,9 @@ class ExtractRequest:
     download: bool = False
     # True at every call site: process=False does no format selection.
     process: bool = True
+    # `url` is a music.youtube.com search page, read through _music_search
+    # rather than extract_info.
+    music_search: bool = False
 
 
 def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
@@ -515,14 +531,187 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it;
     # the copy keeps the opts profile immutable across a worker's extractions.
     try:
-        result = youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
-            url, download=download, process=process
-        )
+        ydl = youtube_dl.YoutubeDL(copy.copy(opts))
+        if req.music_search:
+            return _music_search(ydl, url)
+        result = ydl.extract_info(url, download=download, process=process)
     except YoutubeDLError as e:
         # `from e`: the stdlib stringifies the chain into the parent's __cause__.
         raise _classify_ytdlp_error(e) from e
     # Slimmed here so the unpicklable payload never enters the result queue.
     return _slim_info(result)
+
+
+# The section `sp=` names on a music search URL, as yt-dlp's own
+# YoutubeMusicSearchURLIE._SECTIONS spells it: tracks only, each row carrying its
+# artist and length.
+_MUSIC_SONGS_PARAMS: Final[str] = "EgWKAQIIAWoKEAoQAxAEEAkQBQ=="
+_MUSIC_SECTIONS_PATH: Final[tuple[Any, ...]] = (
+    "contents", "tabbedSearchResultsRenderer", "tabs", 0, "tabRenderer", "content",
+    "sectionListRenderer", "contents",
+)  # fmt: skip
+# Row kinds an unfiltered search labels a playable row with (hl=en). A songs-filtered
+# row carries no label: its first segment is already the artist.
+_MUSIC_ROW_KINDS: Final[frozenset[str]] = frozenset({"song", "video", "episode"})
+_MUSIC_CLOCK_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
+
+
+def _music_search(ydl: Any, url: str) -> YTDLExtractResult:
+    """One music search POST, parsed by _music_search_entries. The request is the
+    first page of yt-dlp's own `_search_results` (its client version, headers and
+    retries); only the parse is ours, because yt-dlp's keeps a row's title alone and
+    skips the top-result card. See docs/ARCHITECTURE.md#reading-music-search."""
+    query_string = parse_qs(urlparse(url).query)
+    query = (query_string.get("q") or [""])[0]
+    data: dict[str, str] = {"query": query}
+    params = (query_string.get("sp") or [""])[0]
+    if params:
+        data["params"] = params
+    ie = ydl.get_info_extractor("YoutubeMusicSearchURL")
+    response = ie._extract_response(
+        item_id=f'query "{query}"',
+        ep="search",
+        query=data,
+        default_client="web_music",
+        check_get_keys=("contents",),
+        ytcfg={},
+        headers=ie.generate_api_headers(ytcfg={}, default_client="web_music"),
+    )
+    return {
+        "_type": "playlist",
+        "id": query,
+        "title": query,
+        "entries": list(_music_search_entries(response)),
+    }
+
+
+def _dig(node: Any, *path: Any) -> Any:
+    """`node[path[0]][path[1]]…`, or None where the shape stops matching."""
+    for step in path:
+        if isinstance(node, list) and isinstance(step, int):
+            node = node[step] if -len(node) <= step < len(node) else None
+        elif isinstance(node, dict) and not isinstance(step, int):
+            node = node.get(step)
+        else:
+            return None
+    return node
+
+
+def _music_segments(text: Any) -> list[str]:
+    """A music subtitle's ` • `-separated segments, each joined from its runs."""
+    segments: list[str] = [""]
+    for run in _dig(text, "runs") or []:
+        piece = run.get("text", "") if isinstance(run, dict) else ""
+        if piece.strip() == "•":
+            segments.append("")
+        else:
+            segments[-1] += piece
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def _music_clock_secs(segment: str) -> Optional[int]:
+    match = _MUSIC_CLOCK_RE.match(segment)
+    if match is None:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def _music_entry(
+    video_id: Any,
+    title: Any,
+    subtitle: Any,
+    endpoint: Any,
+    thumbnail: Any,
+    *,
+    top: bool,
+) -> Optional[YTDLEntry]:
+    """One playable result as a flat entry plus the music fields, or None for a row
+    that is not a video (an album, an artist, a playlist)."""
+    if not isinstance(video_id, str) or len(video_id) != _VIDEO_ID_LEN:
+        return None
+    segments = _music_segments(subtitle)
+    kind = "song"
+    if segments and segments[0].casefold() in _MUSIC_ROW_KINDS:
+        kind = segments.pop(0).casefold()
+    durations = [secs for s in segments if (secs := _music_clock_secs(s)) is not None]
+    video_type = str(
+        _dig(
+            endpoint,
+            "watchEndpointMusicSupportedConfigs",
+            "watchEndpointMusicConfig",
+            "musicVideoType",
+        )
+        or ""
+    ).removeprefix("MUSIC_VIDEO_TYPE_")
+    thumbs = _dig(thumbnail, "musicThumbnailRenderer", "thumbnail", "thumbnails")
+    entry: YTDLEntry = {
+        "_type": "url",
+        "ie_key": "Youtube",
+        "id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": "".join(
+            run.get("text", "")
+            for run in _dig(title, "runs") or []
+            if isinstance(run, dict)
+        ),
+        "artists": segments[0] if segments else "",
+        "music_kind": kind,
+        "music_video_type": video_type,
+        "music_top": top,
+    }
+    if durations:
+        entry["duration"] = durations[-1]
+    thumb = _dig(thumbs, -1, "url") if isinstance(thumbs, list) else None
+    if isinstance(thumb, str) and thumb:
+        entry["thumbnail"] = thumb
+    return entry
+
+
+def _music_search_entries(response: Any) -> Iterator[YTDLEntry]:
+    """The playable results of a music search response, top-result card first,
+    each id once. Pure, so the parse is tested on recorded responses."""
+    seen: set[str] = set()
+    for section in _dig(response, *_MUSIC_SECTIONS_PATH) or []:
+        card = _dig(section, "musicCardShelfRenderer")
+        rows: list[Optional[YTDLEntry]] = []
+        if isinstance(card, dict):
+            endpoint = _dig(card, "title", "runs", 0, "navigationEndpoint")
+            rows.append(
+                _music_entry(
+                    _dig(endpoint, "watchEndpoint", "videoId"),
+                    card.get("title"),
+                    card.get("subtitle"),
+                    _dig(endpoint, "watchEndpoint"),
+                    card.get("thumbnail"),
+                    top=True,
+                )
+            )
+        for shelf in ("itemSectionRenderer", "musicShelfRenderer"):
+            for item in _dig(section, shelf, "contents") or []:
+                row = _dig(item, "musicResponsiveListItemRenderer")
+                if not isinstance(row, dict):
+                    continue
+                columns = [
+                    _dig(column, "musicResponsiveListItemFlexColumnRenderer", "text")
+                    for column in row.get("flexColumns") or []
+                ]
+                title = columns[0] if columns else None
+                rows.append(
+                    _music_entry(
+                        _dig(row, "playlistItemData", "videoId"),
+                        title,
+                        columns[1] if len(columns) > 1 else None,
+                        _dig(title, "runs", 0, "navigationEndpoint", "watchEndpoint"),
+                        row.get("thumbnail"),
+                        top=False,
+                    )
+                )
+        for entry in rows:
+            video_id = entry.get("id", "") if entry is not None else ""
+            if entry is not None and video_id not in seen:
+                seen.add(video_id)
+                yield entry
 
 
 async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
@@ -1485,10 +1674,12 @@ _SEARCH_KIND_MUSIC: Final[str] = "music"
 # (`UC…`) ids beside the tracks, and length is what separates them.
 _VIDEO_ID_LEN: Final[int] = 11
 
-# Shortest query word that can carry a match. Three, because "xvi" is a real ask
-# and a two-letter word ("u2") is shared by too much to mean anything.
+# Shortest word that can carry a match. Three for Latin letters and digits,
+# because "xvi" is a real ask and a two-letter word ("u2") is shared by too much
+# to mean anything; two in any other script, where a syllable or a letter carries
+# more ("좋은", "до").
 _MIN_MATCH_WORD: Final[int] = 3
-_WORD_RE = re.compile(r"[a-z0-9]+")
+_MIN_MATCH_WORD_OTHER: Final[int] = 2
 # Words that carry no identity, so sharing one is no evidence: a stranger's title
 # matched "song", "the" or "you" in a nonsense query. Kept out of both sides.
 _MATCH_STOPWORDS: Final[frozenset[str]] = frozenset(
@@ -1506,6 +1697,7 @@ _MATCH_VARIANT_WORDS: Final[frozenset[str]] = frozenset(
     {
         "karaoke", "nightcore", "instrumental", "cover", "remix", "slowed", "sped",
         "reverb", "8d", "live", "acapella", "acoustic", "piano", "tutorial", "reaction",
+        "reacts",
     }
 )  # fmt: skip
 # How far a candidate may run from the length the ask already knows (Spotify's)
@@ -1557,27 +1749,127 @@ def _search_terms(
     return terms
 
 
-def _match_words(text: str) -> set[str]:
-    """The words of `text` that can carry a match: long enough, and not stopwords."""
-    return {
-        word
-        for word in _WORD_RE.findall(text.lower())
-        if len(word) >= _MIN_MATCH_WORD and word not in _MATCH_STOPWORDS
-    }
+def _dense_script(char: str) -> bool:
+    """Whether `char` belongs to a script written without spaces between words
+    (Han, kana, Thai, Lao, Khmer, Myanmar), where a run of it is a phrase."""
+    point = ord(char)
+    return (
+        0x3040 <= point <= 0x30FF  # hiragana, katakana
+        or 0x31F0 <= point <= 0x31FF  # katakana phonetic extensions
+        or 0x3400 <= point <= 0x4DBF  # CJK extension A
+        or 0x4E00 <= point <= 0x9FFF  # CJK unified ideographs
+        or 0xF900 <= point <= 0xFAFF  # CJK compatibility ideographs
+        or 0x20000 <= point <= 0x3FFFF  # CJK extensions B onward
+        or 0x0E00 <= point <= 0x0EFF  # Thai, Lao
+        or 0x1000 <= point <= 0x109F  # Myanmar
+        or 0x1780 <= point <= 0x17FF  # Khmer
+    )
 
 
-def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
-    """Whether a music-search title is plausibly an answer to `query`: it shares at
-    least half the ask's identifying words and is no rendition (karaoke, a live set)
-    the ask did not name. See docs/ARCHITECTURE.md#the-music-search-fallback."""
-    wanted = _match_words(query)
-    if not wanted:
+def _match_tokens(text: str) -> set[str]:
+    """`text` as the tokens a match is counted in: NFKC-normalised and case-folded,
+    split at anything that is not a letter, mark or digit. A run of a dense script
+    becomes its character pairs, so "夜に駆ける" can share "駆け" with a title. Too
+    short or a stopword drops out. See docs/ARCHITECTURE.md#the-relevance-gate."""
+    tokens: set[str] = set()
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    for word in _words(folded):
+        for dense, run in _script_runs(word):
+            if dense:
+                if len(run) == 1:
+                    tokens.add(run)
+                tokens.update(run[i : i + 2] for i in range(len(run) - 1))
+                continue
+            floor = (
+                _MIN_MATCH_WORD
+                if all(ord(char) < 0x250 for char in run)
+                else _MIN_MATCH_WORD_OTHER
+            )
+            if len(run) >= floor and run not in _MATCH_STOPWORDS:
+                tokens.add(run)
+    return tokens
+
+
+def _words(text: str) -> Iterator[str]:
+    """The runs of letters, combining marks and digits in `text`. By Unicode
+    category rather than the regex word class, which ends a Devanagari word at its
+    first combining vowel sign."""
+    word: list[str] = []
+    for char in text:
+        if unicodedata.category(char)[0] in "LMN":
+            word.append(char)
+        elif word:
+            yield "".join(word)
+            word = []
+    if word:
+        yield "".join(word)
+
+
+def _script_runs(word: str) -> Iterator[tuple[bool, str]]:
+    """`word` cut where it moves between a dense script and any other."""
+    start = 0
+    for index in range(1, len(word) + 1):
+        if index == len(word) or _dense_script(word[index]) != _dense_script(
+            word[start]
+        ):
+            yield _dense_script(word[start]), word[start:index]
+            start = index
+
+
+def _token_scripts(tokens: set[str]) -> set[str]:
+    """The scripts `tokens` are written in, by the first word of each letter's
+    Unicode name (LATIN, CYRILLIC, CJK…), kana and Han as one. Digits carry none."""
+    scripts: set[str] = set()
+    for token in tokens:
+        for char in token:
+            if not char.isalpha():
+                continue
+            script = unicodedata.name(char, "").split(" ")[0]
+            scripts.add("CJK" if script in ("HIRAGANA", "KATAKANA") else script)
+    return scripts
+
+
+def _music_candidate_matches(
+    query: str,
+    title: Optional[str],
+    artists: str = "",
+    *,
+    ask_artists: frozenset[str] = frozenset(),
+    corroborated: bool = False,
+) -> bool:
+    """Whether a music-search result is plausibly the answer to `query`.
+
+    `ask_artists` are the ask's words that name an artist somewhere in the result
+    set; the candidate has to carry one of them, so another act's rendition fails.
+    The ask's other words are the song, and the title has to carry all of them when
+    no artist was named, two thirds when one was, half when the candidate is also
+    `corroborated` (music search's top card, or its length is the one the ask
+    knows). A corroborated candidate by the ask's artist whose title is in a script
+    the ask did not type passes on that alone. A rendition (karaoke, live) passes
+    only when the ask names it too. See docs/ARCHITECTURE.md#the-relevance-gate."""
+    wanted = _match_tokens(_SEARCH_PREFIX_RE.sub("", query))
+    if not wanted or not title:
         return False
-    words = set(_WORD_RE.findall((title or "").lower()))
-    if (words & _MATCH_VARIANT_WORDS) - set(_WORD_RE.findall(query.lower())):
+    title_tokens = _match_tokens(title)
+    if (title_tokens & _MATCH_VARIANT_WORDS) != (wanted & _MATCH_VARIANT_WORDS):
         return False
-    shared = wanted & words
-    return bool(shared) and 2 * len(shared) >= len(wanted)
+    artist_tokens = _match_tokens(artists)
+    named = wanted & ask_artists
+    if named and not named & (artist_tokens | title_tokens):
+        return False
+    song_words = wanted - named
+    if not song_words:
+        return False
+    if named and corroborated and named <= artist_tokens:
+        scripts = _token_scripts(title_tokens)
+        if scripts and not scripts & _token_scripts(song_words):
+            return True
+    shared = len(song_words & title_tokens)
+    if not named:
+        return shared == len(song_words)
+    if corroborated:
+        return shared > 0 and 2 * shared >= len(song_words)
+    return shared > 0 and 3 * shared >= 2 * len(song_words)
 
 
 def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bool:
@@ -1588,14 +1880,59 @@ def _music_duration_fits(duration: Optional[int], expected: Optional[int]) -> bo
     return abs(int(duration) - expected) <= _MUSIC_DURATION_TOLERANCE_SECS
 
 
+def _music_pick(
+    query: str,
+    entries: list[Optional[YTDLEntry]],
+    *,
+    exclude: frozenset[str] = frozenset(),
+    expected_duration: Optional[int] = None,
+) -> Optional[YTDLEntry]:
+    """The first result, top-result card first, that passes the relevance gate and
+    whose length (when music search gave one) fits `expected_duration`. `exclude`
+    names videos already known not to play."""
+    tracks = [
+        entry
+        for entry in entries
+        # Album and channel pages arrive as `YoutubeTab` entries with `MPREb_`/`UC`
+        # ids; select_search_entry cannot tell them apart, and queued they play
+        # nothing.
+        if entry
+        and entry.get("ie_key") == "Youtube"
+        and len(str(entry.get("id") or "")) == _VIDEO_ID_LEN
+        and entry.get("id") not in exclude
+    ]
+    # An ask's word that names an artist anywhere in the answer is an artist word,
+    # and a candidate by someone else is a rendition. See the gate's docstring.
+    named = _match_tokens(query) & frozenset().union(
+        *(_match_tokens(entry.get("artists") or "") for entry in tracks)
+    )
+    for entry in tracks:
+        duration = entry.get("duration")
+        if duration is not None and not _music_duration_fits(
+            int(duration), expected_duration
+        ):
+            continue
+        timed = duration is not None and expected_duration is not None
+        if _music_candidate_matches(
+            query,
+            entry.get("title"),
+            entry.get("artists") or "",
+            ask_artists=frozenset(named),
+            corroborated=bool(entry.get("music_top")) or timed,
+        ):
+            return entry
+    return None
+
+
 async def _ytmusic_candidate_url(
     search: str,
     *,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    expected_duration: Optional[int] = None,
 ) -> Optional[str]:
-    """The watch URL of the first track music.youtube.com answers `search` with that
-    passes the relevance gate, or None. FLAT only: processed, one age-restricted
-    track in the result set raises for the whole search.
+    """The watch URL of what music.youtube.com answers `search` with, chosen by
+    _music_pick, or None. One search POST, parsed in the worker: no result is
+    extracted, so an age-restricted track in the set cannot fail the search.
     See docs/ARCHITECTURE.md#the-music-search-fallback."""
     query = _SEARCH_PREFIX_RE.sub("", search).strip()
     if not query:
@@ -1603,25 +1940,22 @@ async def _ytmusic_candidate_url(
     url = "https://music.youtube.com/search?q=" + quote_plus(query)
     data = await _extract_for_source(
         _inflight_key(_source_cache_key(url), "music"),
-        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS),
+        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS, music_search=True),
         url,
         pool_slot=pool_slot,
     )
-    for entry in (data or {}).get("entries") or []:
-        # Music search interleaves album and channel pages with the tracks, as
-        # `YoutubeTab` entries carrying an `MPREb_`/`UC` id and no title.
-        # select_search_entry cannot tell them apart — they are not `_type`
-        # "playlist" — and queueing one plays nothing.
-        if not entry or entry.get("ie_key") != "Youtube":
-            continue
-        video_id = str(entry.get("id") or "")
-        if len(video_id) != _VIDEO_ID_LEN:
-            continue
-        if not _music_candidate_matches(query, entry.get("title")):
-            continue
-        return f"https://www.youtube.com/watch?v={video_id}"
-    trace.get_current_span().set_attribute("ytdl.music_no_match", True)
-    return None
+    picked = _music_pick(
+        query,
+        (data or {}).get("entries") or [],
+        expected_duration=expected_duration,
+    )
+    span = trace.get_current_span()
+    if picked is None:
+        span.set_attribute("ytdl.music_no_match", True)
+        return None
+    span.set_attribute("ytdl.music_pick_top", bool(picked.get("music_top")))
+    span.set_attribute("ytdl.music_pick_type", picked.get("music_video_type") or "")
+    return f"https://www.youtube.com/watch?v={picked.get('id')}"
 
 
 def _first_video_entry(
@@ -2323,7 +2657,11 @@ class YTDL(discord.FFmpegOpusAudio):
         if not is_link(search.strip()):
             trace.get_current_span().set_attribute("ytdl.music_fallback", True)
             try:
-                watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
+                watch_url = await _ytmusic_candidate_url(
+                    search,
+                    pool_slot=pool_slot,
+                    expected_duration=expected_duration,
+                )
                 if watch_url is not None:
                     log.info(
                         f"search {search!r} found nothing; music search found {watch_url}"
