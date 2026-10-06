@@ -7,7 +7,7 @@ from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
 from src.ping import send_latency_line
-from src.recovery import join_succeeded
+from src.recovery import discord_holds_voice_state, join_succeeded
 from src.util import get_logger, notice_embed, spawn_background
 
 log = get_logger(__name__)
@@ -38,16 +38,24 @@ async def run(
     channel = ctx.author.voice.channel
     assert channel is not None
 
+    parked = ctx.voice_client
+    if parked is not None and not join_succeeded(ctx):
+        # Registered, but its handshake never landed: it answers truthy and would
+        # skip the connect below. Unregistered first so this join makes a fresh one.
+        # Forced only while Discord still has the bot in a channel — see
+        # docs/ARCHITECTURE.md#voice-teardown.
+        log.warning(
+            f"join replacing an unconnected voice client in guild {ctx.guild.id}"
+        )
+        await parked.disconnect(force=discord_holds_voice_state(ctx.guild))
     if not ctx.voice_client:
         await channel.connect(timeout=10.0)
     vc = ctx.voice_client
     if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
         await vc.move_to(channel)
-    # A parked client answers `ctx.voice_client` as truthy, so the connect above is
-    # skipped and nothing has raised: this is the only place that notices. Reported
-    # and returned rather than raised, which is the same thing a failed join tells
-    # its creator, and ahead of set_connection so on_ready cannot recover a guild
-    # this never joined.
+    # Reported and returned rather than raised, which is the same thing a failed
+    # join tells its creator, and ahead of set_connection so on_ready cannot recover
+    # a guild this never joined.
     if not join_succeeded(ctx):
         log.warning(f"join found an unconnected voice client in guild {ctx.guild.id}")
         await ctx.send(

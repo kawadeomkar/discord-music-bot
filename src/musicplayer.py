@@ -518,9 +518,12 @@ class MusicPlayer:
 
     def start(self) -> None:
         """Start the playback loop and, with Redis, the state restore task. The gate
-        opens here when the guild already has a voice client (restore_guild connects
-        before calling start()); otherwise -join / -play open it."""
-        if self._guild.voice_client is not None:
+        opens here when the guild already has a CONNECTED voice client
+        (restore_guild connects before calling start()); otherwise -join / -play
+        open it. A registered client whose handshake never landed does not count:
+        the loop's own check is an isinstance, and each song would fail on it."""
+        vc = self._guild.voice_client
+        if isinstance(vc, discord.VoiceClient) and vc.is_connected():
             self.open_playback_gate()
         if self.store is not None:
             self._restore_task = self.bot.loop.create_task(self._restore_state())

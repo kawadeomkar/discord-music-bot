@@ -475,13 +475,17 @@ sequenceDiagram
     Bot->>User: 👋 reaction + ping embed
 ```
 
-`self_deaf=True` is always set — the bot does not listen to voice, only transmit. The
-`join_succeeded(ctx)` step is the one that notices a PARKED client: `ctx.voice_client`
-answers truthy for a registration whose handshake never landed, so the connect above is
-skipped and nothing raises. Everything after it — the deafen, `set_connection`, the
-playback gate — is held behind it, because persisting a channel the bot is not in makes
-`on_ready` recover a guild that never connected, and the loop's own check is only an
-`isinstance`, so an open gate costs a song per iteration. `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
+`self_deaf=True` is always set — the bot does not listen to voice, only transmit. A
+PARKED client — registered, its handshake never landed — answers `ctx.voice_client` as
+truthy, so `-join` unregisters it first (`disconnect`, forced only while Discord still has
+the bot in a channel, see [Voice teardown](#voice-teardown)) and connects a fresh one: one
+`-join` is the remedy for a bot that looks connected and is not. `MusicPlayer.start()`
+runs in `cog_before_invoke`, before the command body, and opens the gate only for a
+CONNECTED client, so the loop cannot consume the queue onto the parked one in between —
+its own check is only an `isinstance`, and an open gate there costs a song per iteration.
+If the fresh handshake still does not land, `join_succeeded(ctx)` refuses: the deafen,
+`set_connection` and the playback gate are held behind it, because persisting a channel
+the bot is not in makes `on_ready` recover a guild that never connected. `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
 
 ---
 

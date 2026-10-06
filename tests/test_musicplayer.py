@@ -2922,6 +2922,52 @@ class TestReparkCrashedHead:
         assert await mp.repark_crashed_head() is False
 
 
+# ── start() ───────────────────────────────────────────────────────────────────
+
+
+class TestStartOpensTheGateOnlyForAConnectedClient:
+    """start() runs in cog_before_invoke, before any command body: an opener there
+    that a stale voice client satisfies lets the loop consume the queue before
+    -join can replace the client, and every song fails on it in turn."""
+
+    @staticmethod
+    def _started(
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        voice_client: object,
+    ) -> MusicPlayer:
+        mock_guild.voice_client = voice_client
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        mp.start()
+        return mp
+
+    @pytest.mark.parametrize("connected", [True, False], ids=["connected", "parked"])
+    def test_the_gate_follows_the_handshake(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        connected: bool,
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = connected
+        mp = self._started(mock_bot, mock_guild, mock_channel, mock_ctx, vc)
+        assert mp._playback_gate.is_set() is connected
+
+    def test_no_client_leaves_it_shut(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+    ) -> None:
+        mp = self._started(mock_bot, mock_guild, mock_channel, mock_ctx, None)
+        assert not mp._playback_gate.is_set()
+
+
 # ── EtaWalkTo ─────────────────────────────────────────────────────────────────
 
 
