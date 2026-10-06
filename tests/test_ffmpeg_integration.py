@@ -20,6 +20,13 @@ purpose, and pins the two numbers the decision is built on:
   same evidence would eat a real history entry), and is pinned here so the choice
   stays a choice rather than an accident of ffmpeg's exit codes.
 
+A third fact lives here for the same reason: which Opus mode the encode path
+leaves libopus in. discord.py asks for in-band FEC on every spawn, which libopus
+answers by abandoning CELT, and nothing but the bitstream shows it — the argv is
+accepted, the exit code is 0, and the audio plays. `YTDL.FFMPEG_OPTS` overrides
+the pair; the control test reads the TOC bytes under discord.py's bare defaults
+so the override's reason stays measurable. See docs/ARCHITECTURE.md#encoder-mode.
+
 The two-pass `-ss` is deliberately NOT tested here. Whether ffmpeg turns an input
 seek into an offset Range request depends on the file being large enough to be
 worth one — a 29 KB sample is fetched whole either way — and a sample big enough
@@ -43,13 +50,18 @@ import http.server
 import socketserver
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any, Optional
 
 import discord
 import pytest
 
-from src.youtube import _OGG_HEADER_PACKETS
+from src.youtube import (
+    YTDL,
+    _ENCODE_BITRATE_CAP_KBPS,
+    _OGG_HEADER_PACKETS,
+)
 from tests.helpers import tier_enabled
 
 pytestmark = [
@@ -101,16 +113,72 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
     payload: bytes = b""
     mode: str = "ok"
     seen_range: Optional[str] = None
+    gets: int = 0
+    # (first byte, bytes delivered) of every bounded range served, in order.
+    served: list[tuple[int, int]] = []
 
     def log_message(self, *_args: Any) -> None:  # noqa: D102 - quiet under pytest
         pass
 
+    def _serve_half(self) -> None:
+        """Open, deliver half the sample, then let the connection die."""
+        payload = type(self).payload
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(payload[: len(payload) // 2])
+        self.wfile.flush()
+        self.close_connection = True
+
+    def _serve_range(self) -> None:
+        """Honour the Range the reconnect asks for, which is what makes the
+        recovered stream the same audio rather than merely the same length."""
+        payload = type(self).payload
+        raw = self.headers.get("Range") or ""
+        start = int(raw.split("=")[1].split("-")[0]) if "=" in raw else 0
+        self.send_response(206 if start else 200)
+        self.send_header(
+            "Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}"
+        )
+        self.send_header("Content-Length", str(len(payload) - start))
+        self.end_headers()
+        self.wfile.write(payload[start:])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
         type(self).seen_range = self.headers.get("Range")
+        type(self).gets += 1
         mode = type(self).mode
         if mode == "refused":
             # A revoked URL: what YouTube returns once the signature expires.
             self.send_response(403)
+            self.end_headers()
+            return
+        if mode == "dead_then_503_then_ok":
+            # A transient CDN failure, and the shape the reconnect flag exists for:
+            # the connection dies mid-stream, two retries are refused, the fourth
+            # request is honoured as a Range. Content-Length on the 503 is what
+            # makes it a well-formed HTTP error rather than another truncation —
+            # a plain `-reconnect` already retries the latter.
+            if type(self).gets == 1:
+                self._serve_half()
+                return
+            if type(self).gets in (2, 3):
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.close_connection = True
+                return
+            self._serve_range()
+            return
+        if mode == "dead_then_403":
+            # The same death, never answered. The retry flag must not turn this
+            # into a wait: `stream_failed` and the cache drop decide it as before.
+            if type(self).gets == 1:
+                self._serve_half()
+                return
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if mode == "header_then_dead":
@@ -134,6 +202,8 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
     _FailingHandler.payload = opus_sample
     _FailingHandler.mode = "ok"
     _FailingHandler.seen_range = None
+    _FailingHandler.gets = 0
+    _FailingHandler.served = []
     with socketserver.TCPServer(("127.0.0.1", 0), _FailingHandler) as srv:
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
@@ -150,7 +220,29 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
 _EXIT_TIMEOUT_SECS = 10
 
 
-def _drain(url: str) -> tuple[int, int, Optional[Exception]]:
+def _packets(url: str, before_options: Optional[str] = None) -> list[bytes]:
+    """Every Opus packet a source yields, in order. The packets rather than their
+    count, because a reconnect that overlaps or skips a byte range still delivers
+    the right NUMBER of them."""
+    source = discord.FFmpegOpusAudio(url, before_options=before_options, options="-vn")
+    process = source._process
+    packets: list[bytes] = []
+    try:
+        while packet := source.read():
+            packets.append(bytes(packet))
+        process.wait(timeout=_RECONNECT_TIMEOUT_SECS)
+        return packets
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+def _drain(
+    url: str, before_options: Optional[str] = None
+) -> tuple[int, int, Optional[Exception]]:
     """Read a source to exhaustion the way discord.py's AudioPlayer does, then
     let the child exit and ask discord.py what it makes of the exit code.
 
@@ -164,7 +256,7 @@ def _drain(url: str) -> tuple[int, int, Optional[Exception]]:
     backstop), but it is a race, and what this tier exists to pin is the exit
     code itself. `_check_process_returncode` is then called explicitly, which is
     what `read()` would have done had the child been reaped in time."""
-    source = discord.FFmpegOpusAudio(url, options="-vn")
+    source = discord.FFmpegOpusAudio(url, before_options=before_options, options="-vn")
     process = source._process
     packets = 0
     try:
@@ -238,3 +330,163 @@ class TestWhatFFmpegReportsForAFailedStream:
             f"a stream that delivered no audio yielded {header_only} packets, but "
             f"_OGG_HEADER_PACKETS is {_OGG_HEADER_PACKETS}"
         )
+
+
+# RFC 6716 §3.1: TOC configs 0-11 are SILK, 12-15 hybrid, 16-31 CELT.
+_CELT_CONFIG_FLOOR = 16
+# Enough to see a mode hold rather than a first-frame choice; ~1s of the 3s sample.
+_MODE_SAMPLE_PACKETS = 50
+
+
+def _audio_bytes(url: str, *, bitrate: Optional[int] = None) -> int:
+    """How many bytes of Opus the player reads for a fixed number of packets, at
+    `bitrate` kbps. Packets, not file size, because the Ogg framing is not the wire."""
+    source = discord.FFmpegOpusAudio(
+        url, options=YTDL.FFMPEG_OPTS["options"], bitrate=bitrate
+    )
+    process = source._process
+    try:
+        for _ in range(_OGG_HEADER_PACKETS):
+            source.read()
+        return sum(len(source.read()) for _ in range(_MODE_SAMPLE_PACKETS))
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+class TestTheChannelBitrateIsSpent:
+    """`_encode_bitrate_kbps` decides the number; this is the only place that reads
+    what libopus does with it. The argv is asserted in the default tier against a
+    patched `FFmpegOpusAudio`, which cannot see the bitstream.
+    See docs/ARCHITECTURE.md#encoder-mode."""
+
+    def test_a_raised_bitrate_reaches_the_bitstream(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """Monotonic rather than a fixed figure: libopus runs unconstrained VBR, so
+        what a target delivers depends on the content, but more target is more bits
+        for the same input."""
+        url = server.url  # pyright: ignore[reportAttributeAccessIssue]
+        default = _audio_bytes(url)
+        raised = _audio_bytes(url, bitrate=_ENCODE_BITRATE_CAP_KBPS)
+        assert raised > default, (default, raised)
+
+
+# Production's `before_options` minus the flag under test, derived rather than
+# written out: a change to the base flags would otherwise leave the control
+# quietly standing in for something that is no longer the baseline.
+_BASE_RECONNECT = YTDL.FFMPEG_OPTS["before_options"].replace(
+    " -reconnect_on_http_error 5xx", ""
+)
+
+
+def _audio_tocs(url: str, options: str) -> list[int]:
+    """The TOC config of the first _MODE_SAMPLE_PACKETS audio packets, read the
+    way the player reads them, past the two Ogg header packets."""
+    source = discord.FFmpegOpusAudio(url, options=options)
+    process = source._process
+    try:
+        for _ in range(_OGG_HEADER_PACKETS):
+            source.read()
+        tocs = []
+        for _ in range(_MODE_SAMPLE_PACKETS):
+            packet = source.read()
+            # read() answers b"" once the stream is spent; [0] on that is an
+            # IndexError that says nothing about the sample being too short.
+            assert packet, f"stream ended after {len(tocs)} of {_MODE_SAMPLE_PACKETS}"
+            tocs.append(packet[0] >> 3)
+        return tocs
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+class TestEncoderMode:
+    """Which Opus mode the re-encode path leaves libopus in, measured rather than
+    assumed. See docs/ARCHITECTURE.md#encoder-mode."""
+
+    def test_the_shipped_options_hold_celt(self, server: type[_FailingHandler]) -> None:
+        tocs = _audio_tocs(server.url, YTDL.FFMPEG_OPTS["options"])  # pyright: ignore[reportAttributeAccessIssue]
+        assert all(t >= _CELT_CONFIG_FLOOR for t in tocs), tocs
+
+    def test_discord_py_defaults_alone_leave_celt(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The control. When this starts seeing CELT, the override no longer
+        earns its place and the encoder-mode section can shrink."""
+        tocs = _audio_tocs(server.url, "-vn")  # pyright: ignore[reportAttributeAccessIssue]
+        assert all(t < _CELT_CONFIG_FLOOR for t in tocs), tocs
+
+
+# The reconnect backoff is 0 + 1 + 3 s before -reconnect_delay_max refuses a 7,
+# so a recovering stream needs several seconds and a stalled one gives up inside ~4.
+_RECONNECT_TIMEOUT_SECS = 40
+
+
+class TestAMidSongReconnect:
+    """A song whose connection dies mid-stream. `-reconnect` alone retries a
+    truncated stream but not a well-formed HTTP error, so a transient 503 used to
+    end the song wherever it died — exit 0, no error, no retry, and nothing in the
+    logs a listener could connect to the audio stopping.
+    See docs/ARCHITECTURE.md#mid-song-reconnects."""
+
+    def test_a_transient_503_recovers_the_whole_song(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        healthy = _packets(server.url)  # pyright: ignore[reportAttributeAccessIssue]
+        server.mode = "dead_then_503_then_ok"
+        server.gets = 0
+
+        recovered = _packets(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            YTDL.FFMPEG_OPTS["before_options"],
+        )
+
+        # Byte-identical, not merely the same length: the reconnect resumes by
+        # Range, and an overlapping or short range would still count right.
+        assert recovered == healthy
+        assert server.gets == 4, "the 503s were not retried"
+
+    def test_without_the_flag_the_song_ends_where_it_died(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The control, and the measurement that earns the flag: half a song,
+        reported as a clean end."""
+        healthy = _packets(server.url)  # pyright: ignore[reportAttributeAccessIssue]
+        server.mode = "dead_then_503_then_ok"
+        server.gets = 0
+
+        truncated = _packets(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            _BASE_RECONNECT,
+        )
+
+        assert len(truncated) < len(healthy) / 2 + 2
+        # What it did deliver is still the right audio; it just stops.
+        assert truncated[:-1] == healthy[: len(truncated) - 1]
+
+    def test_a_death_that_is_never_answered_still_ends_the_song(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The flag must not turn an unrecoverable death into a wait. ffmpeg does
+        not retry a 403 when the list is `5xx`, so this decides exactly as it did
+        before: exit 0, no error, and the loop falls to
+        `_drop_unplayable_stream_cache` rather than the retry ladder."""
+        server.mode = "dead_then_403"
+        server.gets = 0
+        started = time.monotonic()
+
+        packets, code, error = _drain(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            YTDL.FFMPEG_OPTS["before_options"],
+        )
+
+        assert (code, error) == (0, None)
+        assert packets > _OGG_HEADER_PACKETS, "delivered nothing at all"
+        assert time.monotonic() - started < 5.0, "waited on a death nothing will answer"

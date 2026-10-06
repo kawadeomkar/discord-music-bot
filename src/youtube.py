@@ -251,6 +251,10 @@ class YTDLVideoMetadata(TypedDict, total=False):
     abr: float
     asr: int
     acodec: str
+    # Container extension. Read beside acodec by _encode_bitrate_kbps, because a
+    # direct WAV or AIFF arrives with acodec=None: yt-dlp infers acodec from the
+    # extension only for aac/opus/mp3/flac/vorbis.
+    ext: str
     # Channel count of the served format. _passthrough_codec refuses more than
     # two: `-c:a copy` also copies OpusHead, and clients decode only the front pair.
     audio_channels: int
@@ -740,6 +744,9 @@ _STREAM_CACHE_FIELDS = frozenset(
         # Absent reads as re-encode in _passthrough_codec, so a cache hit must
         # carry it or passthrough silently stops applying.
         "audio_channels",
+        # WAV and AIFF report no acodec, so _encode_bitrate_kbps reads this too:
+        # a cache hit without it silently drops those back to 128k.
+        "ext",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
@@ -755,6 +762,11 @@ _STREAM_CACHE_FIELDS = frozenset(
 # Once per format per process, so an outage does not warn on every song.
 # Optional[str] because an info-dict can omit format_id.
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
+# Same rule, for a YouTube Opus itag the passthrough allowlist does not name.
+_UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
+# YouTube's audio-itag space is a few dozen wide, so this is a backstop against a
+# serve that is not an itag at all rather than an expected bound.
+_MAX_UNKNOWN_OPUS_ITAGS: Final[int] = 64
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -782,6 +794,77 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
             "audio-only primary is degraded and the player is on the fallback ladder"
         )
+    _warn_unknown_opus_itag(data)
+
+
+def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
+    """Say so when YouTube serves an Opus format the allowlist does not cover.
+
+    That serve is re-encoded, spending a lossy generation on a source that could
+    have been copied. Scoped to a format_id that leads with an itag, which is what
+    YouTube's are and what SoundCloud's named `http_opus` rungs are not. Once per
+    format id per process, and never for a serve the gate accepted.
+    Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
+    """
+    format_id = str(data.get("format_id") or "")
+    if not _ITAG_LED_FORMAT_ID.fullmatch(format_id):
+        return
+    if format_id in _UNKNOWN_OPUS_ITAG_WARNED:
+        return
+    if _passthrough_itag(format_id) in _PASSTHROUGH_FORMAT_IDS:
+        # Covered, so not the thing this warns about. The gate also refuses a
+        # covered format whose cache entry predates `audio_channels`, which
+        # _STREAM_CACHE_FIELDS expects for the stream TTL after a deploy.
+        return
+    if not str(data.get("acodec") or "").startswith("opus"):
+        return
+    if _passthrough_codec(data, filtered=False) is not None:
+        return
+    if len(_UNKNOWN_OPUS_ITAG_WARNED) < _MAX_UNKNOWN_OPUS_ITAGS:
+        _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
+    log.warning(
+        f"YouTube served Opus format {format_id}, which is not in the passthrough "
+        f"allowlist ({sorted(_PASSTHROUGH_FORMAT_IDS)}), so the song was "
+        f"re-encoded instead of copied (audio_channels="
+        f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
+    )
+
+
+# Lossless by codec, and by container for the two that report no codec at all:
+# yt-dlp infers `acodec` from the extension only for aac/opus/mp3/flac/vorbis, so a
+# direct WAV arrives with acodec=None. Which containers count, and why m4a is not
+# one of them: docs/ARCHITECTURE.md#encoder-mode.
+_LOSSLESS_ACODECS = frozenset({"flac", "alac"})
+_LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
+# Discord's own ceiling. libopus caps a packet at 1276 B, so the largest 20 ms
+# datagram is 1320-1324 B of UDP payload once DAVE's frame trailer and discord.py's
+# RTP header, nonce and Poly1305 tag are on it. See docs/ARCHITECTURE.md#encoder-mode.
+_ENCODE_BITRATE_CAP_KBPS = 384
+# discord.py's default, which it emits as `-b:a 128k` with or without us.
+_DEFAULT_ENCODE_KBPS = 128
+
+
+def _encode_bitrate_kbps(
+    data: YTDLVideoMetadata, *, channel_bitrate: Optional[int]
+) -> Optional[int]:
+    """The encoder bitrate to ask for, or None to leave discord.py's 128k.
+
+    Only for a source that is actually lossless, where it buys 2 dB at 256k
+    (39.6 -> 41.5 measured). An Opus serve gains 0.0-0.3 dB, because the encode
+    saturates on what the source already threw away; an AAC one gains 0.6-2.0 dB,
+    which does not pay for doubling its voice traffic.
+    See docs/ARCHITECTURE.md#encoder-mode.
+    """
+    if not channel_bitrate:
+        return None
+    lossless = (
+        data.get("acodec") in _LOSSLESS_ACODECS or data.get("ext") in _LOSSLESS_EXTS
+    )
+    if not lossless:
+        return None
+    kbps = min(channel_bitrate // 1000, _ENCODE_BITRATE_CAP_KBPS)
+    # Below the default is not an improvement, and equal to it is not a change.
+    return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
 
 
 def _source_cache_key(search: str) -> str:
@@ -861,6 +944,20 @@ def _playlist_cache_key(url: str) -> str:
 # Opus itags. The allowlist IS the frame-duration check, since the info-dict reports
 # no frame duration and "opus" alone cannot be trusted to mean 20ms.
 _PASSTHROUGH_FORMAT_IDS = frozenset({"249", "250", "251"})
+# A YouTube audio format id: the itag, and `-N` on a video with several audio
+# tracks, where N numbers the track and the encode is the itag's own.
+_ITAG_FORMAT_ID = re.compile(r"(\d+)(?:-\d+)?", re.ASCII)
+# Anything YouTube-shaped, which also takes in a suffix the allowlist cannot speak
+# for (`251-drc`).
+_ITAG_LED_FORMAT_ID = re.compile(r"\d+(?:-.+)?", re.ASCII)
+
+
+def _passthrough_itag(format_id: object) -> Optional[str]:
+    """The itag of a format id the allowlist can speak for, or None: `251`, and
+    `251-23` alike. See docs/ARCHITECTURE.md#audio-pipeline."""
+    match = _ITAG_FORMAT_ID.fullmatch(str(format_id or ""))
+    return match[1] if match else None
+
 
 # OpusHead + OpusTags, which RFC 7845 mandates at the head of every Ogg Opus stream.
 # discord.py yields them from read() like audio, so YTDL discounts exactly two.
@@ -902,7 +999,7 @@ def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[s
         return None
     if data.get("audio_channels") not in (1, 2):
         return None
-    if str(data.get("format_id") or "") not in _PASSTHROUGH_FORMAT_IDS:
+    if _passthrough_itag(data.get("format_id")) not in _PASSTHROUGH_FORMAT_IDS:
         return None
     return "copy"
 
@@ -1767,8 +1864,18 @@ async def _revalidate_source(
 
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn",
+        # `-reconnect_on_http_error 5xx` is what answers a mid-song 503; the
+        # `-reconnect` beside it covers a truncated stream. Needs an ffmpeg no older
+        # than late 2020. See docs/ARCHITECTURE.md#mid-song-reconnects.
+        "before_options": (
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            " -reconnect_on_http_error 5xx"
+        ),
+        # discord.py emits `-fec true -packet_loss 15` on every spawn, and libopus
+        # answers in-band FEC above 8 % expected loss by leaving CELT for SILK/hybrid
+        # on every frame. These trail its arguments, so they win; `-c:a copy` has no
+        # encoder to read them. See docs/ARCHITECTURE.md#encoder-mode.
+        "options": "-vn -fec false -packet_loss 0",
     }
 
     def __init__(
@@ -1781,14 +1888,18 @@ class YTDL(discord.FFmpegOpusAudio):
         before_options: Optional[str] = None,
         options: Optional[str] = None,
         codec: Optional[str] = None,
+        bitrate: Optional[int] = None,
     ) -> None:
         # codec=None keeps discord.py's `-c:a libopus` default; "copy" remuxes.
+        # bitrate=None keeps its 128k default; a kbps int raises the encode target
+        # for the one source worth it. The copy path reads neither.
         super().__init__(
             url,
             executable="ffmpeg",
             before_options=before_options,
             options=options,
             codec=codec,
+            bitrate=bitrate,
         )
 
         # The ask this source plays, held rather than copied field by field. Every
@@ -2208,6 +2319,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         *,
         volume: float = 1.0,
+        channel_bitrate: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         allow_reextract: bool = True,
     ) -> YTDL:
@@ -2239,6 +2351,11 @@ class YTDL(discord.FFmpegOpusAudio):
         codec = _passthrough_codec(data, filtered=bool(filters))
         if filters:
             ffmpeg_opts["options"] += f" -filter:a {','.join(filters)}"
+        # Beside the codec decision, and for the same reason: both describe what
+        # the encoder is asked to do, and the copy path reads neither.
+        bitrate = _encode_bitrate_kbps(data, channel_bitrate=channel_bitrate)
+        if bitrate is not None:
+            trace.get_current_span().set_attribute("ytdl.encode_bitrate_kbps", bitrate)
 
         return cls(
             channel,
@@ -2248,6 +2365,7 @@ class YTDL(discord.FFmpegOpusAudio):
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
             codec=codec,
+            bitrate=bitrate,
         )
 
     @classmethod

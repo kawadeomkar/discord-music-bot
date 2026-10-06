@@ -35,6 +35,7 @@ from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
+    _encode_bitrate_kbps,
     YTDL_OPTS,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
@@ -664,6 +665,19 @@ class TestYTDLFfmpegOpts:
 
     def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
+
+    def test_options_override_discord_py_fec_pair(self) -> None:
+        """discord.py's own `-fec true -packet_loss 15` precede `options` in the
+        argv and ffmpeg keeps the last value, so both must trail, with these values."""
+        options = YTDL.FFMPEG_OPTS["options"].split()
+        assert options[options.index("-fec") + 1] == "false"
+        assert options[options.index("-packet_loss") + 1] == "0"
+
+    def test_before_options_retries_a_well_formed_5xx(self) -> None:
+        """A plain `-reconnect` retries a truncated stream but not an HTTP error, so
+        the ladder's own tier is the only thing that notices this flag going missing
+        — and `just check` does not run it."""
+        assert "-reconnect_on_http_error 5xx" in YTDL.FFMPEG_OPTS["before_options"]
 
 
 class TestYTSource:
@@ -2475,6 +2489,7 @@ class TestYTStream:
             before_options: str,
             options: str,
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -2515,6 +2530,7 @@ class TestYTStream:
             before_options: str,
             options: str,
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -4036,6 +4052,7 @@ class TestOpusPassthrough:
             *,
             codec: Optional[str] = None,
             options: Optional[str] = None,
+            bitrate: Optional[int] = None,
             **kwargs: Any,
         ) -> None:
             noop_ffmpeg_init(self)
@@ -4134,6 +4151,38 @@ class TestOpusPassthrough:
         SoundCloud's http_opus is exactly this case.
         """
         assert await self._codec(format_id="http_opus_0_0") is None
+
+    @pytest.mark.parametrize("format_id", ["251-23", "250-0", "249-7", "251-104"])
+    async def test_one_track_of_a_multi_track_video_is_remuxed(
+        self, format_id: str
+    ) -> None:
+        """A video with dubbed audio numbers its tracks, and the format id of the
+        one served is the itag plus that number. The encode is the itag's own:
+        measured 20 ms on every packet of 249-N, 250-N and 251-N across four videos.
+        See docs/ARCHITECTURE.md#audio-pipeline."""
+        assert await self._codec(format_id=format_id) == "copy"
+
+    @pytest.mark.parametrize(
+        "format_id",
+        [
+            # A different encode of the itag, whose framing nobody has measured.
+            "251-drc",
+            "251-drc-3",
+            "251-3-drc",
+            # Not an itag and a track number.
+            "251-",
+            "-251",
+            "251-x",
+            "251 ",
+            "2510",
+            "774-3",
+            # Decimal digits str.isdigit() admits and no itag is.
+            "251-\u0663",
+            "\u0662\u0665\u0661",
+        ],
+    )
+    async def test_any_other_suffix_is_encoded(self, format_id: str) -> None:
+        assert await self._codec(format_id=format_id) is None
 
     async def test_the_volume_filter_and_the_copy_codec_are_mutually_exclusive(
         self,
@@ -4258,6 +4307,7 @@ class TestYTStreamInterjectionFlags:
             before_options: Optional[str],
             options: Optional[str],
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["before_options"] = before_options
@@ -7297,3 +7347,280 @@ class TestYtPlaylistProgress:
 
         assert seen == [(0, 1671), (25, None)]
         assert youtube._PROGRESS_SUBSCRIBERS == {}
+
+
+class TestEncodeBitrate:
+    """What the encoder is asked for, which is only ever raised for a source that
+    has something left to give: a ~130 kbps lossy serve saturates, so raising its
+    target buys 0.0-0.3 dB, where a lossless one gains 2 dB at 256k."""
+
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            ({"acodec": "flac"}, 256),
+            ({"acodec": "alac"}, 256),
+            # WAV and AIFF report NO acodec: yt-dlp infers it from the extension
+            # only for aac/opus/mp3/flac/vorbis. Measured against a real archive.org
+            # WAV, which arrives acodec=None, ext='wav'.
+            ({"ext": "wav"}, 256),
+            ({"ext": "aiff"}, 256),
+            ({"ext": "aif"}, 256),
+            ({"acodec": "opus", "ext": "webm"}, None),
+            ({"acodec": "mp3", "ext": "mp3"}, None),
+            # m4a carries AAC as often as ALAC, and guessing lossless there would
+            # triple the egress of every AAC file.
+            ({"ext": "m4a"}, None),
+            ({}, None),
+        ],
+        ids=[
+            "flac-by-acodec",
+            "alac-by-acodec",
+            "wav-by-ext",
+            "aiff-by-ext",
+            "aif-by-ext",
+            "opus",
+            "mp3",
+            "m4a-is-not-lossless",
+            "nothing-known",
+        ],
+    )
+    def test_only_a_lossless_source_raises_the_target(
+        self, data: Any, expected: Optional[int]
+    ) -> None:
+        assert _encode_bitrate_kbps(data, channel_bitrate=256000) == expected
+
+    @pytest.mark.parametrize(
+        ("channel_bitrate", "expected"),
+        [
+            (64000, None),
+            (128000, None),
+            (129000, 129),
+            (160000, 160),
+            (256000, 256),
+            (512000, 384),
+            (None, None),
+            (0, None),
+        ],
+        ids=[
+            "below-the-default",
+            "equal-to-the-default",
+            "a-hair-above-is-taken-as-it-is",
+            "above",
+            "typical-boosted-tier",
+            "capped-at-discords-ceiling",
+            "not-connected",
+            "zero",
+        ],
+    )
+    def test_the_channel_bounds_it_and_384_caps_it(
+        self, channel_bitrate: Optional[int], expected: Optional[int]
+    ) -> None:
+        """Below or equal to discord.py's own 128k is not a change worth making, and
+        384k is Discord's ceiling — a 20 ms packet there is ~1 KB, clear of UDP
+        fragmentation."""
+        assert (
+            _encode_bitrate_kbps({"acodec": "flac"}, channel_bitrate=channel_bitrate)
+            == expected
+        )
+
+    def test_a_cache_hit_that_lost_ext_is_not_read_as_lossless(self) -> None:
+        """The `audio_channels` trap, one field over: the gate reads `ext`, so a
+        cached entry written without it would silently drop every WAV back to 128k.
+        _STREAM_CACHE_FIELDS is what stops that, and this is the assertion that
+        keeps them in step."""
+        assert "ext" in _STREAM_CACHE_FIELDS
+        # A cache entry from the build before `ext` was cached: acodec is the only
+        # thing it carries about a WAV, and it carries None.
+        entry: Any = {"acodec": None}
+        assert _encode_bitrate_kbps(entry, channel_bitrate=256000) is None
+
+    async def test_yt_stream_forwards_it_to_the_encoder(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["bitrate"] = bitrate
+
+        data = _fake_ytdl_data(acodec="flac", ext="flac", audio_channels=2)
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://archive.org/a.flac",
+                    title="Lossless",
+                    requester=mock_ctx.author,
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                channel_bitrate=256000,
+            )
+
+        # A FLAC is never remuxed anyway — it is not Opus — so the encoder reads it.
+        assert (captured["codec"], captured["bitrate"]) == (None, 256)
+
+    async def test_an_opus_serve_stays_on_the_default(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """And keeps the copy path, which discards the bitrate unread."""
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["bitrate"] = bitrate
+
+        data = _fake_ytdl_data(
+            acodec="opus", ext="webm", audio_channels=2, format_id="251"
+        )
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://yt.com/v=x",
+                    title="Song",
+                    requester=mock_ctx.author,
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                channel_bitrate=256000,
+            )
+
+        assert (captured["codec"], captured["bitrate"]) == ("copy", None)
+
+
+class TestUnknownOpusItagTripwire:
+    """If YouTube starts serving an Opus itag the allowlist does not name, the song
+    is re-encoded — a lossy generation for a source that could have been copied,
+    and a silent step DOWN from the 251 it replaced. Nothing else would show it:
+    the song plays, the span says `opus_passthrough=false`, and no one is looking."""
+
+    def setup_method(self) -> None:
+        youtube._UNKNOWN_OPUS_ITAG_WARNED.clear()
+
+    def teardown_method(self) -> None:
+        youtube._UNKNOWN_OPUS_ITAG_WARNED.clear()
+
+    @staticmethod
+    def _serve(**overrides: Any) -> Any:
+        return {
+            "acodec": "opus",
+            "audio_channels": 2,
+            "format_id": "774",
+            "vcodec": "none",
+            **overrides,
+        }
+
+    def test_an_unknown_opus_itag_warns_with_its_number(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve())
+        assert "774" in caplog.text
+        assert "not in the passthrough allowlist" in caplog.text
+
+    def test_it_warns_once_per_itag_per_process(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A song every three minutes, for the life of the process."""
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                _record_serving_format(self._serve())
+        assert caplog.text.count("not in the passthrough allowlist") == 1
+
+    def test_an_allowlisted_itag_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="251"))
+        assert "allowlist" not in caplog.text
+
+    def test_an_allowlisted_itag_with_no_channel_count_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A cache entry written before `audio_channels` joined the stream fields
+        reads as re-encode for the rest of its 30-minute TTL. That is a named itag,
+        so it is not what this warns about — and the runbook's response, adding it
+        to the allowlist, is a no-op for one already there."""
+        serve = self._serve(format_id="251")
+        serve.pop("audio_channels", None)
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(serve)
+        assert "allowlist" not in caplog.text
+
+    @pytest.mark.parametrize("format_id", ["\u0663\u0664", "\u0663\u0664-3"])
+    def test_a_format_id_that_is_not_ascii_digits_is_silent(
+        self, caplog: pytest.LogCaptureFixture, format_id: str
+    ) -> None:
+        """`str.isdigit()` alone admits Unicode decimal digits, which no itag is."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id=format_id))
+        assert "allowlist" not in caplog.text
+        assert not youtube._UNKNOWN_OPUS_ITAG_WARNED
+
+    @pytest.mark.parametrize("channels", [2, None])
+    def test_a_covered_track_of_a_multi_track_video_is_silent(
+        self, caplog: pytest.LogCaptureFixture, channels: Optional[int]
+    ) -> None:
+        """`251-23` is itag 251, which the gate copies — and with no channel count
+        it is the same stale cache entry the bare itag is silent for."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(
+                self._serve(format_id="251-23", audio_channels=channels)
+            )
+        assert "allowlist" not in caplog.text
+
+    @pytest.mark.parametrize("format_id", ["774-3", "251-drc"])
+    def test_a_suffixed_format_the_gate_refused_warns_with_its_whole_id(
+        self, caplog: pytest.LogCaptureFixture, format_id: str
+    ) -> None:
+        """The suffix is what an operator needs: `774-3` is an unknown itag, and
+        `251-drc` a known one in an encode the allowlist does not cover."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id=format_id))
+        assert f"Opus format {format_id}," in caplog.text
+        assert "not in the passthrough allowlist" in caplog.text
+
+    def test_soundclouds_named_opus_rung_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Opus, excluded, and correctly so — that rung is 64 kbps, below
+        SoundCloud's own mp3. A tripwire that fires for it is noise."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="http_opus_0_0"))
+        assert "allowlist" not in caplog.text
+
+    def test_an_aac_serve_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The muxed fallback rungs are already warned about by their own rule."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(acodec="mp4a.40.2", format_id="140"))
+        assert "allowlist" not in caplog.text
+
+    def test_a_multichannel_opus_serve_warns_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """itag 338 is 5.1 Opus, refused for a different clause and re-encoded for
+        the same cost. The message carries the channel count so the two cases are
+        distinguishable in the log."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="338", audio_channels=6))
+        assert "338" in caplog.text
+        assert "audio_channels=6" in caplog.text

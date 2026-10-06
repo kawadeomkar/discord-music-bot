@@ -102,7 +102,7 @@ graph TD
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
 | Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
 | PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
-| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
+| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms mono or stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
 | Serialization | `orjson` | Fast JSON serialization for Redis payloads |
@@ -1551,6 +1551,24 @@ flowchart TD
     PLAYER -->|via yt_stream| YTDLP
 ```
 
+**Send pacing.** discord.py's `AudioPlayer` is a plain Python thread sleeping to a
+20 ms deadline, so it competes for the GIL with everything the event loop runs. Measured
+once against a stub voice client, 8 s of sends per row. The harness is not in the tree, so
+these are a recorded reading rather than something a reader can reproduce from it — treat
+them as the shape of the effect, not as a threshold to test against:
+
+| Load on the interpreter | p99 send gap | Gaps over 30 ms |
+|---|---|---|
+| idle process | 24.7 ms | none |
+| one busy Python thread | 24.6 ms | none |
+| three busy Python threads | 42.9 ms | 39 |
+
+The bot's own CPU-heavy work — extraction, chart rendering — lives in process pools, which
+is why the realistic row is the middle one and why the pools are not a convenience. A
+stutter report starts here: three busy *threads* in this process would be the regression,
+and the harness is a `FFmpegOpusAudio` driven by `AudioPlayer` against a client whose
+`send_audio_packet` only timestamps.
+
 **Synchronization primitives:**
 
 | Primitive | Owner | Guards |
@@ -1906,22 +1924,161 @@ flowchart LR
 ```
 
 **FFmpeg flags:**
-- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
-- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
+- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_http_error 5xx` — reconnects to the stream URL on drop, including when the drop is answered with a 5xx ([Mid-song reconnects](#mid-song-reconnects)); extended with `-ss {ts}` (**input side**) when the song carries a start offset
+- `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
 
-**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and ~3.9 s of CPU per 213 s song. `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always emits:
+**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and the encode's CPU (re-measure after the CELT change; the 3.9 s per 213 s figure was taken with the encoder in hybrid mode, which costs 2.5× a CELT encode). `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k -fec -packet_loss` discord.py always emits:
 
 | Clause | Why |
 |---|---|
 | no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Volume is the only source today. |
 | `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
-| `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly; SoundCloud's `http_opus` is exactly the case this excludes. |
+| `format_id` is itag `249`, `250` or `251`, bare or with a `-N` track number | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly — measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream. SoundCloud's `http_opus` is exactly the case this excludes, and its exclusion is right on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3. A video with several audio tracks (dubs) numbers them, and yt-dlp's id for the one served is the itag plus that number — `251-23`. `_passthrough_itag` reads the itag out of it, because the encode is the itag's own: measured on four such videos, every packet of `251-N`, `250-N` and `249-N` is 20 ms, one frame, stereo (249 mixes hybrid and CELT frames, which the frame count does not care about). `251-drc` is a different encode whose framing has not been measured, so any other suffix is refused. |
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
-Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
+Two differences from the encode path are accepted, and ffmpeg warns about neither, since no encoder is instantiated to read the options: a mono source stays mono rather than being upmixed, and the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251). The bitrate is not a quality lever in either direction: on the one 251 these figures were taken from, a 128k CELT re-encode measured about 3 dB below the copy and raising the target to 256k recovered 0.1 dB of it. Treat the 3 dB as that sample rather than as a constant — nothing in the tree re-derives it. Neither path carries in-band FEC — see [Encoder mode](#encoder-mode) for why the encode path turns it off — so the two differ by one lossy generation and nothing else.
+
+#### Encoder mode
+
+discord.py emits `-fec true -packet_loss 15` on every `FFmpegOpusAudio` spawn. In-band FEC exists only as LBRR inside SILK frames, so libopus answers a request for it at more than `(128 - voice_est) >> 4` percent expected loss — 8, for music — by leaving CELT for SILK/hybrid on every frame (`opus_encoder.c`, the `useInBandFEC` mode override). On music that is 8.7 dB against 39.6 dB at the same 128k target, the delivered stream is smaller (119 vs 153 kbps), and no bitrate recovers it: 510k hybrid measures 4.8 dB. The native `Encoder` discord.py uses for PCM sources carries the same defaults and lands in the same mode.
+
+`YTDL.FFMPEG_OPTS["options"]` therefore ends with `-fec false -packet_loss 0`. They trail discord.py's fixed arguments, and ffmpeg keeps the last value of a repeated option, so they win; on the copy path there is no encoder to read them, and the packets are byte-identical with or without them (603/603, both ffmpeg 9.0 and the image's 7.1.5). The ffmpeg tier pins both facts: the shipped options yield CELT, discord.py's bare defaults yield hybrid.
+
+Measured against the alternatives, concealment-only decode, three seeds: `-application lowdelay` ties at zero loss and loses 1.9–2.7 dB at 1–2 % loss while dropping the lookahead to 120 samples; `-packet_loss 5` with FEC off gains 1–3.4 dB under loss and costs 2.2 dB at zero loss on a 251 through the volume filter, the common re-encode. Real voice-path loss is under 1 %, so 0 stands; 5 is the knob if loss ever shows in telemetry. Turning FEC off is also what removes the last in-band-FEC argument for keeping the passthrough gate narrow: the no-FEC CELT stream is ahead at every loss rate tested, by 19 dB at 1 % and 6 dB at 20 %.
+
+The 20 ms framing the itag allowlist stands in for is measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream.
+
+Where the hybrid encode fails, by octave band (SDR against the lossless source, 40 s):
+
+| Band | Hybrid (discord.py defaults) | CELT (shipped options) |
+|---|---|---|
+| 0–500 Hz | 8.81 dB | 34.68 dB |
+| 500–1k | 8.79 | 42.93 |
+| 1k–2k | 8.71 | 41.85 |
+| 2k–4k | 7.18 | 35.45 |
+| 4k–8k | 2.35 | 26.49 |
+| 8k–12k | −0.06 | 17.84 |
+| 12k–16k | 0.53 | 12.43 |
+| 16k+ | −0.54 | 5.05 |
+
+Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
+
+ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
+
+**Encode bitrate.** discord.py asks for 128k and the copy path discards it unread. The one
+case where asking for more is worth anything is a source that has something left to give:
+raising the target for a ~130 kbps Opus serve buys 0.0–0.3 dB, because the encode
+saturates on what the source already threw away, while a lossless source gains 2 dB at
+256k (39.6 → 41.5 measured). AAC sits between: measured against the original through
+original → AAC 128k → Opus, raising 128k to 256k bought 1.1, 0.6 and 2.0 dB on three
+tracks, against 0.1, 0.1 and 0.0 for the same chain through Opus 130k — AAC's own
+artefacts leave the re-encode more to approximate. That is not raised either: AAC reaches
+the bot as YouTube's itag 140 only when the Opus serves are gone, and from SoundCloud,
+whose `hls_aac_160k` would double its voice traffic for a gain below the hybrid-mode loss
+this file opens with. So `_encode_bitrate_kbps` raises it only for a lossless source, bounded by
+the voice channel's own ceiling and capped at 384k — Discord's limit, where a 20 ms packet
+reaches libopus's own 1276-byte per-packet ceiling. DAVE, Discord's end-to-end encryption,
+wraps every Opus frame before transport encryption (`dave_session.encrypt_opus` in
+discord.py 2.7.1, with `davey` installed): an 8-byte truncated AES-GCM tag, a 1–5 byte
+ULEB128 nonce, a size byte and the 2-byte `0xFAFA` marker, 12–16 bytes in all. With
+discord.py's 12-byte RTP header, 16-byte Poly1305 tag and 4-byte nonce on top, that is a
+1320–1324-byte UDP payload — inside a 1500-byte path, and past the 1280-byte IPv6 minimum,
+where `voice_state`'s `sendall` failure surfaces only as a discord.py DEBUG line.
+
+"Lossless" is read from `acodec` **and** `ext`, because yt-dlp infers `acodec` from the
+extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` None and
+`ext` `wav`. `m4a` is deliberately not on the list — AAC and ALAC share it, and guessing
+lossless there would triple the egress of every AAC file. `ext` is in
+`_STREAM_CACHE_FIELDS` for the same reason `audio_channels` is: a cache hit that lost it
+would silently drop those sources back to 128k. Like volume, the value is baked into the
+argv, so it applies from the next song the player builds — the one after next while a
+prefetch holds a built one, and the very next after an empty queue.
+
+#### An unknown Opus itag
+
+The passthrough allowlist names three itags, so a fourth one YouTube starts serving is
+re-encoded: a lossy generation spent on a source that could have been copied, and a step
+**down** from the 251 it replaced. Nothing about that is visible from the outside — the
+song plays, the span carries `ytdl.opus_passthrough=false`, and no error is raised — so
+`_warn_unknown_opus_itag` says so once per format id per process, for an id that leads with
+an itag, whose `acodec` is Opus and which the gate refused: `774`, `774-3`, and `251-drc`
+alike. A covered itag's own track forms (`251-23`) are copied and never reach it.
+SoundCloud's `http_opus` rungs are Opus and excluded too, but their ids are named rather
+than numeric, and their exclusion is correct on quality as well: that rung is 64 kbps,
+below SoundCloud's own 128 kbps mp3.
+
+itag 774 (Opus 256k) is the one to expect. It was absent on seven clients probed
+anonymously, including `web_music` and `ios_music`; only the `android` client carries it,
+and that client refuses cookies. When the warning names it:
+
+1. Fetch one such stream and remux it with `-c:a copy` to Ogg, then read the TOC byte of
+   every packet — the allowlist stands in for the frame duration the info-dict does not
+   report, and 60 ms framing would play at 3× speed and read a third of its true position.
+2. All 20 ms → add the itag to `_PASSTHROUGH_FORMAT_IDS` in the same commit as the line
+   recording the measurement. Anything else → leave it out and deprioritize it in the
+   fallback ladder instead.
+
+When it names a suffix instead (`251-drc`), the measurement is the same and the change is
+to the suffixes `_ITAG_FORMAT_ID` accepts, not to the itag set.
+
+No speculative selector change: the allowlist is a claim about measured framing, and
+widening it on anything less is how the position math silently breaks.
+
+#### Mid-song reconnects
+
+A song's connection can die after it has been playing for a while, and what happens next
+depends on how the **reconnect** is answered rather than on the death itself. `-reconnect`
+and `-reconnect_streamed` retry a stream that simply stopped, but not one whose retry comes
+back as a well-formed HTTP error — so a transient 503 ended the song wherever it died, with
+exit 0, no stored error and nothing in the logs tied to the audio stopping.
+`-reconnect_on_http_error 5xx` is what closes that, measured against a local server that
+dies halfway, refuses two retries and honours the third as a Range request:
+
+| `before_options` | Packets delivered | Exit | Stored error | Wall time |
+|---|---|---|---|---|
+| a healthy stream, for reference | 153 | 0 | none | 0.05 s |
+| without the flag | **77** | 0 | none | 0.04 s |
+| with it | **153**, byte-identical to the healthy stream | 0 | none | 1.05 s |
+
+Byte-identical matters more than the count: the reconnect resumes by `Range`, and a range
+that overlapped or skipped would still deliver 153 packets. The ffmpeg tier pins both rows.
+
+What the flag deliberately does not change is failure detection. A death nothing will
+answer — the retry returning 403 — measures identically with and without it (77 packets,
+exit 0, no error), so it still falls to `_drop_unplayable_stream_cache` rather than the
+retry ladder, and a 403 on the *first* request still exits 8 with an `FFmpegProcessError`
+either way. ffmpeg never retries a 403 when the list is `5xx`. The cost is bounded by
+`-reconnect_delay_max 5`: a 5xx that never clears is retried after 0, 1 and 3 seconds and
+then refused, so an unrecoverable song ends about 4 seconds later than it used to.
+
+A 5xx on the FIRST request is changed, and the stream probe reaches this path: `_probe_stream_url`
+maps 429 and 5xx to `UNCONFIRMED` and plays anyway. Measured against a server that answers
+503 forever, one spawn goes from `exit 8, 1 GET, 0.02 s` to `exit 8, 4 GETs, 4.03 s`. A
+transient 5xx on open therefore recovers instead of burning a rung of
+`_STREAM_PLAY_ATTEMPTS`; a persistent one costs about 4 seconds per attempt, so roughly 12
+before the failure embed where it used to fail at once.
+
+**Required ffmpeg.** `-reconnect_on_http_error` post-dates the three `-reconnect*` flags
+beside it; the `4xx,5xx` list form was added upstream around late 2020. An ffmpeg without it
+fails at argv parse — `Error splitting the argument list: Option not found`, exit 8, on every
+song and on every one of its attempts — so the floor is an ffmpeg no older than that. The
+runtime image installs Debian's, unpinned; `-ping` reports the version a deployment actually
+has.
+
+**The timings above are ffmpeg 7.1's**, the image's, and also hold on 9.0. Ubuntu 24.04's
+6.1 behaves differently on both rows, measured by CI's first run of the tier against it: it
+retries a mid-song 503 *without* the flag (all 153 packets), and with the flag it keeps
+retrying a death answered with 403 for about 12 seconds before ending the song. A `just
+run` on 6.1 therefore recovers the same songs but gives up on an unrecoverable one about
+12 seconds late rather than 4. This is why the ffmpeg tier runs in the test image, whose
+ffmpeg is the runtime stage's own package, in CI and in `just container-test-ffmpeg`.
+
+`-reconnect_on_network_error` was measured alongside and is **not** set: every network-level
+death in these cases was already retried by `-reconnect`, so it changed nothing.
+
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 
@@ -2406,7 +2563,9 @@ rewriting the ladder on **every** promotion (see below). Three filters are load-
 rather than cosmetic: storyboards also carry `vcodec: none` (the `acodec` test is what
 removes them, and yt-dlp writes the string `"none"` there, not `None`), and `-drc`
 variants and foreign-language dubs would make a fallback quietly change what the song
-*sounds* like. A muxed selection gets a one-rung ladder — itself — since that rung
+*sounds* like. yt-dlp scores the `-drc` rungs `quality − 0.5`
+(`extractor/youtube/_video.py`, the DRC branch of the format loop), so `bestaudio` never
+selects one and the filter here is the fallback path's half of the same rule. A muxed selection gets a one-rung ladder — itself — since that rung
 already means the audio-only path is degraded, and walking sideways across muxed
 formats is not a recovery worth having.
 
@@ -2482,9 +2641,11 @@ deliberately **reset** by `interject()`'s resume tail (that song is producing au
 which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
 a deeply-stacked tail resolves).
 
-Mid-song death stays out of scope: it produced audio and earned its history entry, and
-retrying it means resuming at the death position — a different feature this machinery
-makes cheap to add later.
+Mid-song death stays out of scope for the LADDER: it produced audio and earned its history
+entry, and retrying it means resuming at the death position — a different feature this
+machinery makes cheap to add later. ffmpeg's own reconnect is the first line of defence and
+recovers the transient case before the loop hears about it
+([Mid-song reconnects](#mid-song-reconnects)).
 
 ### yt-dlp process boundary
 

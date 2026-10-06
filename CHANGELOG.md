@@ -17,6 +17,37 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.57.0 — 2026-10-03
+
+**Songs the bot re-encodes sound right.** Anything not bit-copied from YouTube — every
+SoundCloud track, every song played at a volume other than 100 %, every video whose only
+audio is AAC — was leaving the encoder in Opus's speech mode. It now stays in the music
+mode, which is also cheaper to encode. Budget for roughly a third more voice traffic per
+such song (119 to 153 kbps measured on a real YouTube stream), though how much depends
+entirely on the music.
+
+**A lossless link encodes at the voice channel's bitrate.** A direct FLAC, WAV or AIFF URL
+now uses the channel's own ceiling, up to 384k, instead of 128k: +2 dB measured on a 256k
+channel. Apple Lossless is not included — it shares `.m4a` with AAC. Everything else stays
+at 128k, because a lossy source gains little or nothing from more. Those songs send up to
+3x the voice traffic they did; like `-volume`, it applies from the song after next.
+
+**A song no longer ends halfway when the connection hiccups.** A connection that died
+mid-play and was answered with a server error used to stop the song there, with nothing
+retried and nothing logged. It is now retried and resumes exactly where it left off. A
+failure that cannot be recovered ends the song about four seconds later than before, on
+the image's ffmpeg 7.1. A `just run` on an older ffmpeg, such as Ubuntu 24.04's 6.1,
+recovers the same songs but takes about 12 seconds to give up on one it cannot.
+
+**Videos with dubbed audio tracks are copied, not re-encoded.** They were decoded and
+re-encoded like a non-Opus source, with nothing in the logs.
+
+**A new WARNING if YouTube serves an Opus format the bot does not copy.** It reads
+`YouTube served Opus format <id>, which is not in the passthrough allowlist`, fires at most
+once per format per restart, and means those songs are being re-encoded — worth reporting.
+
+Nothing to do on deploy, and rolling back is safe: nothing here is stored.
+
 ## 2.56.0 — 2026-10-02
 
 **Searches that YouTube refused to answer now play.** Some searches came back as
