@@ -8623,6 +8623,76 @@ class TestYtStreamLoudness:
         assert "loudness_lkfs" in _STREAM_CACHE_FIELDS
 
 
+class TestScanTarget:
+    """Which URL a scan reads. A YouTube song only reaches the scan without its own
+    figure — a moved capture seam, a non-default track, a `-drc` serve — and then
+    its itag 249 measures what 251 does at a third of the bytes."""
+
+    @staticmethod
+    def _data(format_id: str, *ladder: str, **extra: Any) -> Any:
+        return {
+            "url": "https://cdn/served",
+            "format_id": format_id,
+            "duration": 200,
+            "audio_candidates": [
+                {"format_id": f, "url": f"https://cdn/{f}"} for f in ladder
+            ],
+            **extra,
+        }
+
+    def test_a_251_serve_is_scanned_on_its_249(self) -> None:
+        data = self._data("251", "250", "249", "140")
+        assert youtube._scan_target(data) == "https://cdn/249"
+
+    def test_a_dub_is_scanned_on_its_own_track(self) -> None:
+        data = self._data("251-23", "249-0", "249-23")
+        assert youtube._scan_target(data) == "https://cdn/249-23"
+
+    @pytest.mark.parametrize(
+        ("format_id", "ladder"),
+        [
+            ("251", ("250", "140")),
+            ("251-23", ("249", "249-0")),
+            # A different encode of the very thing measured.
+            ("251-drc", ("249", "249-drc")),
+            ("hls_aac_160k", ("hls_aac_96k",)),
+            ("249", ()),
+        ],
+    )
+    def test_anything_else_scans_what_plays(
+        self, format_id: str, ladder: tuple[str, ...]
+    ) -> None:
+        assert youtube._scan_target(self._data(format_id, *ladder)) == (
+            "https://cdn/served"
+        )
+
+    def test_a_249_rung_without_a_url_is_absent(self) -> None:
+        data = self._data("251")
+        data["audio_candidates"] = [{"format_id": "249"}]
+        assert youtube._scan_target(data) == "https://cdn/served"
+
+    def test_a_livestream_has_no_target(self) -> None:
+        assert youtube._scan_target(self._data("251", "249", duration=None)) is None
+
+    async def test_a_play_scans_the_249(self) -> None:
+        argv: list[str] = []
+        _, spawn = TestMeasureLoudness._child(
+            stderr=TestEbur128Summary._CAPTURED.encode()
+        )
+
+        async def record(*args: Any, **kwargs: Any) -> Any:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        await TestYtStreamLoudness._options(
+            LoudnessMode.NORMALIZE,
+            spawn=record,
+            audio_candidates=[{"format_id": "249", "url": "https://cdn/249"}],
+        )
+
+        assert argv[argv.index("-i") + 1] == "https://cdn/249"
+
+
 class TestPrefetchLoudness:
     """The warm half of a scan: which queued songs it measures, from what."""
 

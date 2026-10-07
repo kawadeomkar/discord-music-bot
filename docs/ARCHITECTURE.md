@@ -2299,6 +2299,26 @@ why it runs outside the warm's slot. The play that reaches the song then reads R
 joins the scan still running. Bulk enqueues spawn no warm, so a playlist's songs are
 measured one ahead by the prefetch, as before.
 
+**A YouTube fallback is scanned on its itag 249.** A YouTube song reaches the scan only
+without a figure of its own — a moved capture seam, a non-default track, a `-drc` serve, a
+stream-cache entry older than the field — and `_scan_target` then reads the ladder's itag 249
+of the served track (`251-23` → `249-23`) instead of the 251 that plays, falling back to the
+served URL when the ladder has none, and for any other serve (`-drc` is a different encode of
+the very thing measured; SoundCloud's rungs are not itags). Measured on eleven videos, 249
+against 251:
+
+| | 249 against 251 |
+|---|---|
+| integrated loudness | within 0.1 LU on all eleven (the summary prints one decimal), and within 0.07 of YouTube's own figure |
+| bytes fetched | 35–42 % |
+| decode | 1.6× faster (3.4 s against 5.3 s for an hour, on 7.1.5) |
+| sample peak | 0.5 dB lower to 2.9 dB higher — which only `ytdl.normalize_headroom_db` on the span reads |
+
+The ffmpeg tier pins the codec half on a synthesized signal: a 50 kbps and a 160 kbps Opus
+encode of it measure within 0.2 LU of each other. The 249 URL comes from the same extraction
+as the one that plays and is not probed; one that answers 403 is a failed scan, cached as
+unmeasured for an hour.
+
 **At most two scans run at once** (`_SCAN_CONCURRENCY`, `_scan_slot()`, process-wide).
 A scan of audio that arrives faster than it decodes — any long googlevideo file — is
 CPU-bound, and one keeps about two cores busy (ffmpeg's demux, decode and filter threads):

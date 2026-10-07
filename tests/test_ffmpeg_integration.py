@@ -689,6 +689,78 @@ class TestAScanStoppedAtItsDeadline:
         assert youtube.parse_ebur128_summary(printed.decode()) is not None
 
 
+class TestTheSmallestOpusServeMeasuresTheSame:
+    """A YouTube fallback scan reads itag 249 (~50 kbps) for 251's (~130 kbps)
+    loudness. Eleven real videos agreed within 0.1 LU; this pins that the decoder
+    and ebur128 under test still treat a low-bitrate Opus encode the same."""
+
+    @staticmethod
+    def _encoded(tmp_path: Path, kbps: int) -> None:
+        path = tmp_path / f"music_{kbps}.webm"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                # A level that moves: tones under a swelling envelope, and noise.
+                "-i",
+                "aevalsrc=0.3*sin(2*PI*220*t)*(0.5+0.5*sin(2*PI*0.2*t))"
+                "+0.2*sin(2*PI*1330*t)*(0.5+0.5*cos(2*PI*0.13*t)):s=48000:d=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=a=0.05:d=20:r=48000",
+                "-filter_complex",
+                "amix=inputs=2:normalize=0",
+                "-ac",
+                "2",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                f"{kbps}k",
+                str(path),
+            ],
+            check=True,
+        )
+
+    @pytest.fixture
+    def served(self, tmp_path: Path) -> Iterator[str]:
+        """Both encodes over HTTP, which is how the scan reads them: its reconnect
+        options belong to the http protocol and are refused on a file path."""
+        self._encoded(tmp_path, 50)
+        self._encoded(tmp_path, 160)
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, directory=str(tmp_path), **kwargs)
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), Quiet) as srv:
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield f"http://127.0.0.1:{srv.server_address[1]}"
+            finally:
+                srv.shutdown()
+                thread.join(timeout=5)
+
+    async def test_249_and_251_bitrates_measure_alike(self, served: str) -> None:
+        low = await measure_loudness(
+            f"{served}/music_50.webm", "https://yt.com/v=249", None
+        )
+        high = await measure_loudness(
+            f"{served}/music_160.webm", "https://yt.com/v=251", None
+        )
+
+        assert low is not None and high is not None
+        assert low.i == pytest.approx(high.i, abs=0.2)
+
+
 class TestAnHlsPlaylistIsScanned:
     """SoundCloud's serves are HLS playlists of fMP4 segments, a different demuxer
     from the webm every other test here reads — and the scan hands it the play

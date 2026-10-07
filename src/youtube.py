@@ -1422,7 +1422,24 @@ def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
     measure whatever it happened to catch."""
     if not data.get("duration") or not data.get("url"):
         return None
-    return data["url"]
+    return _smallest_opus_url(data) or data["url"]
+
+
+def _smallest_opus_url(data: YTDLVideoInfo) -> Optional[str]:
+    """The ladder's itag 249 of the served track, when it has one. Its integrated
+    loudness matched 251's within 0.1 LU on eleven videos at 35-42 % of the bytes;
+    its sample peak reads up to 2.9 dB higher, which only the span reports.
+    See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    served = _ITAG_FORMAT_ID.fullmatch(str(data.get("format_id") or ""))
+    if served is None:
+        return None
+    # The track suffix, so a dub's scan reads the dub: `251-23` -> `249-23`.
+    twin = "249" + served[0][len(served[1]) :]
+    for candidate in data.get("audio_candidates") or []:
+        url = candidate.get("url")
+        if candidate.get("format_id") == twin and url:
+            return url
+    return None
 
 
 def _source_cache_key(search: str) -> str:
