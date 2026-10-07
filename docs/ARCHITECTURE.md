@@ -2253,6 +2253,24 @@ why it runs outside the warm's slot. The play that reaches the song then reads R
 joins the scan still running. Bulk enqueues spawn no warm, so a playlist's songs are
 measured one ahead by the prefetch, as before.
 
+**At most two scans run at once** (`_SCAN_CONCURRENCY`, `_scan_slot()`, process-wide).
+A scan of audio that arrives faster than it decodes — any long googlevideo file — is
+CPU-bound, and one keeps about two cores busy (ffmpeg's demux, decode and filter threads):
+one 60-minute itag-251 file scanned locally on the image's ffmpeg 7.1.5, 12 vCPUs:
+
+| Scans at once | Wall per scan | Cores busy |
+|---|---|---|
+| 1 | 5.3 s | 2.2 |
+| 2 | 6.6 s | 4.5 |
+| 4 | 6.1 s | 8.5 |
+| 8 | 7.9 s | 10.9 (saturated) |
+
+Eight at once on an 18-core laptop each took 9.2 s, so every one of them missed an 8 s bound,
+and each such miss was a song cached as unmeasured. Two keep most of a small host for the
+per-song encoders, at the price of a queue: a scan's own deadline starts once it holds a
+slot, and `ytdl.loudness_scan_queued_secs` on its span says how long it waited. A play
+waiting on a queued scan is still bounded by the knob below.
+
 **`LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the wait, not the scan.** A play waits at most
 that long and then starts at its own level under the ceiling (`ytdl.loudness_source =
 pending`); the scan carries on to its own bound, the same value, and what it measures is

@@ -1000,6 +1000,25 @@ _SCAN_RANGE_BYTES: Final[int] = 10 << 20
 _SCAN_FETCH_RETRIES: Final[int] = 2
 
 
+# How many scans run at once, process-wide. One CPU-bound scan keeps about two cores
+# busy (ffmpeg's demux, decode and filter threads); two leave most of a small host
+# to playback. See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_SCAN_CONCURRENCY: Final[int] = 2
+_scan_gate: Optional[asyncio.Semaphore] = None
+_scan_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _scan_slot() -> asyncio.Semaphore:
+    """The bound on concurrent scans, rebuilt when the running loop changes — a
+    Semaphore binds to the first loop that awaits it and refuses another."""
+    global _scan_gate, _scan_gate_loop
+    loop = asyncio.get_running_loop()
+    if _scan_gate is None or _scan_gate_loop is not loop:
+        _scan_gate = asyncio.Semaphore(_SCAN_CONCURRENCY)
+        _scan_gate_loop = loop
+    return _scan_gate
+
+
 def _loudness_cache_key(webpage_url: str) -> str:
     return f"ytdl:loudness:v1:{webpage_url}"
 
@@ -1182,11 +1201,17 @@ def _start_scan(
 async def _scan_in_its_own_span(
     stream_url: str, webpage_url: str, redis: Optional[aioredis.Redis]
 ) -> Optional[Loudness]:
-    """_scan_loudness under a span of its own: it outlives the span of the caller
-    that started it, and an ended span drops every attribute written to it."""
+    """_scan_loudness under a span of its own, and under the process-wide bound: it
+    outlives the span of the caller that started it, and an ended span drops every
+    attribute written to it. Its own deadline starts once it holds a slot."""
     with _tracer.start_as_current_span("ytdl.loudness_scan") as span:
         span.set_attribute("ytdl.url", webpage_url)
-        return await _scan_loudness(stream_url, webpage_url, redis)
+        queued = time.monotonic()
+        async with _scan_slot():
+            span.set_attribute(
+                "ytdl.loudness_scan_queued_secs", round(time.monotonic() - queued, 3)
+            )
+            return await _scan_loudness(stream_url, webpage_url, redis)
 
 
 async def _scan_loudness(

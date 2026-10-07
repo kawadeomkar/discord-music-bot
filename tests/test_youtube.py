@@ -7684,6 +7684,53 @@ class TestMeasureLoudness:
 
         process.kill.assert_called_once()
 
+    async def test_no_more_than_two_scans_run_at_once(self) -> None:
+        """A long scan keeps about two cores busy; eight at once saturated a
+        twelve-core host and every one of them missed its bound."""
+        assert youtube._SCAN_CONCURRENCY == 2
+        process, release, spawned, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            songs = [
+                asyncio.ensure_future(
+                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                )
+                for n in range(3)
+            ]
+            await settle()
+            assert len(spawned) == 2
+            release.set()
+            results = await asyncio.gather(*songs)
+
+        assert len(spawned) == 3
+        assert all(r == Loudness(i=-19.7, peak=-3.8) for r in results)
+
+    def test_the_bound_is_rebuilt_for_a_new_loop(self) -> None:
+        """A Semaphore binds to the first loop that waits on it, and the bot's loop
+        is not the first one a process (or a test run) creates."""
+
+        async def grab() -> asyncio.Semaphore:
+            return youtube._scan_slot()
+
+        first, second = asyncio.run(grab()), asyncio.run(grab())
+        assert first is not second
+
+    async def test_a_cancelled_scan_gives_its_slot_back(self) -> None:
+        process, _, spawned, spawn = self._gated_child(b"")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            for n in range(youtube._SCAN_CONCURRENCY):
+                asyncio.ensure_future(
+                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                )
+            await settle()
+            for job in list(youtube._INFLIGHT_SCANS.values()):
+                job.cancel()
+            await settle()
+            assert not youtube._scan_slot().locked()
+
+        assert len(spawned) == youtube._SCAN_CONCURRENCY
+
     async def test_a_scan_that_printed_no_summary_is_not_a_level(self) -> None:
         _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
         with patch("asyncio.create_subprocess_exec", new=spawn):
