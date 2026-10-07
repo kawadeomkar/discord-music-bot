@@ -2225,8 +2225,15 @@ key for an hour (`_LOUDNESS_UNMEASURED_TTL`), so a failing song costs it once an
 instead of on every play. Both are TTL'd and evictable, so they carry none of the
 non-evictable-key obligations in
 [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
-Livestreams — no duration — are never scanned: the scan would read until its deadline and
-measure whatever it caught.
+Livestreams are never scanned: the scan would read until its deadline and measure whatever
+it caught. yt-dlp says which those are (`is_live`, or a `live_status` of `is_live`,
+`is_upcoming` or `post_live`, both kept in the stream cache). It also reports no duration for
+a direct file — its generic extractor gives a SoundHelix MP3 and an Icecast stream the same
+`duration: None, is_live: None` — so a source with no duration is scanned behind a check
+of its own: `_read_scan_output` reads ffmpeg's input header first, and `Duration: N/A`
+ends the scan before any audio is read (`_EndlessInput`, cached as unmeasured for an hour).
+Measured: the MP3 prints `Duration: 00:06:12.72` (estimated from its bitrate), the stream
+`Duration: N/A`, 0.25 s after the spawn; the ffmpeg tier pins both against a local server.
 
 ##### Long songs
 

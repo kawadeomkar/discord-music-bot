@@ -7512,12 +7512,26 @@ class _ScanChild:
         self.stdin: Any = None
         self.stderr = MagicMock()
         self.stderr.read = self._read
+        self.stderr.readline = self._readline
         self.kill = MagicMock(side_effect=self._killed)
         self.send_signal = MagicMock(side_effect=self._signalled)
+        # What readline() has handed out; read() returns the rest.
+        self.consumed = 0
 
     async def _read(self) -> bytes:
         await self.ended.wait()
-        return self.printed
+        return self.printed[self.consumed :]
+
+    async def _readline(self) -> bytes:
+        """The input header is printed before any audio is read, so a line that is
+        there already is handed out before the child ends."""
+        if b"\n" not in self.printed[self.consumed :]:
+            await self.ended.wait()
+        end = self.printed.find(b"\n", self.consumed)
+        end = len(self.printed) if end < 0 else end + 1
+        line = self.printed[self.consumed : end]
+        self.consumed = end
+        return line
 
     async def wait(self) -> int:
         await self.ended.wait()
@@ -7733,7 +7747,9 @@ class TestMeasureLoudness:
         with patch("asyncio.create_subprocess_exec", new=spawn):
             songs = [
                 asyncio.ensure_future(
-                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                    measure_loudness(
+                        "https://cdn/a", f"{self._URL}{n}", None, duration=240
+                    )
                 )
                 for n in range(3)
             ]
@@ -7879,6 +7895,40 @@ class TestMeasureLoudness:
         assert measured is not None and measured.covered_secs == 720.0
         assert process.send_signal.call_count == 2
         process.kill.assert_not_called()
+
+    async def test_a_source_ffmpeg_finds_endless_is_stopped_before_its_audio(
+        self, fake_redis: Any
+    ) -> None:
+        """No duration from yt-dlp: the header decides, and `Duration: N/A` is a
+        radio stream the scan would otherwise read for its whole deadline."""
+        process, spawn = self._child(
+            stderr=b"Input #0, mp3\n  Duration: N/A, start: 0.000000\n", hangs=True
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await asyncio.wait_for(
+                    measure_loudness("https://cdn/a", self._URL, fake_redis), 1
+                )
+                is None
+            )
+
+        process.kill.assert_called_once()
+        assert orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL))) == {
+            "unmeasured": True
+        }
+
+    async def test_a_song_with_a_known_duration_is_not_held_to_the_header(
+        self,
+    ) -> None:
+        """The check costs nothing, but a source yt-dlp gave a duration has
+        already said it ends."""
+        _, spawn = self._child(
+            stderr=b"  Duration: N/A\n" + TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert await measure_loudness(
+                "https://cdn/a", self._URL, None, duration=240
+            ) == Loudness(i=-19.7, peak=-3.8)
 
     @pytest.mark.parametrize("covered", ["00:09:59.00", None])
     async def test_a_stopped_scan_short_of_ten_minutes_is_not_a_level(
@@ -8196,7 +8246,12 @@ class TestMeasureLoudnessInRanges:
             process.returncode = 0
             return 0
 
+        async def readline() -> bytes:
+            # No input header: the live check reads to the end and finds none.
+            return b""
+
         process.stderr.read = read
+        process.stderr.readline = readline
         process.wait = wait
         process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
         process.send_signal = MagicMock()
@@ -8521,18 +8576,51 @@ class TestYtStreamLoudness:
         assert "volume=" not in options
         assert _PEAK_LIMITER in options
 
-    async def test_a_livestream_is_never_scanned(self) -> None:
-        """No duration: the scan would read the stream until its own timeout and
-        measure whatever it happened to catch."""
+    @pytest.mark.parametrize(
+        "flags",
+        [{"is_live": True}, {"live_status": "is_live"}, {"live_status": "post_live"}],
+    )
+    async def test_a_livestream_is_never_scanned(self, flags: dict[str, Any]) -> None:
+        """The scan would read the stream until its deadline and measure whatever
+        it happened to catch."""
 
         async def refuse(*_args: Any, **_kwargs: Any) -> Any:
             raise AssertionError("scanned a livestream")
 
         _, options = await self._options(
-            LoudnessMode.NORMALIZE, duration=None, spawn=refuse
+            LoudnessMode.NORMALIZE, duration=None, spawn=refuse, **flags
         )
 
         assert _PEAK_LIMITER in options
+
+    async def test_a_direct_file_with_no_duration_is_measured(self) -> None:
+        """yt-dlp's generic extractor reports no duration for a direct MP3, and
+        once was the reason normalize never moved one."""
+        printed = (
+            b"  Duration: 00:06:12.72, start: 0.000000, bitrate: 192 kb/s\n"
+            + TestEbur128Summary._CAPTURED.encode()
+        )
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, stderr=printed
+        )
+
+        assert "volume=5.7dB" in options
+
+    async def test_an_endless_source_yt_dlp_did_not_flag_is_refused_at_once(
+        self,
+    ) -> None:
+        """An Icecast stream looks like a direct file to yt-dlp. ffmpeg says
+        `Duration: N/A` before it reads any audio, and the scan stops there."""
+        process, spawn = TestMeasureLoudness._child(
+            stderr=b"  Duration: N/A, start: 0.000000, bitrate: 128 kb/s\n",
+            hangs=True,
+        )
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, spawn=spawn
+        )
+
+        assert "volume=" not in options
+        process.kill.assert_called_once()
 
     async def test_a_play_waits_for_the_scan_at_most_the_knob(self) -> None:
         """The knob is the silence a listener sits through, so it bounds the wait
@@ -8568,12 +8656,13 @@ class TestYtStreamLoudness:
         assert options.index("volume=-5.7dB") < options.index("alimiter")
 
     async def test_a_livestream_with_a_figure_is_normalized(self) -> None:
-        """No duration only rules out the scan."""
+        """Being live only rules out the scan."""
         _, options = await self._options(
             LoudnessMode.NORMALIZE,
             duration=None,
             spawn=self._no_scan,
             loudness_lkfs=-20.0,
+            is_live=True,
         )
         assert "volume=6.0dB" in options
 
@@ -8672,7 +8761,7 @@ class TestScanTarget:
         assert youtube._scan_target(data) == "https://cdn/served"
 
     def test_a_livestream_has_no_target(self) -> None:
-        assert youtube._scan_target(self._data("251", "249", duration=None)) is None
+        assert youtube._scan_target(self._data("251", "249", is_live=True)) is None
 
     async def test_a_play_scans_the_249(self) -> None:
         argv: list[str] = []
@@ -8730,8 +8819,21 @@ class TestPrefetchLoudness:
         assert await self._measured(fake_redis) == []
 
     async def test_a_livestream_is_not_scanned(self, fake_redis: Any) -> None:
-        await self._cached(fake_redis, duration=None)
+        await self._cached(fake_redis, duration=None, is_live=True)
         assert await self._measured(fake_redis) == []
+
+    async def test_a_direct_file_is_measured_behind_the_live_check(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis, duration=None)
+        assert await self._measured(fake_redis) == [
+            ("https://cdn/a", self._PAGE, fake_redis, {"duration": None})
+        ]
+
+    def test_the_live_flags_survive_the_stream_cache(self) -> None:
+        """A cache hit without them reaches the scan's header check, which costs a
+        connection to the stream to learn what yt-dlp already said."""
+        assert {"is_live", "live_status"} <= youtube._STREAM_CACHE_FIELDS
 
     async def test_nothing_cached_is_nothing_to_measure(self, fake_redis: Any) -> None:
         assert await self._measured(fake_redis) == []

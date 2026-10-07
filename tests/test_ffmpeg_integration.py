@@ -761,6 +761,78 @@ class TestTheSmallestOpusServeMeasuresTheSame:
         assert low.i == pytest.approx(high.i, abs=0.2)
 
 
+class TestADirectFileWithNoDurationIsMeasured:
+    """yt-dlp reports no duration for a direct MP3 or for an Icecast stream, so the
+    scan asks ffmpeg: a file with a length prints one (estimated from its bitrate),
+    an endless stream prints `Duration: N/A` before it reads any audio."""
+
+    @pytest.fixture
+    def mp3(self, tmp_path: Path) -> Iterator[str]:
+        path = tmp_path / "song.mp3"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=440:duration={_SAMPLE_SECS}",
+                "-c:a",
+                "libmp3lame",
+                # No Xing header: its length is what Content-Length says, or nothing.
+                "-write_xing",
+                "0",
+                str(path),
+            ],
+            check=True,
+        )
+        payload = path.read_bytes()
+
+        class Radio(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                if self.path == "/file.mp3":
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                self.end_headers()
+                for _ in range(int(_STALL_SECS)):
+                    try:
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(1)
+
+        with socketserver.ThreadingTCPServer(("127.0.0.1", 0), Radio) as srv:
+            srv.daemon_threads = True
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield f"http://127.0.0.1:{srv.server_address[1]}"
+            finally:
+                srv.shutdown()
+                thread.join(timeout=5)
+
+    async def test_a_file_is_measured(self, mp3: str) -> None:
+        measured = await measure_loudness(f"{mp3}/file.mp3", "https://x/f.mp3", None)
+        assert measured is not None
+        assert -60.0 < measured.i < 0.0
+
+    async def test_a_stream_is_refused_before_its_audio(self, mp3: str) -> None:
+        started = time.monotonic()
+        measured = await measure_loudness(f"{mp3}/radio.mp3", "https://x/r.mp3", None)
+        assert measured is None
+        assert time.monotonic() - started < 1.5
+
+
 class TestAnHlsPlaylistIsScanned:
     """SoundCloud's serves are HLS playlists of fMP4 segments, a different demuxer
     from the webm every other test here reads — and the scan hands it the play
