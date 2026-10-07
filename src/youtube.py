@@ -275,6 +275,9 @@ class YTDLVideoMetadata(TypedDict, total=False):
     # neither, nor a duration (_scan_target).
     is_live: bool
     live_status: str
+    # Not yt-dlp's: the served track's itag 249, which a loudness scan reads in
+    # place of the 251 that plays (_lift_scan_url, _scan_target).
+    scan_url: str
     # The song's audio ladder, best first, candidate[0] being the format above.
     # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
     # revoked URL costs one sideways probe instead of the song.
@@ -562,6 +565,23 @@ def _lift_player_loudness(node: dict[str, Any]) -> None:
     node["loudness_lkfs"] = lkfs
 
 
+def _lift_scan_url(node: dict[str, Any]) -> None:
+    """Keep the URL of the served track's itag 249 before `formats` leaves: the
+    retry ladder keeps three rungs, 251-140-250 on a typical video, so 249 is
+    rarely one of them. See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    served = _ITAG_FORMAT_ID.fullmatch(str(node.get("format_id") or ""))
+    formats = node.get("formats")
+    if served is None or not isinstance(formats, list):
+        return
+    twin = "249" + served[0][len(served[1]) :]
+    if twin == served[0]:
+        return
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("format_id") == twin and fmt.get("url"):
+            node["scan_url"] = fmt["url"]
+            return
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
@@ -580,6 +600,7 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     for node in nodes:
         _lift_thumbnail(node)
         _lift_player_loudness(node)
+        _lift_scan_url(node)
         candidates = _mine_audio_candidates(node)
         if candidates:
             node["audio_candidates"] = candidates
@@ -852,6 +873,8 @@ _STREAM_CACHE_FIELDS = frozenset(
         # sideways probe rather than a re-extraction. This key is TTL'd and
         # evictable, so it carries no golden-rule-12 obligation.
         "audio_candidates",
+        # One more such URL; a cache hit without it scans the 251 that plays.
+        "scan_url",
     }
 )
 
@@ -1468,13 +1491,15 @@ def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
 
 
 def _smallest_opus_url(data: YTDLVideoInfo) -> Optional[str]:
-    """The ladder's itag 249 of the served track, when it has one. Its integrated
-    loudness matched 251's within 0.1 LU on eleven videos at 35-42 % of the bytes;
-    its sample peak reads up to 2.9 dB higher, which only the span reports.
-    See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    """The served track's itag 249, lifted by the worker or on the ladder. Its
+    integrated loudness matched 251's within 0.1 LU on eleven videos at 35-42 % of
+    the bytes; its sample peak reads up to 2.9 dB higher, which only the span
+    reports. See docs/ARCHITECTURE.md#when-a-song-is-measured."""
     served = _ITAG_FORMAT_ID.fullmatch(str(data.get("format_id") or ""))
     if served is None:
         return None
+    if lifted := data.get("scan_url"):
+        return lifted
     # The track suffix, so a dub's scan reads the dub: `251-23` -> `249-23`.
     twin = "249" + served[0][len(served[1]) :]
     for candidate in data.get("audio_candidates") or []:

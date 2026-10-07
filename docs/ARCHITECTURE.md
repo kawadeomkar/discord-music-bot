@@ -2319,10 +2319,13 @@ measured one ahead by the prefetch, as before.
 
 **A YouTube fallback is scanned on its itag 249.** A YouTube song reaches the scan only
 without a figure of its own — a moved capture seam, a non-default track, a `-drc` serve, a
-stream-cache entry older than the field — and `_scan_target` then reads the ladder's itag 249
-of the served track (`251-23` → `249-23`) instead of the 251 that plays, falling back to the
-served URL when the ladder has none, and for any other serve (`-drc` is a different encode of
-the very thing measured; SoundCloud's rungs are not itags). Measured on eleven videos, 249
+stream-cache entry older than the field — and `_scan_target` then reads the served track's
+itag 249 (`251-23` → `249-23`) instead of the 251 that plays. The retry ladder keeps three
+rungs, and on a typical video they are 251, 140 and 250 (both videos checked live), so the
+worker lifts the 249's URL on its own (`_lift_scan_url`, `scan_url` in the stream cache:
+one more signed URL, about 1.2 KB, on every YouTube entry whatever the mode). A 249 on the
+ladder serves as well; a song with neither scans what plays, as does any other serve (`-drc`
+is a different encode of the very thing measured; SoundCloud's rungs are not itags). Measured on eleven videos, 249
 against 251:
 
 | | 249 against 251 |

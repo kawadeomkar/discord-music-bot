@@ -8755,6 +8755,19 @@ class TestScanTarget:
             "https://cdn/served"
         )
 
+    def test_the_lifted_249_is_preferred(self) -> None:
+        """The ladder keeps three rungs, 251-140-250 on a typical video, so the 249
+        a scan wants is lifted on its own in the worker."""
+        data = self._data("251", "140", "250", scan_url="https://cdn/lifted-249")
+        assert youtube._scan_target(data) == "https://cdn/lifted-249"
+
+    def test_a_lifted_url_does_not_outrank_a_drc_serve(self) -> None:
+        data = self._data("251-drc", scan_url="https://cdn/lifted-249")
+        assert youtube._scan_target(data) == "https://cdn/served"
+
+    def test_the_lifted_url_survives_the_stream_cache(self) -> None:
+        assert "scan_url" in youtube._STREAM_CACHE_FIELDS
+
     def test_a_249_rung_without_a_url_is_absent(self) -> None:
         data = self._data("251")
         data["audio_candidates"] = [{"format_id": "249"}]
@@ -8780,6 +8793,55 @@ class TestScanTarget:
         )
 
         assert argv[argv.index("-i") + 1] == "https://cdn/249"
+
+
+class TestLiftScanUrl:
+    """The worker keeps the served track's 249 before `formats` is dropped."""
+
+    @staticmethod
+    def _node(format_id: str, *ids: str) -> dict[str, Any]:
+        return {
+            "format_id": format_id,
+            "formats": [{"format_id": f, "url": f"https://cdn/{f}"} for f in ids],
+        }
+
+    @pytest.mark.parametrize(
+        ("served", "ids", "lifted"),
+        [
+            ("251", ("249", "250", "140", "251"), "https://cdn/249"),
+            ("251-23", ("249-0", "249-23", "251-23"), "https://cdn/249-23"),
+            ("140", ("249", "140"), "https://cdn/249"),
+            ("251", ("250", "140", "251"), None),
+            ("249", ("249",), None),
+            ("251-drc", ("249", "249-drc"), None),
+            ("hls_aac_160k", ("249",), None),
+        ],
+    )
+    def test_which_url_is_lifted(
+        self, served: str, ids: tuple[str, ...], lifted: Optional[str]
+    ) -> None:
+        node = self._node(served, *ids)
+        youtube._lift_scan_url(node)
+        assert node.get("scan_url") == lifted
+
+    def test_a_249_without_a_url_is_not_lifted(self) -> None:
+        node = {"format_id": "251", "formats": [{"format_id": "249"}]}
+        youtube._lift_scan_url(node)
+        assert "scan_url" not in node
+
+    def test_slimming_keeps_it_after_formats_leave(self) -> None:
+        info = {
+            "id": "x",
+            "url": "https://cdn/251",
+            "format_id": "251",
+            "formats": [
+                {"format_id": "249", "url": "https://cdn/249", "acodec": "opus"},
+                {"format_id": "251", "url": "https://cdn/251", "acodec": "opus"},
+            ],
+        }
+        slim = cast(Any, youtube._slim_info(info))
+        assert slim["scan_url"] == "https://cdn/249"
+        assert "formats" not in slim
 
 
 class TestPrefetchLoudness:
