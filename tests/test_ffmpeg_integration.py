@@ -55,6 +55,7 @@ import contextlib
 import http.server
 import math
 import re
+import signal
 import socketserver
 import subprocess
 import threading
@@ -88,6 +89,9 @@ pytestmark = [
 # Long enough to deliver many packets past the header, short enough that a
 # failing test does not sit here: 3s is ~150 20ms frames.
 _SAMPLE_SECS = 3
+# How long "half_then_stall" holds its connection. The single-threaded server cannot
+# shut down until it returns, so it is short; the scan's deadline is shorter still.
+_STALL_SECS = 3.0
 
 
 @pytest.fixture(scope="session")
@@ -216,6 +220,18 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if mode == "half_then_stall":
+            # A fetch that stops making progress with the connection still open:
+            # what a throttled CDN looks like to a scan at its deadline.
+            payload = type(self).payload
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[: len(payload) // 2])
+            self.wfile.flush()
+            time.sleep(_STALL_SECS)
+            self.close_connection = True
             return
         if mode == "header_then_dead":
             # Opens, delivers the container header, then the connection dies.
@@ -604,6 +620,75 @@ class TestMeasureLoudnessReadsTheRealBinary:
         assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # pyright: ignore[reportAttributeAccessIssue]
 
 
+class TestALongSongIsMeasuredFromItsStart:
+    """A song past the cap is measured from its first `_SCAN_MAX_AUDIO_SECS`, which
+    ffmpeg's own `-t` has to honour and its closing line has to report."""
+
+    async def test_the_reading_covers_the_cap(
+        self, server: type[_FailingHandler], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(youtube, "_SCAN_MAX_AUDIO_SECS", 1.0)
+        measured = await measure_loudness(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            "https://yt.com/v=capped",
+            None,
+            duration=_SAMPLE_SECS,
+        )
+
+        assert measured is not None and measured.covered_secs is not None
+        assert measured.covered_secs == pytest.approx(1.0, abs=0.1)
+
+
+class TestAScanStoppedAtItsDeadline:
+    """SIGINT, not kill: ffmpeg stops reading and prints the summary of the audio
+    it has, with the closing line that says how much that was. The unit tests fake
+    both halves of that; this is the binary doing it."""
+
+    async def test_what_it_read_is_the_reading(
+        self, server: type[_FailingHandler], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        server.mode = "half_then_stall"
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 1.0)
+        monkeypatch.setattr(youtube, "_PARTIAL_MIN_SECS", 0.5)
+        started = time.monotonic()
+
+        measured = await measure_loudness(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            "https://yt.com/v=stalled",
+            None,
+            duration=_SAMPLE_SECS,
+        )
+
+        assert time.monotonic() - started < _STALL_SECS
+        assert measured is not None and measured.covered_secs is not None
+        assert 0.5 <= measured.covered_secs < _SAMPLE_SECS
+        assert -60.0 < measured.i < 0.0
+
+    def test_one_signal_does_not_break_a_stalled_read(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The control, and the reason `_interrupt` sends two: the first is read
+        between packets, and a fetch stalled inside a read never gets there."""
+        server.mode = "half_then_stall"
+        child = subprocess.Popen(
+            ["ffmpeg", "-nostats", "-loglevel", "info", "-i", server.url]  # pyright: ignore[reportAttributeAccessIssue]
+            + ["-vn", "-af", "ebur128=framelog=quiet:peak=sample", "-f", "null", "-"],
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(0.5)
+            child.send_signal(signal.SIGINT)
+            time.sleep(0.75)
+            assert child.poll() is None, "one SIGINT broke the read after all"
+            child.send_signal(signal.SIGINT)
+            _, printed = child.communicate(timeout=_STALL_SECS)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+        assert youtube.parse_ebur128_summary(printed.decode()) is not None
+
+
 class TestAnHlsPlaylistIsScanned:
     """SoundCloud's serves are HLS playlists of fMP4 segments, a different demuxer
     from the webm every other test here reads — and the scan hands it the play
@@ -709,6 +794,25 @@ class TestALongSongIsScannedInRanges:
         assert server.gets == self._RANGES
         self._assert_every_byte_arrived_once(server)
         assert ranged is not None and ranged == whole
+
+    async def test_a_capped_song_is_fed_only_its_share(
+        self, server: type[_FailingHandler], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Closing stdin early is ffmpeg's end of input, so it measures the
+        prefix it was fed rather than failing."""
+        monkeypatch.setattr(youtube, "_SCAN_MAX_AUDIO_SECS", _SAMPLE_SECS / 2)
+
+        measured = await measure_loudness(
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
+            "https://yt.com/v=prefix",
+            None,
+            duration=_SAMPLE_SECS,
+        )
+
+        delivered = sum(n for _, n in server.served)
+        assert delivered < len(server.payload)
+        assert measured is not None and measured.covered_secs is not None
+        assert 0.5 < measured.covered_secs < _SAMPLE_SECS
 
     async def test_a_range_that_dies_is_resumed_where_it_stopped(
         self, server: type[_FailingHandler]
