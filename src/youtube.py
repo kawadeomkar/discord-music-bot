@@ -1374,8 +1374,8 @@ async def _scan_loudness(
             "-vn",
             "-af",
             # Sample peak, which is the one `alimiter` holds the ceiling on, and it
-            # costs what asking for no peak costs: 0.25 s against 0.98 s for
-            # `peak=true` on a four-minute song, measured.
+            # costs what asking for no peak costs: 0.35 s against 0.82 s for
+            # `peak=true` on a 3½-minute song, measured.
             "ebur128=framelog=quiet:peak=sample",
             "-f",
             "null",

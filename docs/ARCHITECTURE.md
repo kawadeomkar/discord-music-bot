@@ -2162,10 +2162,21 @@ Why a static gain rather than a normalizing filter, measured on the same loud/qu
 | `volume=<gain>dB` + limiter (shipped) | yes, exactly, and LRA untouched | needs the track's loudness before the argv is assembled |
 
 `ebur128` reads SAMPLE peak, which is the one `alimiter` holds the ceiling on, and asking
-for it costs what asking for no peak costs: 0.25 s against 0.98 s for `peak=true` on a
-four-minute song, measured on ffmpeg 9.0.2. That puts the decode near 960× realtime — 0.40 s
-of CPU for four minutes, 2.87 s for an hour — so what bounds a scan is fetching the audio a
-second time, and how that fetch is made decides whether a long song can be measured at all.
+for it costs what asking for no peak costs, and well under half of `peak=true`: 0.35 s against
+0.82 s (9.0.2) and 0.35 s against 0.68 s (7.1.5) on a 3½-minute 251. What a scan decodes,
+local file, best of three, user+sys CPU across ffmpeg's threads:
+
+| Input | ffmpeg 7.1.5 (the image) | ffmpeg 9.0.2 |
+|---|---|---|
+| itag 251, 3½ min | 0.33 s wall, 0.69 s CPU — about 650× realtime | 0.35 s, 0.61 s |
+| itag 249, 3¼ min | 0.23 s wall, 0.53 s CPU — about 850× | — |
+| itag 251, the 20-minute cap | 1.71 s wall, 3.75 s CPU — 700× | — |
+| itag 249, the 20-minute cap | 1.09 s wall, 2.94 s CPU — 1,100× | — |
+| itag 251, a whole hour (no longer scanned) | 5.3 s wall, 11.8 s CPU | 5.5 s, 9.9 s |
+
+A scan therefore keeps two to three cores busy while it decodes, and a 249 scan of a long
+YouTube fallback is about a second of it. Network aside, the decode is not free; what decides
+whether a long song can be measured at all is still how its fetch is made.
 
 **A song over 10 MB is fetched in ranges.** googlevideo serves a single request spanning
 more than about 10 MB at ~33 KB/s — twice realtime — from its first byte, and that is the
