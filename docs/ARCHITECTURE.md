@@ -2225,18 +2225,25 @@ key for an hour (`_LOUDNESS_UNMEASURED_TTL`), so a song past the timeout costs i
 hour instead of on every play. Both are TTL'd and evictable, so they carry none of the
 non-evictable-key obligations in
 [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
-`LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the scan, and the child is spawned with asyncio
-rather than in an executor so a cancellation KILLS it: this runs inside the prefetch, which
-every bulk queue mutation cancels and whose contract forbids uninterruptible work there.
 Livestreams — no duration — are never scanned: the scan would read until its timeout and
 measure whatever it caught.
 
-One wait is the cost a user sees, and only for a song with no figure from YouTube: its
-first play in a normalizing server sits through the scan, bounded by the knob and by the
-re-fetch rather than the measuring, once per song per 30 days. It runs wherever the source
-is built — inside the prefetch for a queued song, and in the playback loop itself for the
-first song of a session or the first after an empty queue, which is the one case a listener
-waits on.
+##### When a song is measured
+
+**One scan per song, shared.** `measure_loudness` reads the cache and otherwise joins the
+scan already running for that cache key (`_INFLIGHT_SCANS`), or starts it. The scan is its
+own task under its own `ytdl.loudness_scan` span, and every caller awaits it through
+`asyncio.shield`: two guilds missing the cache together fetch the song once, and a caller
+that is cancelled — the prefetch, which every bulk queue mutation cancels — returns at once
+without stopping a scan another caller, or the song's next play, is waiting for. The child is
+spawned with asyncio rather than in an executor, so the one cancellation that reaches the
+scan itself, at shutdown, kills it; a caller whose scan was cancelled under it is answered
+"no level" rather than a `CancelledError` it would read as its own.
+
+**`LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the wait, not the scan.** A play waits at most
+that long and then starts at its own level under the ceiling (`ytdl.loudness_source =
+pending`); the scan carries on to its own bound, the same value, and what it measures is
+cached for the song's next play.
 
 A track whose peaks leave less headroom than its gain lands short of the target: the
 limiter holds back the difference rather than clipping, so a 20 dB-crest recording measured
