@@ -1290,6 +1290,15 @@ def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
     return float(lkfs)
 
 
+def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
+    """The URL a scan of this song reads, or None when it is not to be scanned.
+    Livestreams (no duration) never are: the scan would read until its bound and
+    measure whatever it happened to catch."""
+    if not data.get("duration") or not data.get("url"):
+        return None
+    return data["url"]
+
+
 def _source_cache_key(search: str) -> str:
     """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
     one entry — but never for a link, scheme-less or not, as parse_url reads one:
@@ -2557,6 +2566,25 @@ class YTDL(discord.FFmpegOpusAudio):
             return _enrich_queueobject(qo, data)
         return None
 
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.prefetch_loudness")
+    async def prefetch_loudness(
+        cls, qo: QueueObject, redis: Optional[aioredis.Redis]
+    ) -> None:
+        """Measure a queued song before its turn, from the stream URL its warm just
+        cached, so a normalizing guild's play reads the level from Redis instead of
+        waiting on the scan. Waits for the whole scan: nobody is listening here.
+        See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        if redis is None:
+            return
+        data = await _stream_cache_get(redis, _stream_cache_key(qo.webpage_url))
+        if data is None or _player_loudness(data) is not None:
+            return
+        target = _scan_target(data)
+        if target is not None:
+            await measure_loudness(target, qo.webpage_url, redis)
+
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
         """The audio URLs to try for this song, best first.
@@ -2805,13 +2833,12 @@ class YTDL(discord.FFmpegOpusAudio):
         gain_db: Optional[float] = None
         if loudness is LoudnessMode.NORMALIZE:
             span = trace.get_current_span()
-            # YouTube's own figure costs nothing; the scan is for a song without
-            # one. Livestreams (no duration) are never scanned: the scan would read
-            # until its timeout and measure whatever it happened to catch.
+            # YouTube's own figure costs nothing; the scan is for a song without one.
             lufs = _player_loudness(data)
-            if lufs is None and data.get("duration"):
+            target = _scan_target(data) if lufs is None else None
+            if target is not None:
                 measured = await measure_loudness(
-                    data["url"],
+                    target,
                     qo.webpage_url,
                     redis,
                     wait=config.loudness_scan_timeout_secs(),

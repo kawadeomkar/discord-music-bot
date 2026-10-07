@@ -2240,6 +2240,19 @@ spawned with asyncio rather than in an executor, so the one cancellation that re
 scan itself, at shutdown, kills it; a caller whose scan was cancelled under it is answered
 "no level" rather than a `CancelledError` it would read as its own.
 
+**A queued song is measured before its turn.** The one-ahead prefetch builds song N+1 only
+if it was queued before song N started, so a song added while another plays — one `-play` at
+a time, or `-p --next`, which hands the prefetch slot back without re-spawning it — used to
+reach its turn unmeasured and scan at the song boundary. Every enqueue already spawns a
+stream warm (`MusicPlayer._warm_stream`); in a normalizing guild it now goes on, after
+releasing `prefetch_warm_slot()`, to `YTDL.prefetch_loudness`, which reads the URL the warm
+cached and joins or starts the song's scan. It waits for the whole scan, since nobody is
+listening there, and skips a song YouTube already measured, a livestream, a song that left
+the queue while it warmed, and a stopped player. The scan holds no yt-dlp worker, which is
+why it runs outside the warm's slot. The play that reaches the song then reads Redis, or
+joins the scan still running. Bulk enqueues spawn no warm, so a playlist's songs are
+measured one ahead by the prefetch, as before.
+
 **`LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the wait, not the scan.** A play waits at most
 that long and then starts at its own level under the ceiling (`ytdl.loudness_source =
 pending`); the scan carries on to its own bound, the same value, and what it measures is

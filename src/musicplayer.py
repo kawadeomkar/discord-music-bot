@@ -1034,17 +1034,24 @@ class MusicPlayer:
         """One enqueue-time stream warm, under the process-wide background bound.
         One spawns per song, so a paste burst is N of them at once against a four-
         worker pool; the bound is what keeps a worker free for the in-band resolve
-        another guild's playback loop is waiting on."""
+        another guild's playback loop is waiting on.
+
+        A normalizing guild's song is then measured here, outside that bound — the
+        scan holds no worker — so its turn reads the level instead of waiting on it.
+        See docs/ARCHITECTURE.md#when-a-song-is-measured."""
         if self.store is None:
             return
         async with prefetch_warm_slot():
             warmed = await YTDL.prefetch_stream(item, redis=self.store.redis)
-        if warmed is not None:
-            # The back-fill goes into the queue's slot for the item; a card already
-            # rendered from the old object shows it when it next re-renders. A
-            # refused swap means the item left the queue, and what it drops is
-            # display fields the play-time resolve derives again.
-            self.queue.replace_item(item, warmed)
+        if warmed is None:
+            return
+        # The back-fill goes into the queue's slot for the item; a card already
+        # rendered from the old object shows it when it next re-renders. A refused
+        # swap means the item left the queue: nothing left to measure it for.
+        if not self.queue.replace_item(item, warmed):
+            return
+        if self.loudness is LoudnessMode.NORMALIZE and not self.retired:
+            await YTDL.prefetch_loudness(warmed, redis=self.store.redis)
 
     async def queue_put_front(
         self,

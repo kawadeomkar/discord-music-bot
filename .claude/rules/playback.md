@@ -112,6 +112,8 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
 PHASE 2 — PREFETCH (background):
   • per-song prefetch_stream task at enqueue (skipped for bulk playlists — N
     concurrent extractions would mint URLs that expire before playback)
+    — and, in a `loudness normalize` guild, the song's loudness scan right after
+    it, outside the warm slot (docs/ARCHITECTURE.md#when-a-song-is-measured)
   • _prefetch_next_song: while song N plays, song N+1 is fully resolved AND its
     YTDL/FFmpeg source constructed, cached in ytdl:stream:{webpage_url}
     (TTL = min(URL expire − 30min, 30min) — YouTube revokes well before `expire`)

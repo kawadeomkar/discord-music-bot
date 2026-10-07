@@ -8302,6 +8302,72 @@ class TestYtStreamLoudness:
         assert "loudness_lkfs" in _STREAM_CACHE_FIELDS
 
 
+class TestPrefetchLoudness:
+    """The warm half of a scan: which queued songs it measures, from what."""
+
+    _PAGE = "https://sc.com/a/b"
+
+    async def _cached(self, fake_redis: Any, **fields: Any) -> None:
+        data = {"url": "https://cdn/a", "webpage_url": self._PAGE, "duration": 200}
+        await cache_set(
+            fake_redis, youtube._stream_cache_key(self._PAGE), {**data, **fields}, 60
+        )
+
+    async def _measured(self, redis: Any) -> list[tuple[Any, ...]]:
+        calls: list[tuple[Any, ...]] = []
+
+        async def measure(*args: Any, **kwargs: Any) -> None:
+            calls.append((*args, kwargs))
+
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("src.youtube.measure_loudness", new=measure):
+            await YTDL.prefetch_loudness(qo, redis)
+        return calls
+
+    async def test_it_measures_the_cached_url_and_waits_for_all_of_it(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis)
+        assert await self._measured(fake_redis) == [
+            ("https://cdn/a", self._PAGE, fake_redis, {})
+        ]
+
+    async def test_a_song_youtube_measured_is_not_scanned(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis, loudness_lkfs=-9.0)
+        assert await self._measured(fake_redis) == []
+
+    async def test_a_livestream_is_not_scanned(self, fake_redis: Any) -> None:
+        await self._cached(fake_redis, duration=None)
+        assert await self._measured(fake_redis) == []
+
+    async def test_nothing_cached_is_nothing_to_measure(self, fake_redis: Any) -> None:
+        assert await self._measured(fake_redis) == []
+
+    async def test_no_redis_has_nowhere_to_leave_the_level(self) -> None:
+        assert await self._measured(None) == []
+
+    async def test_the_play_after_it_reads_the_level(self, fake_redis: Any) -> None:
+        """End to end through the real measure: the warm's scan lands in Redis and
+        the play spawns nothing."""
+        await self._cached(fake_redis)
+        _, spawn = TestMeasureLoudness._child(
+            stderr=TestEbur128Summary._CAPTURED.encode()
+        )
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await YTDL.prefetch_loudness(qo, fake_redis)
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("the play scanned a song its warm had measured")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            assert await measure_loudness(
+                "https://cdn/a", self._PAGE, fake_redis, wait=1.0
+            ) == Loudness(i=-19.7, peak=-3.8)
+
+
 def _player_response(video_id: object, lkfs: object) -> dict[str, Any]:
     return {
         "videoDetails": {"videoId": video_id},
