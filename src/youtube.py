@@ -22,6 +22,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
+from src.guild_state import LoudnessMode
 from src.queue_item import NpCard, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
@@ -867,6 +868,160 @@ def _encode_bitrate_kbps(
     return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Loudness:
+    """One song's measured level: integrated loudness in LUFS and true peak in
+    dBFS, both as ffmpeg's ebur128 summary reports them."""
+
+    i: float
+    peak: float
+
+
+# ebur128's summary block, printed at info level once the stream ends. Anchored per
+# line, because the same words appear in its per-frame log.
+_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", re.M)
+
+# A month. What a song measures does not change, so the only reason to re-measure is
+# that the entry is cheap to lose, not that it goes stale. TTL'd and evictable, so it
+# carries none of the non-evictable-key obligations.
+_LOUDNESS_TTL: Final[int] = 30 * 86400
+
+# An hour, for "this one did not measure". A song longer than the scan timeout can
+# cover fails identically every play, and without this the whole timeout is spent
+# again each time; an hour is short enough that a transient failure heals.
+_LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
+# What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
+_SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-reconnect_on_http_error",
+    "5xx",
+)
+
+
+def _loudness_cache_key(webpage_url: str) -> str:
+    return f"ytdl:loudness:v1:{webpage_url}"
+
+
+def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
+    """The I and Peak of an ebur128 summary, or None when either is missing —
+    which is what a scan that died mid-stream looks like, and is not a level."""
+    found = {key: value for key, value in _LOUDNESS_LINE.findall(stderr)}
+    if "I" not in found or "Peak" not in found:
+        return None
+    try:
+        return Loudness(i=float(found["I"]), peak=float(found["Peak"]))
+    except ValueError:
+        return None
+
+
+def normalize_gain_db(lufs: float) -> float:
+    """The gain that puts a song of this integrated loudness on the target,
+    clamped."""
+    lo, hi = _LOUDNESS_GAIN_CLAMP_DB
+    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - lufs))
+
+
+async def measure_loudness(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+) -> Optional[Loudness]:
+    """How loud this song is, from the cache when it has been measured before.
+
+    None means "play it at its own level": a failed scan, a timed-out one, or no
+    summary in what ffmpeg printed. Never raises — a level is an improvement to a
+    play, not a precondition for one.
+
+    The child is spawned with asyncio, not run in an executor, so a cancellation
+    KILLS it: the prefetch this runs inside is cancelled by every bulk queue
+    mutation, and its contract forbids uninterruptible work there (an executor job
+    cannot be interrupted, which is why the resolve refuses to re-extract from it).
+    """
+    span = trace.get_current_span()
+    cache_key = _loudness_cache_key(webpage_url)
+    cached = await cache_get(redis, cache_key)
+    if isinstance(cached, dict) and cached.get("unmeasured"):
+        span.set_attribute("ytdl.loudness_source", "cached-unmeasured")
+        return None
+    if isinstance(cached, dict) and "i" in cached and "peak" in cached:
+        try:
+            measured = Loudness(i=float(cached["i"]), peak=float(cached["peak"]))
+        except TypeError, ValueError:
+            measured = None
+        if measured is not None:
+            span.set_attribute("ytdl.loudness_source", "cache")
+            span.set_attribute("ytdl.loudness_lufs", measured.i)
+            return measured
+
+    process: Optional[asyncio.subprocess.Process] = None
+    stderr = b""
+    failure: Optional[str] = None
+    try:
+        async with asyncio.timeout(config.loudness_scan_timeout_secs()):
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-nostats",
+                "-loglevel",
+                "info",
+                # The play path's reconnects, because a drop here is remembered for
+                # an hour: see FFMPEG_OPTS["before_options"].
+                *_SCAN_RECONNECT_ARGS,
+                "-i",
+                stream_url,
+                "-vn",
+                "-af",
+                # Sample peak, which is the one `alimiter` holds the ceiling on, and
+                # it costs what asking for no peak costs: 0.25 s against 0.98 s for
+                # `peak=true` on a four-minute song, measured.
+                "ebur128=framelog=quiet:peak=sample",
+                "-f",
+                "null",
+                "-",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+    except (TimeoutError, OSError) as e:
+        failure = repr(e)
+    finally:
+        # Both the timeout and an outer cancellation land here, and either leaves a
+        # child holding a CDN connection. kill(), not terminate(): this one has no
+        # cleanup to do.
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    measured = (
+        None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
+    )
+    if measured is None:
+        log.warning(
+            f"loudness scan failed for {webpage_url}: {failure}"
+            if failure
+            else f"loudness scan printed no summary for {webpage_url}"
+        )
+        span.set_attribute("ytdl.loudness_source", "none")
+        # Remembered for an hour rather than re-paid on every play: a song the scan
+        # timeout cannot cover times out the same way next time. Short, so a
+        # transient failure heals itself.
+        await cache_set(
+            redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
+        )
+        return None
+    span.set_attribute("ytdl.loudness_source", "scan")
+    span.set_attribute("ytdl.loudness_lufs", measured.i)
+    await cache_set(
+        redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
+    )
+    return measured
+
+
 def _source_cache_key(search: str) -> str:
     """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
     one entry — but never for a link, scheme-less or not, as parse_url reads one:
@@ -964,16 +1119,50 @@ def _passthrough_itag(format_id: object) -> Optional[str]:
 _OGG_HEADER_PACKETS = 2
 
 
-def _audio_filters(volume: float) -> list[str]:
+# EBU R128 target. YouTube's own reference, which is why most tracks move by a
+# decibel or two rather than being rebuilt: matching it also matches what a listener
+# hears on YouTube itself.
+_LOUDNESS_TARGET_LUFS: Final[float] = -14.0
+# What a measured song's gain is allowed to be. Past these a track is not merely
+# quiet — it is a field recording or a mastering error, and moving it by 30 dB
+# amplifies its noise floor into the room.
+_LOUDNESS_GAIN_CLAMP_DB: Final[tuple[float, float]] = (-20.0, 12.0)
+# The ceiling every loudness mode applies, and the headroom a gain is read against.
+# Sample peak, which is what alimiter holds.
+_PEAK_CEILING_DBFS: Final[float] = -1.0
+# The same ceiling in the linear unit the filter takes, so the two cannot drift.
+# `level=disabled` holds it to a ceiling rather than a leveller, and `latency=1`
+# aligns the lookahead so everything under the ceiling comes through unchanged.
+# Both measured in the ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
+_PEAK_LIMITER: Final[str] = (
+    f"alimiter=limit={10 ** (_PEAK_CEILING_DBFS / 20):.3f}:level=disabled:latency=1"
+)
+
+
+def _audio_filters(
+    volume: float,
+    loudness: LoudnessMode = LoudnessMode.OFF,
+    gain_db: Optional[float] = None,
+) -> list[str]:
     """The -filter:a chain for one song, in application order.
 
     The ONLY place a filter enters the argv. _passthrough_codec refuses whenever
     this is non-empty, so a filter added here disables the remux path by
     construction rather than by a second test that could disagree with it.
+
+    Volume, then the measured gain, then the ceiling: a limiter has to cap the
+    signal the listener actually receives, so a guild playing at 200 % is capped
+    after its gain rather than before it. NORMALIZE without a gain — the scan
+    failed or timed out — still takes the ceiling, and the song plays at its own
+    level. See docs/ARCHITECTURE.md#loudness-normalization.
     """
     filters = []
     if volume != 1.0:
         filters.append(f"volume={volume}")
+    if loudness is LoudnessMode.NORMALIZE and gain_db is not None:
+        filters.append(f"volume={gain_db:.1f}dB")
+    if loudness is not LoudnessMode.OFF:
+        filters.append(_PEAK_LIMITER)
     return filters
 
 
@@ -2319,6 +2508,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         *,
         volume: float = 1.0,
+        loudness: LoudnessMode = LoudnessMode.OFF,
         channel_bitrate: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         allow_reextract: bool = True,
@@ -2344,10 +2534,25 @@ class YTDL(discord.FFmpegOpusAudio):
             # song still plays. MusicPlayer's start path announces the offset.
             ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
             ffmpeg_opts["options"] += " -ss 0"
+        gain_db: Optional[float] = None
+        if loudness is LoudnessMode.NORMALIZE and data.get("duration"):
+            # Livestreams (no duration) are skipped: the scan would read the stream
+            # until its timeout and measure whatever it happened to catch.
+            measured = await measure_loudness(data["url"], qo.webpage_url, redis)
+            if measured is not None:
+                gain_db = normalize_gain_db(measured.i)
+                span = trace.get_current_span()
+                span.set_attribute("ytdl.normalize_gain_db", gain_db)
+                # The gain asked for, against what fits under the ceiling. A song
+                # with less headroom than gain lands short of the target, because
+                # the limiter holds back the difference.
+                span.set_attribute(
+                    "ytdl.normalize_headroom_db", _PEAK_CEILING_DBFS - measured.peak
+                )
         # Chain first, codec second: ffmpeg refuses `-c:a copy` alongside any
         # filtergraph, and asking _audio_filters what it produced keeps the two
         # from disagreeing when a filter is added.
-        filters = _audio_filters(volume)
+        filters = _audio_filters(volume, loudness, gain_db)
         codec = _passthrough_codec(data, filtered=bool(filters))
         if filters:
             ffmpeg_opts["options"] += f" -filter:a {','.join(filters)}"

@@ -20,6 +20,11 @@ purpose, and pins the two numbers the decision is built on:
   same evidence would eat a real history entry), and is pinned here so the choice
   stays a choice rather than an accident of ffmpeg's exit codes.
 
+A fourth fact is the loudness setting's ceiling: `alimiter` is transparent below
+it only with `latency=1`, and the difference is in the samples, not in any exit
+code. That one measures the filter directly rather than through discord.py,
+because what is under test is the filter.
+
 A third fact lives here for the same reason: which Opus mode the encode path
 leaves libopus in. discord.py asks for in-band FEC on every spawn, which libopus
 answers by abandoning CELT, and nothing but the bitstream shows it — the argv is
@@ -45,13 +50,16 @@ the server is local, and the sample is synthesised by ffmpeg at session scope.
 
 from __future__ import annotations
 
+import array
 import contextlib
 import http.server
+import math
 import socketserver
 import subprocess
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, Optional
 
 import discord
@@ -61,6 +69,8 @@ from src.youtube import (
     YTDL,
     _ENCODE_BITRATE_CAP_KBPS,
     _OGG_HEADER_PACKETS,
+    _PEAK_LIMITER,
+    measure_loudness,
 )
 from tests.helpers import tier_enabled
 
@@ -422,6 +432,205 @@ class TestEncoderMode:
         earns its place and the encoder-mode section can shrink."""
         tocs = _audio_tocs(server.url, "-vn")  # pyright: ignore[reportAttributeAccessIssue]
         assert all(t < _CELT_CONFIG_FLOOR for t in tocs), tocs
+
+
+# ffmpeg's `sine` source generates at about -21 dBFS, which is already comfortably
+# under the limiter's 0.891 ceiling; +24 dB puts it over, and clipping.
+_OVER_THE_CEILING_DB = 24
+# One step of 16-bit quantisation. The limiter's pass-through gain is 1.0 to within
+# float rounding (7.5e-09 on ffmpeg 9.0.2, four thousand times under this step), so a
+# quantised difference lands here or nowhere.
+_ONE_LSB = 1
+# Far above _ONE_LSB and far below the ~3300 the 5 ms shift measures, so the control
+# fails on that shift rather than on a build's rounding.
+_A_REAL_CHANGE = 100
+# 0.891 of full scale, plus a decibel of slack for the encode either side of it.
+_CEILING_SAMPLE = int(0.891 * 32768)
+_ENCODE_SLACK = 400
+
+
+def _sine(directory: Path, *, gain_db: int = 0) -> str:
+    """A sample built like the tier's own, at `gain_db` relative to it."""
+    path = directory / f"sine{gain_db}.webm"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={_SAMPLE_SECS}",
+            "-af",
+            f"volume={gain_db}dB",
+            "-c:a",
+            "libopus",
+            "-f",
+            "webm",
+            str(path),
+            "-y",
+        ],
+        check=True,
+    )
+    return str(path)
+
+
+def _decoded(path: str, *filters: str) -> array.array[int]:
+    """`path` decoded to 48 kHz stereo 16-bit, through `filters` when given."""
+    chain = ["-filter:a", ",".join(filters)] if filters else []
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path,
+            "-vn",
+            *chain,
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    samples: array.array[int] = array.array("h")
+    samples.frombytes(result.stdout)
+    return samples
+
+
+def _worst_difference(a: array.array[int], b: array.array[int]) -> int:
+    assert len(a) == len(b), f"lengths differ: {len(a)} vs {len(b)}"
+    return max((abs(x - y) for x, y in zip(a, b)), default=0)
+
+
+class TestTheLoudnessCeilingIsTransparent:
+    """`peak` and `normalize` both end in `alimiter`, which every song they touch
+    passes through. A limiter that alters a song it was not meant to cap is a
+    quality regression with no symptom: no error, no exit code, and audio that
+    still plays. See docs/ARCHITECTURE.md#loudness-normalization."""
+
+    def test_the_filtergraph_alone_is_bit_exact(self, tmp_path: Path) -> None:
+        """The baseline the next two are read against: inserting a filtergraph at
+        all costs nothing, so any difference below belongs to the limiter."""
+        sample = _sine(tmp_path)
+        assert _worst_difference(_decoded(sample), _decoded(sample, "anull")) == 0
+
+    def test_below_the_ceiling_the_shipped_limiter_changes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        sample = _sine(tmp_path)
+        assert (
+            _worst_difference(_decoded(sample), _decoded(sample, _PEAK_LIMITER))
+            <= _ONE_LSB
+        )
+
+    def test_without_latency_1_every_sample_moves(self, tmp_path: Path) -> None:
+        """The control, and the whole reason that option is in the string:
+        alimiter's default reports its 5 ms lookahead as latency, which ffmpeg
+        answers by delaying the stream. Nothing else in the chain would show it."""
+        unlatched = _PEAK_LIMITER.replace(":latency=1", "")
+        assert unlatched != _PEAK_LIMITER, "the shipped filter no longer sets latency"
+        sample = _sine(tmp_path)
+        assert (
+            _worst_difference(_decoded(sample), _decoded(sample, unlatched))
+            > _A_REAL_CHANGE
+        )
+
+    def test_a_peak_over_the_ceiling_is_brought_under_it(self, tmp_path: Path) -> None:
+        """The other half: a limiter that caps nothing is not a ceiling."""
+        hot = _sine(tmp_path, gain_db=_OVER_THE_CEILING_DB)
+        assert max(abs(s) for s in _decoded(hot)) > _CEILING_SAMPLE
+        capped = _decoded(hot, _PEAK_LIMITER)
+        assert max(abs(s) for s in capped) <= _CEILING_SAMPLE + _ENCODE_SLACK
+
+
+class TestMeasureLoudnessReadsTheRealBinary:
+    """`normalize` decides a song's gain from what ffmpeg prints, and the unit tests
+    parse a captured block. This is what notices when a build stops printing it in
+    that shape: the scan would then return None for every song and the setting would
+    quietly do nothing but re-encode."""
+
+    async def test_the_tiers_sample_measures(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        measured = await measure_loudness(server.url, "https://yt.com/v=tier", None)  # pyright: ignore[reportAttributeAccessIssue]
+
+        assert measured is not None, "ebur128 printed no summary this parser could read"
+        assert math.isfinite(measured.i) and math.isfinite(measured.peak)
+        # The sine is about -21 dBFS, so both readings land well under 0.
+        assert -60.0 < measured.i < 0.0
+        assert -60.0 < measured.peak <= 0.0
+
+    async def test_a_url_that_serves_nothing_is_not_a_level(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """A refused URL has to answer None rather than raise: the scan runs inside
+        the prefetch, where a level is an improvement to a play and not a
+        precondition for one."""
+        server.mode = "refused"
+        assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # pyright: ignore[reportAttributeAccessIssue]
+
+
+class TestAnHlsPlaylistIsScanned:
+    """SoundCloud's serves are HLS playlists of fMP4 segments, a different demuxer
+    from the webm every other test here reads — and the scan hands it the play
+    path's reconnect flags, which it must accept."""
+
+    @pytest.fixture
+    def playlist(self, tmp_path: Path) -> Iterator[str]:
+        """A VOD playlist of the tier's tone in 1 s fMP4 segments, served locally."""
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=440:duration={_SAMPLE_SECS}",
+                "-c:a",
+                "aac",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_segment_type",
+                "fmp4",
+                str(tmp_path / "playlist.m3u8"),
+            ],
+            check=True,
+        )
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, directory=str(tmp_path), **kwargs)
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), Quiet) as srv:
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield f"http://127.0.0.1:{srv.server_address[1]}/playlist.m3u8"
+            finally:
+                srv.shutdown()
+                thread.join(timeout=5)
+
+    async def test_it_measures(self, playlist: str) -> None:
+        measured = await measure_loudness(playlist, "https://sc.com/a/hls", None)
+        assert measured is not None
+        assert -60.0 < measured.i < 0.0
 
 
 # The reconnect backoff is 0 + 1 + 3 s before -reconnect_delay_max refuses a 7,

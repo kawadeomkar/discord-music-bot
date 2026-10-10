@@ -32,6 +32,7 @@ from src.guild_state import (
     GuildConfig,
     GuildStateData,
     HistoryEntry,
+    LoudnessMode,
     NowPlayingData,
     SongQueueEntry,
     parse_queue_entry,
@@ -4837,6 +4838,45 @@ class TestStateRestore:
         await music_player._restore_state()
         assert music_player.volume == 0.5
 
+    async def test_restore_sets_loudness(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Without this leg a restart silently returns every normalizing guild to
+        off, while `-settings` keeps printing the mode it stored."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"normalize"
+        )
+        await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
+    async def test_a_mode_the_cache_already_holds_is_not_overwritten_by_restore(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """`seed` returns the fields it ACCEPTED: a write that has not reached Redis
+        yet is the newer one, so the snapshot must not undo it."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"off"
+        )
+        music_player.loudness = LoudnessMode.NORMALIZE
+        with patch.object(
+            music_player._cog.guild_settings, "seed", return_value=frozenset()
+        ):
+            await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
+    async def test_the_settings_cache_seeds_loudness_before_any_read(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """`_adopt_cached_settings` is the pre-restore fallback: the first song of a
+        session is built from it."""
+        mocked(music_player._cog.guild_settings).peek = MagicMock(
+            return_value=GuildConfig(loudness="peak")
+        )
+        music_player._adopt_cached_settings()
+        assert music_player.loudness is LoudnessMode.PEAK
+
     async def test_restore_noop_when_no_redis(
         self,
         mock_bot: MagicMock,
@@ -5626,6 +5666,16 @@ class TestStreamSource:
             await player._stream_source(source)
         assert stream.await_args is not None
         return dict(stream.await_args.kwargs)
+
+    async def test_the_guilds_loudness_reaches_the_stream(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """The hand-off `-settings loudness` depends on. Both ends are covered on
+        their own — the setting reaching the player, and the mode reaching the
+        argv — and this is the step between them."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["loudness"] is LoudnessMode.NORMALIZE
 
     async def test_the_channels_own_bitrate_reaches_the_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject

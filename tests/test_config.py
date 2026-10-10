@@ -1377,7 +1377,7 @@ class TestKnobHandle:
         assert config.KNOBS[knob.field] is knob
 
     def test_every_handle_is_the_module_global_named_as_its_field(self) -> None:
-        assert len(config.KNOBS) == 15
+        assert len(config.KNOBS) == 16
         for field, knob in config.KNOBS.items():
             assert getattr(config, field) is knob, field
 
