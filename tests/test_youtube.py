@@ -1548,6 +1548,64 @@ class TestYTSourceTermLadder:
         # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
 
+    async def test_a_term_nothing_is_indexed_under_costs_one_call(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An empty search does not become a result by being asked a second time
+        processed, and the ISRC rung misses by design. Checked against the live
+        service: a code nothing is indexed under answers with a playlist of no
+        entries, where a real one answers with exactly one."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search.startswith('ytsearch:"'):
+                return {"_type": "playlist", "entries": []}
+            return self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+                flat=True,
+                expected_duration=233,
+            )
+
+        assert asked.count('ytsearch:"GBAHS1600463"') == 1
+        assert result.duration == 234
+
+    async def test_the_flat_fallback_keeps_the_length_its_choice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A flat entry too thin to play falls through to a processed extraction of
+        the SAME widened term, so the length still chooses there. One result would
+        hand that resolve YouTube's top-ranked video instead."""
+        asked: list[tuple[str, str]] = []
+        live = {"_type": "playlist", "entries": [{"id": "x", "title": "L", "url": "u"}]}
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            flat = request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+            asked.append(("flat" if flat else "processed", search))
+            return live if flat else self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                flat=True,
+                expected_duration=233,
+            )
+
+        widened = f"ytsearch{youtube._DURATION_MATCH_RESULTS}:Shape of You Ed Sheeran"
+        assert asked == [("flat", widened), ("processed", widened)]
+
 
 class TestMusicSearchFallback:
     """A signed-out `ytsearch` whose top results hold age-restricted content comes
@@ -4696,6 +4754,20 @@ class TestSearchEntryPicker:
         ]
         chosen = select_search_entry(cast(Any, entries), expected_duration=233)
         assert chosen is not None and chosen.get("id") == "a"
+
+    def test_the_tie_window_leaves_the_ranking_in_charge_of_a_near_miss(self) -> None:
+        """What `_DURATION_TIE_SECS` is FOR: a few seconds of arithmetic must not
+        override YouTube's own ranking, because a master and its remaster differ by
+        more than the ranking does. Here the ranked entry is 4 s out and the one
+        behind it is exact, and the ranked one still wins — narrowing the window to
+        an exact match would silently change which recording plays."""
+        entries = [
+            {"_type": "video", "id": "ranked", "duration": 237, "url": "https://r"},
+            {"_type": "video", "id": "exact", "duration": 233, "url": "https://e"},
+        ]
+        assert youtube._DURATION_TIE_SECS == 5
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "ranked"
 
 
 class TestSearchTerms:
