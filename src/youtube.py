@@ -2330,6 +2330,15 @@ def _search_terms(
     return terms
 
 
+def _search_answered_with_nothing(data: YTDLExtractResult) -> bool:
+    """A search that found no results at all, as against one whose results are
+    unusable — the second is worth a second look at, the first is not. Only a list
+    is read: the pick below walks the same entries, and a generator would come back
+    empty from having been counted here."""
+    entries = data.get("entries")
+    return isinstance(entries, list) and not entries
+
+
 def _match_words(text: str) -> set[str]:
     """The words of `text` that can carry a match: long enough, and not stopwords."""
     return {
@@ -3220,11 +3229,12 @@ class YTDL(discord.FFmpegOpusAudio):
                 # internal search URL in text a user reads.
                 log.warning(f"music fallback for {search!r} failed: {e!r}")
 
-        # Raised as the failure the caller has always seen, `from None` because the
-        # wrapper is this method's private business.
-        raise last_miss.public from None
+        # Raised as the failure the caller has always seen, chained to the wrapper
+        # so the traceback keeps the frame that found nothing.
+        raise last_miss.public from last_miss
 
     @classmethod
+    @_tracer.start_as_current_span("ytdl.resolve_term")
     async def _resolve_term(
         cls,
         requester: Union[discord.User, discord.Member],
@@ -3303,7 +3313,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 search,
                 pool_slot=pool_slot,
             )
-            if flat_data is not None and flat_data.get("entries") == []:
+            if flat_data is not None and _search_answered_with_nothing(flat_data):
                 # The search answered with no results at all. The full path below
                 # would re-send the same search POST and get the same empty page,
                 # so this miss is final for the term.
