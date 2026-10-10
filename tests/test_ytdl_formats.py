@@ -8,10 +8,14 @@ main() is covered only for the one decision it makes: which entry of a search re
 to report on. It has to make the SAME choice yt_source does, and the way that breaks
 is someone re-inlining the rule instead of calling the shared picker."""
 
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from scripts.ytdl_formats import main, render
+import pytest
+
+from scripts.ytdl_formats import loudness_line, main, render
+from src import youtube
 
 
 def _info(**overrides: Any) -> dict[str, Any]:
@@ -83,6 +87,53 @@ class TestRender:
         empty section, which reads like a mining bug rather than the wrong input."""
         report = "\n".join(render({"format_id": "x", "url": "https://x"}))
         assert "(no alternatives — no format list, or no stream URL)" in report
+
+
+class TestLoudnessLine:
+    """The one place a yt-dlp bump that moved the capture seam is visible: in
+    production the song still normalizes, by the scan, and nothing says why it
+    waited."""
+
+    @pytest.fixture(autouse=True)
+    def _figures(self) -> Iterator[None]:
+        youtube._PLAYER_LOUDNESS.clear()
+        youtube._PLAYER_LOUDNESS["aaa"] = -13.01
+        yield
+        youtube._PLAYER_LOUDNESS.clear()
+
+    def test_a_captured_figure_is_reported(self) -> None:
+        line = loudness_line({"id": "aaa", "format_id": "251"}, captured=True)
+        assert "-13.01 LUFS" in line
+
+    def test_a_serve_the_figure_does_not_describe_says_scan(self) -> None:
+        line = loudness_line({"id": "aaa", "format_id": "251-drc"}, captured=True)
+        assert "-13.01" not in line and "scan" in line
+
+    def test_a_missing_seam_is_named_as_that(self) -> None:
+        line = loudness_line({"id": "aaa", "format_id": "251"}, captured=False)
+        assert "seam missing" in line and "-13.01" not in line
+
+    def test_it_does_not_write_on_the_info_it_was_handed(self) -> None:
+        info = {"id": "aaa", "format_id": "251"}
+        loudness_line(info, captured=True)
+        assert "loudness_lkfs" not in info
+
+    def test_main_prints_it(self) -> None:
+        ydl = MagicMock()
+        ydl.extract_info.return_value = {
+            "id": "aaa",
+            "url": "https://b",
+            "format_id": "251",
+        }
+        with (
+            patch("scripts.ytdl_formats.sys.argv", ["ytdl-formats", "https://yt/a"]),
+            patch("scripts.ytdl_formats.yt_dlp.YoutubeDL", return_value=ydl),
+            patch("builtins.print") as printer,
+        ):
+            assert main() == 0
+        assert "-13.01 LUFS" in "\n".join(
+            str(c.args[0]) for c in printer.call_args_list
+        )
 
 
 class TestMainEntrySelection:
