@@ -271,6 +271,10 @@ class YTDLVideoMetadata(TypedDict, total=False):
     # Not yt-dlp's: the loudness YouTube's own player normalizes this song against,
     # lifted from the player response in the worker (_lift_player_loudness).
     loudness_lkfs: float
+    # yt-dlp's live flags. A livestream is never scanned; a direct file reports
+    # neither, nor a duration (_scan_target).
+    is_live: bool
+    live_status: str
     # Not yt-dlp's: the served track's itag 249, which a loudness scan reads in
     # place of the 251 that plays (_lift_scan_url, _scan_target).
     scan_url: str
@@ -858,6 +862,9 @@ _STREAM_CACHE_FIELDS = frozenset(
         "ext",
         # A cache hit without it falls back to the scan, and its wait.
         "loudness_lkfs",
+        # A cache hit without them leaves a livestream to the scan's header check.
+        "is_live",
+        "live_status",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
@@ -1121,14 +1128,38 @@ async def _feed_ranges(stream_url: str, size: int, stdin: asyncio.StreamWriter) 
         stdin.close()
 
 
+class _EndlessInput(Exception):
+    """ffmpeg found no duration in a source yt-dlp did not call live: a radio
+    stream, which a scan would read until its deadline."""
+
+
+async def _read_scan_output(stderr: asyncio.StreamReader, live_gate: bool) -> bytes:
+    """Everything a scan prints. With `live_gate`, its input header is read first
+    and `Duration: N/A` raises _EndlessInput at once — measured: a direct MP3 prints
+    an estimated duration, an Icecast stream N/A."""
+    if not live_gate:
+        return await stderr.read()
+    head = bytearray()
+    while line := await stderr.readline():
+        head += line
+        if b"Duration:" in line:
+            if b"Duration: N/A" in line:
+                raise _EndlessInput
+            break
+    return bytes(head) + await stderr.read()
+
+
 async def _run_scan(
-    process: asyncio.subprocess.Process, stream_url: str, feed_bytes: Optional[int]
+    process: asyncio.subprocess.Process,
+    stream_url: str,
+    feed_bytes: Optional[int],
+    live_gate: bool,
 ) -> tuple[bytes, bool]:
     """Drive one scan to its end or its deadline: what ffmpeg printed, and whether
     it was stopped early. stderr is read throughout — a pipe nobody drains stops
     ffmpeg, which stops it reading stdin. A feed that fails raises."""
     assert process.stderr is not None
-    printed = asyncio.create_task(process.stderr.read())
+    printed = asyncio.create_task(_read_scan_output(process.stderr, live_gate))
     feed: Optional[asyncio.Task[None]] = None
     if feed_bytes is not None:
         assert process.stdin is not None
@@ -1376,7 +1407,11 @@ async def _scan_loudness(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        stderr, stopped = await _run_scan(process, stream_url, feed_bytes)
+        stderr, stopped = await _run_scan(
+            process, stream_url, feed_bytes, live_gate=duration is None
+        )
+    except _EndlessInput:
+        failure = "ffmpeg found no duration: a live stream"
     except aiohttp.ClientResponseError as e:
         # Not its repr, which carries the signed URL.
         failure = f"HTTP {e.status} for a range"
@@ -1439,11 +1474,18 @@ def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
     return float(lkfs)
 
 
+# yt-dlp's live_status values for a stream with no end yet.
+_LIVE_STATUSES: Final = frozenset({"is_live", "is_upcoming", "post_live"})
+
+
 def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
     """The URL a scan of this song reads, or None when it is not to be scanned.
-    Livestreams (no duration) never are: the scan would read until its bound and
-    measure whatever it happened to catch."""
-    if not data.get("duration") or not data.get("url"):
+    Livestreams never are: the scan would read until its bound and measure whatever
+    it happened to catch. A song with no duration that yt-dlp does not call live — a
+    direct file — is scanned, and the scan itself refuses one ffmpeg finds endless."""
+    if not data.get("url"):
+        return None
+    if data.get("is_live") or data.get("live_status") in _LIVE_STATUSES:
         return None
     return _smallest_opus_url(data) or data["url"]
 
