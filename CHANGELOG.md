@@ -17,6 +17,40 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.58.0 — 2026-10-03
+
+**New setting: `-settings loudness`.** Off by default, and off behaves exactly as the bot
+always has. The other two even out how loud songs play:
+
+- `peak` caps the loudest peaks, so a hot track stops jumping out of the mix. Anything
+  below the ceiling is left alone.
+- `normalize` brings every song to one loudness, raising quiet ones as well as lowering
+  loud ones. A YouTube song uses the loudness YouTube itself reports, so it starts as fast
+  as any other. Anything else — SoundCloud, a direct file — is measured once and remembered
+  for a month, and a song queued behind another is measured while it waits its turn, so
+  it starts without a pause too. Only a song that reaches its turn unmeasured, typically
+  the first of a session, waits: `-settings bot loudness-scan-timeout` (default 8s,
+  `LOUDNESS_SCAN_TIMEOUT_SECS`) bounds that wait. Past it the song plays at its own level
+  and the measurement finishes in the background for its next play. A song longer than 20
+  minutes — a DJ set, a full album — is measured from its first twenty. A recording with
+  very sharp peaks lands short of the rest rather than being squashed into line.
+
+Measuring costs CPU and bandwidth only in a `normalize` server, and only for songs YouTube
+did not measure: at most two measurements run at once, each reads at most twenty minutes
+of the song (the smallest YouTube format when one is needed), and `off` and `peak` measure
+nothing. Either mode re-encodes the audio instead of copying YouTube's bitstream through
+untouched, which spends one lossy generation and about 3% of one CPU core per playing server;
+`off` remains the only bit-exact setting. If a future
+yt-dlp update stops reporting YouTube's figure, nothing breaks — YouTube songs are measured
+before their first play again — and `just ytdl-formats <url>` prints a `LOUDNESS` line that
+says which is happening.
+
+The README has a troubleshooting section for a listener who hears the bot muffled when
+nobody else does.
+
+Nothing to do on deploy: no guild has the loudness setting until someone sets it. Rolling
+back is safe; an older build ignores the setting and the cached measurements.
+
 ## 2.57.0 — 2026-10-03
 
 **Songs the bot re-encodes sound right.** Anything not bit-copied from YouTube — every

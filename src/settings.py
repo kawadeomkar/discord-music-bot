@@ -47,6 +47,7 @@ from src.guild_state import (
     ConfigField,
     ConfigFieldName,
     GuildConfig,
+    LoudnessMode,
     is_config_field,
     valid_timezone,
 )
@@ -81,6 +82,7 @@ class SettingKind(Enum):
     SWITCH = "switch"  # on/off/true/false/enable/disable/yes/no; renders on/off
     TIMEZONE = "timezone"  # canonical IANA name; renders as stored
     COUNT = "count"  # integer; renders 16
+    CHOICE = "choice"  # one of the spec's `choices`; renders as stored
 
 
 class SettingGroup(Enum):
@@ -118,6 +120,9 @@ class SettingSpec:
     applies: str
     # Server scope: the guild:{id}:config field.
     field: ConfigFieldName | None = None
+    # CHOICE only: every value it accepts, in the order the cards list them. The
+    # first is not the default — `default` is, and it has to be one of these.
+    choices: tuple[str, ...] = ()
     minimum: Bound | None
     maximum: Bound | None
     # Another setting's current value: checked when a value is written, never on read.
@@ -140,6 +145,12 @@ class SettingSpec:
     env: str | None = None
 
     def __post_init__(self) -> None:
+        if (self.kind is SettingKind.CHOICE) != bool(self.choices):
+            # A CHOICE with no choices accepts nothing, and choices on any other
+            # kind are never read — both are typos with no runtime symptom.
+            raise ValueError(f"{self.key}: choices belong to CHOICE, and only to it")
+        if self.choices and self.default not in self.choices:
+            raise ValueError(f"{self.key}: default {self.default!r} is not a choice")
         if self.knob is None:
             return
         if self.env is not None:
@@ -200,6 +211,30 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         minimum=CONFIG_DOMAIN[ConfigField.VOLUME].lo * 100,
         maximum=CONFIG_DOMAIN[ConfigField.VOLUME].hi * 100,
         default=DEFAULT_VOLUME * 100,
+    ),
+    SettingSpec(
+        key="loudness",
+        aliases=("ln", "normalize"),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.CHOICE,
+        group=SettingGroup.PLAYBACK,
+        label="Loudness",
+        summary="How much the levels between songs are evened out.",
+        more=(
+            "`peak` caps the loudest peaks and leaves everything below them alone; "
+            "`normalize` brings every song to one loudness, measuring each once. "
+            "Either one re-encodes rather than copying the audio."
+        ),
+        applies="from the next song the player builds",
+        field=ConfigField.LOUDNESS,
+        choices=(
+            LoudnessMode.OFF.value,
+            LoudnessMode.PEAK.value,
+            LoudnessMode.NORMALIZE.value,
+        ),
+        minimum=None,
+        maximum=None,
+        default=LoudnessMode.OFF.value,
     ),
     SettingSpec(
         key="timezone",
@@ -490,6 +525,29 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         why_maximum="A song can wait for the check twice before it starts.",
     ),
     SettingSpec(
+        key="loudness-scan-timeout",
+        aliases=("scan-timeout",),
+        scope=SettingScope.BOT,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.PLAYBACK,
+        label="Loudness scan timeout",
+        summary="How long a song waits to be measured before it plays.",
+        more=(
+            "Only `loudness normalize` waits, for a song not yet measured; a "
+            "queued song is measured before its turn. Past it the song plays at "
+            "its own level, measured for next time."
+        ),
+        applies="from the next song that waits",
+        knob=config.loudness_scan_timeout_secs,
+        minimum=2.0,
+        maximum=config.LOUDNESS_SCAN_TIMEOUT_MAX_SECS,
+        why_minimum=(
+            "The scan reads up to twenty minutes of the song from the CDN, which "
+            "takes a second or two on a healthy connection."
+        ),
+        why_maximum="Every second of it is silence before the song starts.",
+    ),
+    SettingSpec(
         key="ping-tick",
         aliases=(),
         scope=SettingScope.BOT,
@@ -662,7 +720,7 @@ def format_value(spec: SettingSpec, value: SettingValue) -> str:
             return f"{int(value)}%"
         case SettingKind.SWITCH:
             return "on" if value else "off"
-        case SettingKind.TIMEZONE:
+        case SettingKind.TIMEZONE | SettingKind.CHOICE:
             return str(value)
         case SettingKind.COUNT:
             return str(int(value))
@@ -1209,6 +1267,21 @@ def _redirect_refusal(spec: SettingSpec, name: str) -> Refusal:
     return Refusal(reason=RefusalReason.TIMEZONE_REDIRECT, text=text, spec=spec)
 
 
+def _parse_choice(spec: SettingSpec, value: str) -> Parsed | Refusal:
+    """One of the spec's `choices`, folded like every other value the grammar
+    reads. The refusal names them all: there are never many, and a user who
+    misspelled one should not have to ask what the others are."""
+    folded = value.strip().casefold()
+    for choice in spec.choices:
+        if choice.casefold() == folded:
+            return Parsed(value=choice)
+    return Refusal(
+        reason=RefusalReason.BAD_SHAPE,
+        text=f"`{spec.key}` takes {_quote_list(spec.choices)}.",
+        spec=spec,
+    )
+
+
 def _parse_timezone(spec: SettingSpec, value: str) -> Parsed | Refusal:
     folded = value.strip().replace(" ", "_").casefold()
     if _FIXED_OFFSET_RE.fullmatch(folded.replace("_", "")):
@@ -1253,6 +1326,8 @@ def parse_value(spec: SettingSpec, value: str) -> Parsed | Refusal:
             result = _parse_switch(spec, value)
         case SettingKind.TIMEZONE:
             result = _parse_timezone(spec, value)
+        case SettingKind.CHOICE:
+            result = _parse_choice(spec, value)
     if isinstance(result, Refusal):
         return result
     refusal = check_write(spec, result.value)
@@ -1516,6 +1591,8 @@ def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
             return "on or off"
         case SettingKind.TIMEZONE:
             return "a city like Europe/London, or UTC"
+        case SettingKind.CHOICE:
+            return _quote_list(spec.choices)
     lo, hi = write_range(spec) if now else (bound(spec.minimum), bound(spec.maximum))
     lo, hi = lo or 0, hi or 0
     if lo > hi:
@@ -1862,6 +1939,7 @@ class _SettingsBot(Protocol):
 class _SettingsPlayer(Protocol):
     volume: float
     timezone: ZoneInfo
+    loudness: LoudnessMode
 
 
 class _SettingsCog(Protocol):
@@ -2332,6 +2410,9 @@ class GuildSettings:
             elif target is not None and field == ConfigField.TIMEZONE:
                 zone = value if isinstance(value, str) else None
                 target.timezone = GuildConfig(timezone=zone).tzinfo()
+            elif target is not None and field == ConfigField.LOUDNESS:
+                mode = value if isinstance(value, str) else None
+                target.loudness = GuildConfig(loudness=mode).loudness_mode()
         self._prune()
 
     async def sweep_orphans(

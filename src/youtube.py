@@ -1,10 +1,13 @@
 import asyncio
 import contextlib
 import copy
+import functools
+import math
 import os
 import re
+import signal
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
@@ -22,6 +25,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
+from src.guild_state import LoudnessMode
 from src.queue_item import NpCard, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
@@ -29,6 +33,7 @@ from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
     ProgressFn,
+    cancel_task,
     current_traceparent,
     fmt_duration,
     get_logger,
@@ -263,6 +268,16 @@ class YTDLVideoMetadata(TypedDict, total=False):
     format_id: str
     protocol: str
     vcodec: str
+    # Not yt-dlp's: the loudness YouTube's own player normalizes this song against,
+    # lifted from the player response in the worker (_lift_player_loudness).
+    loudness_lkfs: float
+    # yt-dlp's live flags. A livestream is never scanned; a direct file reports
+    # neither, nor a duration (_scan_target).
+    is_live: bool
+    live_status: str
+    # Not yt-dlp's: the served track's itag 249, which a loudness scan reads in
+    # place of the 251 that plays (_lift_scan_url, _scan_target).
+    scan_url: str
     # The song's audio ladder, best first, candidate[0] being the format above.
     # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
     # revoked URL costs one sideways probe instead of the song.
@@ -473,6 +488,100 @@ def _lift_thumbnail(info: dict[str, Any]) -> None:
             info["thumbnail"] = last["url"]
 
 
+# video id -> the loudness YouTube's player normalizes it against, from the player
+# responses of the extraction this process is running. A pool worker runs one at a
+# time, and _ytdlp_extract empties this before each.
+# See docs/ARCHITECTURE.md#loudness-normalization.
+_PLAYER_LOUDNESS: dict[str, float] = {}
+# The wrapper capture_player_loudness installed, so a second call can tell.
+_noting_player_loudness: Optional[Callable[..., Any]] = None
+
+
+def _note_player_loudness(player_responses: object) -> None:
+    """Record `trackAbsoluteLoudnessLkfs` for every video these responses describe.
+    Keyed by the response's own video id, and total over any shape: yt-dlp's
+    internals are not a contract, and a figure is never worth an extraction."""
+    if not isinstance(player_responses, list):
+        return
+    for response in player_responses:
+        try:
+            video_id = response["videoDetails"]["videoId"]
+            lkfs = response["playerConfig"]["audioConfig"]["trackAbsoluteLoudnessLkfs"]
+        except KeyError, TypeError:
+            continue
+        # bool is an int, and a NaN would become the gain.
+        if (
+            isinstance(video_id, str)
+            and isinstance(lkfs, int | float)
+            and not isinstance(lkfs, bool)
+            and math.isfinite(lkfs)
+        ):
+            # Two places is all YouTube sends; the rest is its float32.
+            _PLAYER_LOUDNESS.setdefault(video_id, round(float(lkfs), 2))
+
+
+def capture_player_loudness() -> bool:
+    """Have yt-dlp's YouTube extractor leave each video's loudness in
+    _PLAYER_LOUDNESS, and answer whether it could. Idempotent.
+
+    The seam is a private method of the pinned yt-dlp, so its absence is an answer
+    rather than an error: the song is then measured by the scan.
+    """
+    global _noting_player_loudness
+    from yt_dlp.extractor.youtube import YoutubeIE
+
+    original = getattr(YoutubeIE, "_extract_player_responses", None)
+    if original is None:
+        return False
+    if original is _noting_player_loudness:
+        return True
+
+    @functools.wraps(original)
+    def noting(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        # (player_responses, player_url) today.
+        if isinstance(result, tuple) and result:
+            _note_player_loudness(result[0])
+        return result
+
+    _noting_player_loudness = noting
+    setattr(YoutubeIE, "_extract_player_responses", noting)
+    return True
+
+
+def _lift_player_loudness(node: dict[str, Any]) -> None:
+    """Put YouTube's figure for this video on its info-dict, when the format served
+    is one the figure describes: the only audio track, or the default one of
+    several. A `-drc` serve is a different signal, and falls to the scan."""
+    lkfs = _PLAYER_LOUDNESS.get(str(node.get("id") or ""))
+    if lkfs is None:
+        return
+    track = _ITAG_FORMAT_ID.fullmatch(str(node.get("format_id") or ""))
+    if track is None:
+        return
+    numbered = track[0] != track[1]
+    if numbered and "(default)" not in str(node.get("format_note") or ""):
+        return
+    node["loudness_lkfs"] = lkfs
+
+
+def _lift_scan_url(node: dict[str, Any]) -> None:
+    """Keep the URL of the served track's itag 249 before `formats` leaves: the
+    retry ladder keeps three rungs, 251-140-250 on a typical video, so 249 is
+    rarely one of them. See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    served = _ITAG_FORMAT_ID.fullmatch(str(node.get("format_id") or ""))
+    formats = node.get("formats")
+    if served is None or not isinstance(formats, list):
+        return
+    twin = "249" + served[0][len(served[1]) :]
+    if twin == served[0]:
+        return
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("format_id") == twin and fmt.get("url"):
+            node["scan_url"] = fmt["url"]
+            return
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
@@ -490,6 +599,8 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
         nodes.extend(entry for entry in entries if isinstance(entry, dict))
     for node in nodes:
         _lift_thumbnail(node)
+        _lift_player_loudness(node)
+        _lift_scan_url(node)
         candidates = _mine_audio_candidates(node)
         if candidates:
             node["audio_candidates"] = candidates
@@ -516,6 +627,8 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     """Extraction worker run in the process pool. Top-level so it is picklable."""
     url, opts = req.url, req.opts
     download, process = req.download, req.process
+    capture_player_loudness()
+    _PLAYER_LOUDNESS.clear()
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it;
     # the copy keeps the opts profile immutable across a worker's extractions.
     try:
@@ -747,6 +860,11 @@ _STREAM_CACHE_FIELDS = frozenset(
         # WAV and AIFF report no acodec, so _encode_bitrate_kbps reads this too:
         # a cache hit without it silently drops those back to 128k.
         "ext",
+        # A cache hit without it falls back to the scan, and its wait.
+        "loudness_lkfs",
+        # A cache hit without them leaves a livestream to the scan's header check.
+        "is_live",
+        "live_status",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
@@ -755,6 +873,8 @@ _STREAM_CACHE_FIELDS = frozenset(
         # sideways probe rather than a re-extraction. This key is TTL'd and
         # evictable, so it carries no golden-rule-12 obligation.
         "audio_candidates",
+        # One more such URL; a cache hit without it scans the 251 that plays.
+        "scan_url",
     }
 )
 
@@ -867,6 +987,528 @@ def _encode_bitrate_kbps(
     return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Loudness:
+    """One song's measured level: integrated loudness in LUFS and true peak in
+    dBFS, both as ffmpeg's ebur128 summary reports them."""
+
+    i: float
+    peak: float
+    # Seconds of the song the reading covers when it is a prefix of it; None when
+    # the scan read the whole song.
+    covered_secs: Optional[float] = None
+
+
+# ebur128's summary block, printed at info level once the stream ends. Anchored per
+# line, because the same words appear in its per-frame log.
+_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", re.M)
+
+# A month. What a song measures does not change, so the only reason to re-measure is
+# that the entry is cheap to lose, not that it goes stale. TTL'd and evictable, so it
+# carries none of the non-evictable-key obligations.
+_LOUDNESS_TTL: Final[int] = 30 * 86400
+
+# An hour, for "this one did not measure" and for a reading cut short by the scan's
+# deadline: without it every play re-pays the scan, and an hour is short enough that
+# a transient failure or a slow fetch heals.
+_LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
+# A song longer than this is measured from its first twenty minutes. On nine 43-150
+# minute mixes, albums, concerts and a podcast that prefix landed within 1.1 LU of
+# the whole, against up to 9.8 LU off the target unmeasured; re-scanning reads the
+# same prefix, so it is cached like a whole song. See docs/ARCHITECTURE.md#long-songs.
+_SCAN_MAX_AUDIO_SECS: Final[float] = 1200.0
+# All a scan may spend once it holds a slot. Past it ffmpeg is told to stop and prints
+# the summary of what it read, which is kept if it covers _PARTIAL_MIN_SECS.
+_SCAN_DEADLINE_SECS: Final[float] = 30.0
+# ffmpeg exited 18 ms after SIGINT, measured; this only bounds one that does not.
+_SCAN_STOP_GRACE_SECS: Final[float] = 2.0
+# How long a first SIGINT gets before the second (_interrupt).
+_SCAN_SECOND_SIGNAL_SECS: Final[float] = 0.25
+# Ten minutes landed within 2.5 LU of the whole on the same nine.
+_PARTIAL_MIN_SECS: Final[float] = 600.0
+# ffmpeg's closing progress line, printed even under -nostats: how much it read.
+_SCAN_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+# What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
+_SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-reconnect_on_http_error",
+    "5xx",
+)
+
+
+# googlevideo serves one request for more than this at about twice realtime, from
+# its first byte; yt-dlp chunks its own downloads at the same size.
+# See docs/ARCHITECTURE.md#loudness-normalization.
+_SCAN_RANGE_BYTES: Final[int] = 10 << 20
+# How many dead connections or 5xx answers one ranged scan rides out.
+_SCAN_FETCH_RETRIES: Final[int] = 2
+
+
+# How many scans run at once, process-wide. One CPU-bound scan keeps about two cores
+# busy (ffmpeg's demux, decode and filter threads); two leave most of a small host
+# to playback. See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_SCAN_CONCURRENCY: Final[int] = 2
+_scan_gate: Optional[asyncio.Semaphore] = None
+_scan_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _scan_slot() -> asyncio.Semaphore:
+    """The bound on concurrent scans, rebuilt when the running loop changes — a
+    Semaphore binds to the first loop that awaits it and refuses another."""
+    global _scan_gate, _scan_gate_loop
+    loop = asyncio.get_running_loop()
+    if _scan_gate is None or _scan_gate_loop is not loop:
+        _scan_gate = asyncio.Semaphore(_SCAN_CONCURRENCY)
+        _scan_gate_loop = loop
+    return _scan_gate
+
+
+def _loudness_cache_key(webpage_url: str) -> str:
+    return f"ytdl:loudness:v1:{webpage_url}"
+
+
+def _ranged_scan_size(stream_url: str) -> Optional[int]:
+    """The byte size of a googlevideo file, which is what a scan needs to ask for
+    it in ranges, or None for any other URL."""
+    parsed = urlparse(stream_url)
+    if not (parsed.hostname or "").endswith(".googlevideo.com"):
+        return None
+    try:
+        return int(parse_qs(parsed.query)["clen"][0])
+    except KeyError, ValueError:
+        return None
+
+
+async def _feed_ranges(stream_url: str, size: int, stdin: asyncio.StreamWriter) -> None:
+    """Write a googlevideo file to the scan's stdin, fetched in ranges small
+    enough to be served at full speed.
+
+    A dead connection or a 5xx resumes at the byte it reached, up to
+    _SCAN_FETCH_RETRIES times; any other answer than the range asked for raises.
+    stdin is closed either way, which is what lets ffmpeg finish.
+    """
+    session = _get_probe_session()
+    # The scan's own timeout bounds this; the session's backstop would undercut it.
+    timeout = aiohttp.ClientTimeout(total=None)
+    sent = deaths = 0
+    try:
+        while sent < size:
+            last = min(sent + _SCAN_RANGE_BYTES, size) - 1
+            try:
+                async with session.get(
+                    _probe_target(stream_url),
+                    headers={"Range": f"bytes={sent}-{last}"},
+                    timeout=timeout,
+                ) as response:
+                    if response.status != 206:
+                        # A 200 is the whole file again, from byte 0.
+                        raise aiohttp.ClientResponseError(
+                            response.request_info,
+                            response.history,
+                            status=response.status,
+                            message="the range was not served",
+                        )
+                    async for chunk in response.content.iter_any():
+                        stdin.write(chunk)
+                        await stdin.drain()
+                        sent += len(chunk)
+            except aiohttp.ClientError as e:
+                refused = isinstance(e, aiohttp.ClientResponseError) and e.status < 500
+                deaths += 1
+                if refused or deaths > _SCAN_FETCH_RETRIES:
+                    raise
+    finally:
+        stdin.close()
+
+
+class _EndlessInput(Exception):
+    """ffmpeg found no duration in a source yt-dlp did not call live: a radio
+    stream, which a scan would read until its deadline."""
+
+
+async def _read_scan_output(stderr: asyncio.StreamReader, live_gate: bool) -> bytes:
+    """Everything a scan prints. With `live_gate`, its input header is read first
+    and `Duration: N/A` raises _EndlessInput at once — measured: a direct MP3 prints
+    an estimated duration, an Icecast stream N/A."""
+    if not live_gate:
+        return await stderr.read()
+    head = bytearray()
+    while line := await stderr.readline():
+        head += line
+        if b"Duration:" in line:
+            if b"Duration: N/A" in line:
+                raise _EndlessInput
+            break
+    return bytes(head) + await stderr.read()
+
+
+async def _run_scan(
+    process: asyncio.subprocess.Process,
+    stream_url: str,
+    feed_bytes: Optional[int],
+    live_gate: bool,
+) -> tuple[bytes, bool]:
+    """Drive one scan to its end or its deadline: what ffmpeg printed, and whether
+    it was stopped early. stderr is read throughout — a pipe nobody drains stops
+    ffmpeg, which stops it reading stdin. A feed that fails raises."""
+    assert process.stderr is not None
+    printed = asyncio.create_task(_read_scan_output(process.stderr, live_gate))
+    feed: Optional[asyncio.Task[None]] = None
+    if feed_bytes is not None:
+        assert process.stdin is not None
+        feed = asyncio.create_task(_feed_ranges(stream_url, feed_bytes, process.stdin))
+    stopped = False
+    try:
+        try:
+            async with asyncio.timeout(_SCAN_DEADLINE_SECS) as deadline:
+                if feed is not None:
+                    await asyncio.shield(feed)
+                await asyncio.shield(printed)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            stopped = True
+            # The end of its input, or SIGINT: either way ffmpeg finishes the
+            # stream it has and prints the summary of it.
+            if feed is not None and not feed.done():
+                await cancel_task(feed)
+            else:
+                await _interrupt(process, printed)
+            async with asyncio.timeout(_SCAN_STOP_GRACE_SECS):
+                await asyncio.shield(printed)
+        # Its summary is in hand; one that lingers past this is killed below.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_SCAN_STOP_GRACE_SECS):
+                await process.wait()
+        return printed.result(), stopped
+    finally:
+        await cancel_task(feed)
+        await cancel_task(printed)
+
+
+async def _interrupt(
+    process: asyncio.subprocess.Process, printed: asyncio.Task[bytes]
+) -> None:
+    """Tell ffmpeg to finish what it has. It reads a first SIGINT only between
+    packets, so one blocked on a stalled fetch needs a second to break the read —
+    measured on 7.1.5 and 9.0.2. A third would abort it without the summary."""
+    for _ in range(2):
+        with contextlib.suppress(ProcessLookupError):
+            process.send_signal(signal.SIGINT)
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_SCAN_SECOND_SIGNAL_SECS):
+                await asyncio.shield(printed)
+                return
+
+
+def _scan_covered_secs(stderr: str) -> Optional[float]:
+    """How much audio a scan read, from ffmpeg's closing progress line."""
+    found = _SCAN_TIME.findall(stderr)
+    if not found:
+        return None
+    hours, minutes, seconds = found[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
+    """The I and Peak of an ebur128 summary, or None when either is missing —
+    which is what a scan that died mid-stream looks like, and is not a level."""
+    found = {key: value for key, value in _LOUDNESS_LINE.findall(stderr)}
+    if "I" not in found or "Peak" not in found:
+        return None
+    try:
+        return Loudness(i=float(found["I"]), peak=float(found["Peak"]))
+    except ValueError:
+        return None
+
+
+def normalize_gain_db(lufs: float) -> float:
+    """The gain that puts a song of this integrated loudness on the target,
+    clamped."""
+    lo, hi = _LOUDNESS_GAIN_CLAMP_DB
+    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - lufs))
+
+
+# cache key -> the scan measuring that song right now. Callers join it through a
+# shield, so one waiter's cancellation never stops a scan another is waiting for.
+# See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_INFLIGHT_SCANS: dict[str, asyncio.Future[Optional[Loudness]]] = {}
+
+
+async def measure_loudness(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    *,
+    duration: Optional[float] = None,
+    wait: Optional[float] = None,
+) -> Optional[Loudness]:
+    """How loud this song is, from the cache when it has been measured before.
+
+    None means "play it at its own level": a failed scan, no summary in what ffmpeg
+    printed, or a scan still running after `wait` seconds. Never raises — a level
+    is an improvement to a play, not a precondition for one.
+
+    The scan itself is one task per song, shared by every caller: giving up on it
+    (`wait`, or a cancellation) leaves it running to its own bound, and what it
+    measures is cached for the next play.
+    """
+    span = trace.get_current_span()
+    cache_key = _loudness_cache_key(webpage_url)
+    cached = await cache_get(redis, cache_key)
+    if isinstance(cached, dict) and cached.get("unmeasured"):
+        span.set_attribute("ytdl.loudness_source", "cached-unmeasured")
+        return None
+    if isinstance(cached, dict) and "i" in cached and "peak" in cached:
+        try:
+            covered = cached.get("covered")
+            measured = Loudness(
+                i=float(cached["i"]),
+                peak=float(cached["peak"]),
+                covered_secs=None if covered is None else float(covered),
+            )
+        except TypeError, ValueError:
+            measured = None
+        if measured is not None:
+            span.set_attribute("ytdl.loudness_source", "cache")
+            span.set_attribute("ytdl.loudness_lufs", measured.i)
+            return measured
+
+    job = _INFLIGHT_SCANS.get(cache_key)
+    if job is None:
+        job = _start_scan(stream_url, webpage_url, redis, cache_key, duration)
+    else:
+        span.set_attribute("ytdl.loudness_joined_scan", True)
+    try:
+        async with asyncio.timeout(wait):
+            measured = await asyncio.shield(job)
+    except TimeoutError:
+        span.set_attribute("ytdl.loudness_source", "pending")
+        return None
+    except asyncio.CancelledError:
+        # The job itself was cancelled (shutdown), not this caller: no level.
+        task = asyncio.current_task()
+        if job.cancelled() and task is not None and not task.cancelling():
+            return None
+        raise
+    span.set_attribute("ytdl.loudness_source", "scan" if measured else "none")
+    if measured is not None:
+        span.set_attribute("ytdl.loudness_lufs", measured.i)
+    return measured
+
+
+def _start_scan(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    cache_key: str,
+    duration: Optional[float],
+) -> asyncio.Future[Optional[Loudness]]:
+    """Start the one scan of this song, registered until it settles."""
+    job = asyncio.ensure_future(
+        _scan_in_its_own_span(stream_url, webpage_url, redis, duration)
+    )
+    _INFLIGHT_SCANS[cache_key] = job
+
+    # Registered before anything awaits the job, so a caller arriving after it
+    # settles reads the cache rather than joining a finished scan.
+    def _settle(finished: asyncio.Future[Optional[Loudness]]) -> None:
+        if _INFLIGHT_SCANS.get(cache_key) is finished:
+            del _INFLIGHT_SCANS[cache_key]
+        if not finished.cancelled() and finished.exception() is not None:
+            log.warning(
+                f"loudness scan crashed for {webpage_url}: {finished.exception()!r}"
+            )
+
+    job.add_done_callback(_settle)
+    return job
+
+
+async def _scan_in_its_own_span(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    duration: Optional[float],
+) -> Optional[Loudness]:
+    """_scan_loudness under a span of its own, and under the process-wide bound: it
+    outlives the span of the caller that started it, and an ended span drops every
+    attribute written to it. Its own deadline starts once it holds a slot."""
+    with _tracer.start_as_current_span("ytdl.loudness_scan") as span:
+        span.set_attribute("ytdl.url", webpage_url)
+        queued = time.monotonic()
+        async with _scan_slot():
+            span.set_attribute(
+                "ytdl.loudness_scan_queued_secs", round(time.monotonic() - queued, 3)
+            )
+            return await _scan_loudness(stream_url, webpage_url, redis, duration)
+
+
+async def _scan_loudness(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    duration: Optional[float],
+) -> Optional[Loudness]:
+    """Measure one song with ffmpeg's ebur128 and cache the answer either way.
+
+    The child is spawned with asyncio, not run in an executor, so a cancellation
+    KILLS it — which only the process's own shutdown does, since every caller
+    joins through a shield.
+    """
+    span = trace.get_current_span()
+    cache_key = _loudness_cache_key(webpage_url)
+    process: Optional[asyncio.subprocess.Process] = None
+    stderr = b""
+    stopped = False
+    failure: Optional[str] = None
+    capped = duration is not None and duration > _SCAN_MAX_AUDIO_SECS
+    # A googlevideo file over the range is fetched here and piped in: ffmpeg's one
+    # request for it is throttled past any deadline this scan has. A capped one is
+    # fed the same share of its bytes as of its length: the serves are near-
+    # constant bitrate. Anything else ffmpeg reads itself, with the play path's
+    # reconnects, and stops at the cap on its own.
+    size = _ranged_scan_size(stream_url) or 0
+    ranged = size > _SCAN_RANGE_BYTES
+    feed_bytes: Optional[int] = None
+    if ranged:
+        feed_bytes = (
+            min(size, math.ceil(size * _SCAN_MAX_AUDIO_SECS / duration))
+            if capped and duration
+            else size
+        )
+        source: tuple[str, ...] = ("-i", "pipe:0")
+    else:
+        cap = f"{_SCAN_MAX_AUDIO_SECS:g}"
+        source = (*_SCAN_RECONNECT_ARGS, "-t", cap, "-i", stream_url)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-nostats",
+            "-loglevel",
+            "info",
+            *source,
+            "-vn",
+            "-af",
+            # Sample peak, which is the one `alimiter` holds the ceiling on, and it
+            # costs what asking for no peak costs: 0.35 s against 0.82 s for
+            # `peak=true` on a 3½-minute song, measured.
+            "ebur128=framelog=quiet:peak=sample",
+            "-f",
+            "null",
+            "-",
+            stdin=asyncio.subprocess.PIPE if ranged else None,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr, stopped = await _run_scan(
+            process, stream_url, feed_bytes, live_gate=duration is None
+        )
+    except _EndlessInput:
+        failure = "ffmpeg found no duration: a live stream"
+    except aiohttp.ClientResponseError as e:
+        # Not its repr, which carries the signed URL.
+        failure = f"HTTP {e.status} for a range"
+    except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
+        failure = repr(e)
+    finally:
+        # A failure, a stop that did not end it and a cancellation all land here,
+        # and each leaves a child holding a CDN connection. kill(), not
+        # terminate(): this one has no cleanup to do.
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    printed = stderr.decode("utf-8", "replace")
+    measured = None if failure else parse_ebur128_summary(printed)
+    covered = _scan_covered_secs(printed)
+    short = covered is None or covered < _PARTIAL_MIN_SECS
+    if measured is not None and stopped and short:
+        failure = f"stopped at its deadline after {covered or 0.0:.0f}s of audio"
+        measured = None
+    if measured is None:
+        log.warning(
+            f"loudness scan failed for {webpage_url}: {failure}"
+            if failure
+            else f"loudness scan printed no summary for {webpage_url}"
+        )
+        span.set_attribute("ytdl.loudness_scan_failed", True)
+        await cache_set(
+            redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
+        )
+        return None
+    value: dict[str, float] = {"i": measured.i, "peak": measured.peak}
+    if stopped or capped:
+        covered = covered if covered is not None else _SCAN_MAX_AUDIO_SECS
+        measured = replace(measured, covered_secs=covered)
+        value["covered"] = covered
+        span.set_attribute("ytdl.loudness_covered_secs", value["covered"])
+    span.set_attribute("ytdl.loudness_lufs", measured.i)
+    span.set_attribute("ytdl.loudness_scan_stopped", stopped)
+    # A reading cut short by the deadline is a slow fetch's, retried within the
+    # hour; a capped one is what every re-scan would read again.
+    ttl = _LOUDNESS_UNMEASURED_TTL if stopped else _LOUDNESS_TTL
+    await cache_set(redis, cache_key, value, ttl)
+    return measured
+
+
+def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
+    """YouTube's own figure for this song in LUFS, when the extraction carried one.
+    Re-validated because it has been through the stream cache."""
+    lkfs = data.get("loudness_lkfs")
+    if (
+        not isinstance(lkfs, int | float)
+        or isinstance(lkfs, bool)
+        or not math.isfinite(lkfs)
+    ):
+        return None
+    span = trace.get_current_span()
+    span.set_attribute("ytdl.loudness_source", "youtube")
+    span.set_attribute("ytdl.loudness_lufs", float(lkfs))
+    return float(lkfs)
+
+
+# yt-dlp's live_status values for a stream with no end yet.
+_LIVE_STATUSES: Final = frozenset({"is_live", "is_upcoming", "post_live"})
+
+
+def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
+    """The URL a scan of this song reads, or None when it is not to be scanned.
+    Livestreams never are: the scan would read until its bound and measure whatever
+    it happened to catch. A song with no duration that yt-dlp does not call live — a
+    direct file — is scanned, and the scan itself refuses one ffmpeg finds endless."""
+    if not data.get("url"):
+        return None
+    if data.get("is_live") or data.get("live_status") in _LIVE_STATUSES:
+        return None
+    return _smallest_opus_url(data) or data["url"]
+
+
+def _smallest_opus_url(data: YTDLVideoInfo) -> Optional[str]:
+    """The served track's itag 249, lifted by the worker or on the ladder. Its
+    integrated loudness matched 251's within 0.1 LU on eleven videos at 35-42 % of
+    the bytes; its sample peak reads up to 2.9 dB higher, which only the span
+    reports. See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    served = _ITAG_FORMAT_ID.fullmatch(str(data.get("format_id") or ""))
+    if served is None:
+        return None
+    if lifted := data.get("scan_url"):
+        return lifted
+    # The track suffix, so a dub's scan reads the dub: `251-23` -> `249-23`.
+    twin = "249" + served[0][len(served[1]) :]
+    for candidate in data.get("audio_candidates") or []:
+        url = candidate.get("url")
+        if candidate.get("format_id") == twin and url:
+            return url
+    return None
+
+
 def _source_cache_key(search: str) -> str:
     """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
     one entry — but never for a link, scheme-less or not, as parse_url reads one:
@@ -964,16 +1606,50 @@ def _passthrough_itag(format_id: object) -> Optional[str]:
 _OGG_HEADER_PACKETS = 2
 
 
-def _audio_filters(volume: float) -> list[str]:
+# EBU R128 target. YouTube's own reference, which is why most tracks move by a
+# decibel or two rather than being rebuilt: matching it also matches what a listener
+# hears on YouTube itself.
+_LOUDNESS_TARGET_LUFS: Final[float] = -14.0
+# What a measured song's gain is allowed to be. Past these a track is not merely
+# quiet — it is a field recording or a mastering error, and moving it by 30 dB
+# amplifies its noise floor into the room.
+_LOUDNESS_GAIN_CLAMP_DB: Final[tuple[float, float]] = (-20.0, 12.0)
+# The ceiling every loudness mode applies, and the headroom a gain is read against.
+# Sample peak, which is what alimiter holds.
+_PEAK_CEILING_DBFS: Final[float] = -1.0
+# The same ceiling in the linear unit the filter takes, so the two cannot drift.
+# `level=disabled` holds it to a ceiling rather than a leveller, and `latency=1`
+# aligns the lookahead so everything under the ceiling comes through unchanged.
+# Both measured in the ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
+_PEAK_LIMITER: Final[str] = (
+    f"alimiter=limit={10 ** (_PEAK_CEILING_DBFS / 20):.3f}:level=disabled:latency=1"
+)
+
+
+def _audio_filters(
+    volume: float,
+    loudness: LoudnessMode = LoudnessMode.OFF,
+    gain_db: Optional[float] = None,
+) -> list[str]:
     """The -filter:a chain for one song, in application order.
 
     The ONLY place a filter enters the argv. _passthrough_codec refuses whenever
     this is non-empty, so a filter added here disables the remux path by
     construction rather than by a second test that could disagree with it.
+
+    Volume, then the measured gain, then the ceiling: a limiter has to cap the
+    signal the listener actually receives, so a guild playing at 200 % is capped
+    after its gain rather than before it. NORMALIZE without a gain — the scan
+    failed or timed out — still takes the ceiling, and the song plays at its own
+    level. See docs/ARCHITECTURE.md#loudness-normalization.
     """
     filters = []
     if volume != 1.0:
         filters.append(f"volume={volume}")
+    if loudness is LoudnessMode.NORMALIZE and gain_db is not None:
+        filters.append(f"volume={gain_db:.1f}dB")
+    if loudness is not LoudnessMode.OFF:
+        filters.append(_PEAK_LIMITER)
     return filters
 
 
@@ -2100,6 +2776,27 @@ class YTDL(discord.FFmpegOpusAudio):
             return _enrich_queueobject(qo, data)
         return None
 
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.prefetch_loudness")
+    async def prefetch_loudness(
+        cls, qo: QueueObject, redis: Optional[aioredis.Redis]
+    ) -> None:
+        """Measure a queued song before its turn, from the stream URL its warm just
+        cached, so a normalizing guild's play reads the level from Redis instead of
+        waiting on the scan. Waits for the whole scan: nobody is listening here.
+        See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        if redis is None:
+            return
+        data = await _stream_cache_get(redis, _stream_cache_key(qo.webpage_url))
+        if data is None or _player_loudness(data) is not None:
+            return
+        target = _scan_target(data)
+        if target is not None:
+            await measure_loudness(
+                target, qo.webpage_url, redis, duration=data.get("duration")
+            )
+
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
         """The audio URLs to try for this song, best first.
@@ -2319,6 +3016,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         *,
         volume: float = 1.0,
+        loudness: LoudnessMode = LoudnessMode.OFF,
         channel_bitrate: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         allow_reextract: bool = True,
@@ -2344,10 +3042,36 @@ class YTDL(discord.FFmpegOpusAudio):
             # song still plays. MusicPlayer's start path announces the offset.
             ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
             ffmpeg_opts["options"] += " -ss 0"
+        gain_db: Optional[float] = None
+        if loudness is LoudnessMode.NORMALIZE:
+            span = trace.get_current_span()
+            # YouTube's own figure costs nothing; the scan is for a song without one.
+            lufs = _player_loudness(data)
+            target = _scan_target(data) if lufs is None else None
+            if target is not None:
+                measured = await measure_loudness(
+                    target,
+                    qo.webpage_url,
+                    redis,
+                    duration=data.get("duration"),
+                    wait=config.loudness_scan_timeout_secs(),
+                )
+                if measured is not None:
+                    lufs = measured.i
+                    # The gain asked for, against what fits under the ceiling. A
+                    # song with less headroom than gain lands short of the target,
+                    # because the limiter holds back the difference.
+                    span.set_attribute(
+                        "ytdl.normalize_headroom_db",
+                        _PEAK_CEILING_DBFS - measured.peak,
+                    )
+            if lufs is not None:
+                gain_db = normalize_gain_db(lufs)
+                span.set_attribute("ytdl.normalize_gain_db", gain_db)
         # Chain first, codec second: ffmpeg refuses `-c:a copy` alongside any
         # filtergraph, and asking _audio_filters what it produced keeps the two
         # from disagreeing when a filter is added.
-        filters = _audio_filters(volume)
+        filters = _audio_filters(volume, loudness, gain_db)
         codec = _passthrough_codec(data, filtered=bool(filters))
         if filters:
             ffmpeg_opts["options"] += f" -filter:a {','.join(filters)}"

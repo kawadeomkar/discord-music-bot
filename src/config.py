@@ -234,6 +234,18 @@ stream_probe_timeout_secs = _secs(
 # pay the probe twice, so this is already up to 10s of silence before a song starts.
 STREAM_PROBE_TIMEOUT_MAX_SECS: Final[float] = 5.0
 
+# The ebur128 scan is the only thing between a NORMALIZE guild's first play of a
+# song YouTube sent no loudness for and its audio, once per song per cache TTL.
+# Measured live, a 4-minute song takes about half a second and an hour-long one
+# about six; past this the song plays at its own level.
+_MIN_LOUDNESS_SCAN_SECS: Final[float] = 1.0
+loudness_scan_timeout_secs = _secs(
+    "LOUDNESS_SCAN_TIMEOUT_SECS", 8.0, minimum=_MIN_LOUDNESS_SCAN_SECS
+)
+# Not a knob: the most `-settings bot loudness-scan-timeout` accepts. Every second
+# here is silence before the first play of a song in a normalizing guild.
+LOUDNESS_SCAN_TIMEOUT_MAX_SECS: Final[float] = 20.0
+
 # The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
 # is capped well under that; the floor keeps the touch a cadence, not a spin.
 _MIN_LIVENESS_SECS: Final[float] = 1.0

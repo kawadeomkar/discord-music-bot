@@ -369,11 +369,11 @@ def reset_structlog_contextvars() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def settle_youtube_background_jobs() -> Iterator[None]:
-    """Drain the two fire-and-forget registries src.youtube keeps between tests.
+    """Drain the fire-and-forget registries src.youtube keeps between tests.
 
-    Both outlive the call that started them by design — the stream-cache warm the
-    reply does not wait for, and the source-cache revalidation served behind a stale
-    hit. Each test gets its own event loop, so one left pending is a task destroyed
+    Each outlives the call that started them by design — the stream-cache warm the
+    reply does not wait for, the source-cache revalidation served behind a stale
+    hit, and the loudness scan a caller stopped waiting for. Each test gets its own event loop, so one left pending is a task destroyed
     on a closed loop, and its patches are long gone by the time it would run.
     """
     import src.youtube as youtube
@@ -382,10 +382,12 @@ def settle_youtube_background_jobs() -> Iterator[None]:
     pending = [
         *youtube._INFLIGHT_STREAM_WARMS.values(),
         *youtube._SOURCE_REVALIDATIONS,
+        *youtube._INFLIGHT_SCANS.values(),
     ]
     for job in pending:
         job.cancel()
     youtube._INFLIGHT_STREAM_WARMS.clear()
+    youtube._INFLIGHT_SCANS.clear()
     youtube._SOURCE_REVALIDATIONS.clear()
 
 

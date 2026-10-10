@@ -1,6 +1,8 @@
 """Tests for src/youtube.py — YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import math
+import signal
 import copy
 import pathlib
 import contextlib
@@ -13,8 +15,8 @@ import time
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
-from collections.abc import Callable, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import Awaitable, Callable, Iterator
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aiohttp
 import discord
@@ -28,14 +30,26 @@ import pytest
 from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
+from src import config
+from src.redis_client import cache_set
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
 from src.queue_item import NpCard, NpHostRef, QueueObject
 from src import youtube
 from src.play_placement import ResolveWaitExpired
+from src.guild_state import LoudnessMode
 from src.youtube import (
     YTDL,
+    Loudness,
+    _audio_filters,
+    _LOUDNESS_GAIN_CLAMP_DB,
+    _LOUDNESS_TARGET_LUFS,
+    _PEAK_LIMITER,
     _encode_bitrate_kbps,
+    _loudness_cache_key,
+    measure_loudness,
+    normalize_gain_db,
+    parse_ebur128_summary,
     YTDL_OPTS,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
@@ -7347,6 +7361,1873 @@ class TestYtPlaylistProgress:
 
         assert seen == [(0, 1671), (25, None)]
         assert youtube._PROGRESS_SUBSCRIBERS == {}
+
+
+class TestEbur128Summary:
+    """ffmpeg prints the summary once, at info level, after the stream ends."""
+
+    _CAPTURED = (
+        "[Parsed_ebur128_0 @ 0x14f6069b0] Summary:\n"
+        "\n"
+        "  Integrated loudness:\n"
+        "    I:         -19.7 LUFS\n"
+        "    Threshold: -30.4 LUFS\n"
+        "\n"
+        "  Loudness range:\n"
+        "    LRA:         8.2 LU\n"
+        "    Threshold: -34.6 LUFS\n"
+        "    LRA low:   -25.1 LUFS\n"
+        "    LRA high:  -16.9 LUFS\n"
+        "\n"
+        "  True peak:\n"
+        "    Peak:       -3.8 dBFS\n"
+    )
+
+    def test_the_captured_block_parses(self) -> None:
+        assert parse_ebur128_summary(self._CAPTURED) == Loudness(i=-19.7, peak=-3.8)
+
+    def test_nothing_printed_is_not_a_level(self) -> None:
+        assert parse_ebur128_summary("") is None
+
+    def test_a_half_written_summary_is_not_a_level(self) -> None:
+        """What a scan killed mid-stream leaves behind."""
+        assert parse_ebur128_summary("    I:         -19.7 LUFS\n") is None
+
+    def test_a_number_the_pattern_accepts_and_float_refuses_is_not_a_level(
+        self,
+    ) -> None:
+        """`[\\d.]+` admits `-.` and `1.2.3`, which float() refuses. A level is an
+        improvement to a play, so an unreadable one plays at its own."""
+        for value in ("-.", "1.2.3", ".."):
+            summary = f"  I:  {value} LUFS\n  Peak:  -3.0 dBFS\n"
+            assert youtube._LOUDNESS_LINE.findall(summary)[0] == ("I", value)
+            assert parse_ebur128_summary(summary) is None
+
+    def test_the_last_match_wins_so_the_summary_beats_the_frames(self) -> None:
+        """`framelog=info` prints the same two words per frame and the summary LAST.
+        The pick is a dict comprehension, which keeps the last of a repeated key."""
+        summary = (
+            "  I:  -30.0 LUFS\n  Peak:  -20.0 dBFS\n"
+            "  I:  -14.1 LUFS\n  Peak:   -0.9 dBFS\n"
+        )
+        assert parse_ebur128_summary(summary) == Loudness(i=-14.1, peak=-0.9)
+
+    def test_the_per_frame_log_is_not_mistaken_for_the_summary(self) -> None:
+        """`framelog=quiet` suppresses it, but the words are the same, and a
+        per-frame M/I line is an instantaneous reading rather than the whole song."""
+        frame = "[Parsed_ebur128_0 @ 0x1] t: 1.9 TARGET:-23 M: -22.0 S: -22.5 I: -21.9 LUFS  LRA: 0.9 LU"
+        assert parse_ebur128_summary(frame) is None
+
+
+class TestNormalizeGain:
+    """The gain that puts a song on the target, and the clamp that keeps a field
+    recording from being amplified into the room."""
+
+    def test_a_song_on_the_target_is_not_moved(self) -> None:
+        assert normalize_gain_db(_LOUDNESS_TARGET_LUFS) == 0.0
+
+    def test_a_quiet_song_is_raised(self) -> None:
+        assert normalize_gain_db(-19.7) == pytest.approx(5.7)
+
+    def test_a_loud_song_is_lowered(self) -> None:
+        assert normalize_gain_db(-8.0) == pytest.approx(-6.0)
+
+    def test_the_clamp_is_twenty_down_and_twelve_up(self) -> None:
+        """Asserting against the constant itself passes for any value, and these two
+        bound how far a mastering error can move a room."""
+        assert _LOUDNESS_GAIN_CLAMP_DB == (-20.0, 12.0)
+
+    def test_a_silent_recording_is_clamped(self) -> None:
+        assert normalize_gain_db(-60.0) == (_LOUDNESS_GAIN_CLAMP_DB[1])
+
+    def test_a_mastering_error_is_clamped_the_other_way(self) -> None:
+        assert normalize_gain_db(6.0) == (_LOUDNESS_GAIN_CLAMP_DB[0])
+
+
+class TestLoudnessFilters:
+    """What each mode contributes to the chain, and in what order. The order is the
+    invariant: a ceiling has to apply to the signal the listener receives."""
+
+    def test_off_emits_nothing_so_the_copy_path_survives(self) -> None:
+        """The only mode that can stay bit-exact: any filtergraph refuses
+        `-c:a copy`, so OFF has to produce an EMPTY list, not a no-op filter."""
+        assert _audio_filters(1.0, LoudnessMode.OFF, None) == []
+
+    def test_peak_is_the_limiter_alone(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.PEAK, None) == [_PEAK_LIMITER]
+
+    def test_peak_ignores_a_gain_it_was_handed(self) -> None:
+        """A measured gain belongs to NORMALIZE. PEAK caps peaks and moves nothing."""
+        assert _audio_filters(1.0, LoudnessMode.PEAK, -6.0) == [_PEAK_LIMITER]
+
+    def test_normalize_is_the_gain_then_the_ceiling(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, -6.0) == [
+            "volume=-6.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_volume_leads_the_chain(self) -> None:
+        """A guild at 200% is capped AFTER its gain, or the ceiling describes a
+        signal nobody receives."""
+        assert _audio_filters(2.0, LoudnessMode.NORMALIZE, 3.0) == [
+            "volume=2.0",
+            "volume=3.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_normalize_without_a_measurement_still_takes_the_ceiling(self) -> None:
+        """A scan that failed or timed out leaves the song at its own level rather
+        than unplayed."""
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, None) == [_PEAK_LIMITER]
+
+    def test_the_limiter_disables_auto_levelling(self) -> None:
+        """alimiter auto-levels its output by default, which would RAISE a quiet
+        song — the opposite of the setting's purpose. `latency=1` is what keeps it
+        transparent below the ceiling instead of shifting every sample by its 5 ms
+        lookahead; the ffmpeg tier measures both halves."""
+        assert "level=disabled" in _PEAK_LIMITER
+        assert "latency=1" in _PEAK_LIMITER
+
+
+class _ScanChild:
+    """ffmpeg as a scan drives it: stderr that reaches EOF when the child ends, a
+    SIGINT that ends it having printed `on_stop` (or is ignored when that is None),
+    and a kill that ends it having printed nothing."""
+
+    def __init__(
+        self,
+        stderr: bytes = b"",
+        *,
+        hangs: bool = False,
+        on_stop: Optional[bytes] = None,
+        signals_to_stop: int = 1,
+    ) -> None:
+        self.returncode: Optional[int] = None
+        self.printed = stderr
+        self.on_stop = on_stop
+        self.signals_to_stop = signals_to_stop
+        self.ended = asyncio.Event()
+        if not hangs:
+            self.ended.set()
+        self.stdin: Any = None
+        self.stderr = MagicMock()
+        self.stderr.read = self._read
+        self.stderr.readline = self._readline
+        self.kill = MagicMock(side_effect=self._killed)
+        self.send_signal = MagicMock(side_effect=self._signalled)
+        # What readline() has handed out; read() returns the rest.
+        self.consumed = 0
+
+    async def _read(self) -> bytes:
+        await self.ended.wait()
+        return self.printed[self.consumed :]
+
+    async def _readline(self) -> bytes:
+        """The input header is printed before any audio is read, so a line that is
+        there already is handed out before the child ends."""
+        if b"\n" not in self.printed[self.consumed :]:
+            await self.ended.wait()
+        end = self.printed.find(b"\n", self.consumed)
+        end = len(self.printed) if end < 0 else end + 1
+        line = self.printed[self.consumed : end]
+        self.consumed = end
+        return line
+
+    async def wait(self) -> int:
+        await self.ended.wait()
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def _killed(self) -> None:
+        self.returncode = -9
+        self.printed = b""
+        self.ended.set()
+
+    def _signalled(self, _signal: int) -> None:
+        self.signals_to_stop -= 1
+        if self.on_stop is not None and self.signals_to_stop <= 0:
+            self.printed = self.on_stop
+            self.returncode = 255
+            self.ended.set()
+
+
+class TestMeasureLoudness:
+    """The one thing between a normalizing guild's first play of a song and its
+    audio. Bounded, cached for a month, and killed by a cancellation — the prefetch
+    this runs inside is cancelled by every bulk queue mutation."""
+
+    _URL = "https://yt.com/watch?v=loud"
+
+    @staticmethod
+    def _child(
+        *,
+        stderr: bytes = b"",
+        hangs: bool = False,
+        on_stop: Optional[bytes] = None,
+        signals_to_stop: int = 1,
+    ) -> tuple[Any, Callable[..., Awaitable[Any]]]:
+        """A stand-in for the ffmpeg child, and the create_subprocess_exec that
+        answers with it. `hangs` never ends on its own."""
+        process = _ScanChild(
+            stderr, hangs=hangs, on_stop=on_stop, signals_to_stop=signals_to_stop
+        )
+
+        async def spawn(*_args: Any, **_kwargs: Any) -> _ScanChild:
+            return process
+
+        return process, spawn
+
+    async def test_a_scan_measures_and_caches(self, fake_redis: Any) -> None:
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        assert await fake_redis.get(_loudness_cache_key(self._URL)) is not None
+
+    async def test_a_measured_level_lives_a_month(self, fake_redis: Any) -> None:
+        """Documented as "remembers the answer for a month". A regression to a day
+        turns a normalizing guild's cached play into a daily re-scan and a daily
+        extra fetch of the song."""
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        ttl = await fake_redis.ttl(_loudness_cache_key(self._URL))
+        assert youtube._LOUDNESS_TTL == 30 * 86400
+        assert youtube._LOUDNESS_TTL - 10 <= ttl <= youtube._LOUDNESS_TTL
+
+    async def test_a_cache_hit_spawns_nothing(self, fake_redis: Any) -> None:
+        """The whole point of the cache: a song measured once never pays again, so a
+        replay and a second guild both start immediately."""
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"i": -12.5, "peak": -1.2}, 60
+        )
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("spawned ffmpeg for a song already measured")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-12.5, peak=-1.2)
+
+    async def test_an_unreadable_cache_entry_is_re_measured(
+        self, fake_redis: Any
+    ) -> None:
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"i": "loud", "peak": -1.0}, 60
+        )
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+
+    async def test_a_child_that_ignores_the_stop_is_killed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dead child left behind holds a CDN connection open for the life of the
+        process."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        monkeypatch.setattr(youtube, "_SCAN_STOP_GRACE_SECS", 0.01)
+        process, spawn = self._child(hangs=True)
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await asyncio.wait_for(
+                measure_loudness("https://cdn/a", self._URL, None), 5
+            )
+
+        assert measured is None
+        assert process.send_signal.call_args_list == [call(signal.SIGINT)] * 2
+        process.kill.assert_called_once()
+
+    @staticmethod
+    def _gated_child(
+        stderr: bytes,
+    ) -> tuple[Any, asyncio.Event, list[int], Callable[..., Awaitable[Any]]]:
+        """A child that finishes only once the returned event is set, and a spawn
+        that counts how many times it was asked for one."""
+        process = _ScanChild(stderr, hangs=True)
+        spawned: list[int] = []
+
+        async def spawn(*_args: Any, **_kwargs: Any) -> _ScanChild:
+            spawned.append(1)
+            return process
+
+        return process, process.ended, spawned, spawn
+
+    async def test_a_cancelled_caller_leaves_the_scan_to_finish_and_cache(
+        self, fake_redis: Any
+    ) -> None:
+        """Every bulk queue mutation cancels the prefetch this runs inside. The scan
+        it started is the one the next play, or another guild, is waiting on."""
+        process, release, _, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            task = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, fake_redis)
+            )
+            await settle()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            job = youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)]
+            release.set()
+            assert await job == Loudness(i=-19.7, peak=-3.8)
+
+        process.kill.assert_not_called()
+        assert await fake_redis.get(_loudness_cache_key(self._URL)) is not None
+        assert not youtube._INFLIGHT_SCANS
+
+    async def test_callers_of_one_song_share_one_scan(self, fake_redis: Any) -> None:
+        """Two guilds missing the cache together, or a warm and the play it ran
+        ahead of: one fetch of the song, one answer for both."""
+        _, release, spawned, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            first = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, fake_redis)
+            )
+            second = asyncio.ensure_future(
+                measure_loudness("https://cdn/b", self._URL, fake_redis)
+            )
+            await settle()
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        assert spawned == [1]
+        assert results == [Loudness(i=-19.7, peak=-3.8)] * 2
+
+    async def test_a_caller_that_stops_waiting_plays_without_and_the_scan_caches(
+        self, fake_redis: Any
+    ) -> None:
+        """`wait` bounds the silence before a play, not the scan: what the scan
+        measures after the song started is there for its next play."""
+        _, release, _, spawn = self._gated_child(TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await measure_loudness(
+                    "https://cdn/a", self._URL, fake_redis, wait=0.01
+                )
+                is None
+            )
+            release.set()
+            await youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)]
+
+        assert orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL))) == {
+            "i": -19.7,
+            "peak": -3.8,
+        }
+
+    async def test_a_scan_cancelled_at_shutdown_kills_its_child(self) -> None:
+        """The one cancellation that reaches the scan itself. Its caller was not
+        cancelled, so it is answered "no level" rather than a CancelledError it
+        would read as its own."""
+        process, _, _, spawn = self._gated_child(b"")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            caller = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, None)
+            )
+            await settle()
+            youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)].cancel()
+            assert await caller is None
+
+        process.kill.assert_called_once()
+
+    async def test_no_more_than_two_scans_run_at_once(self) -> None:
+        """A long scan keeps about two cores busy; eight at once saturated a
+        twelve-core host and every one of them missed its bound."""
+        assert youtube._SCAN_CONCURRENCY == 2
+        process, release, spawned, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            songs = [
+                asyncio.ensure_future(
+                    measure_loudness(
+                        "https://cdn/a", f"{self._URL}{n}", None, duration=240
+                    )
+                )
+                for n in range(3)
+            ]
+            await settle()
+            assert len(spawned) == 2
+            release.set()
+            results = await asyncio.gather(*songs)
+
+        assert len(spawned) == 3
+        assert all(r == Loudness(i=-19.7, peak=-3.8) for r in results)
+
+    def test_the_bound_is_rebuilt_for_a_new_loop(self) -> None:
+        """A Semaphore binds to the first loop that waits on it, and the bot's loop
+        is not the first one a process (or a test run) creates."""
+
+        async def grab() -> asyncio.Semaphore:
+            return youtube._scan_slot()
+
+        first, second = asyncio.run(grab()), asyncio.run(grab())
+        assert first is not second
+
+    async def test_a_cancelled_scan_gives_its_slot_back(self) -> None:
+        process, _, spawned, spawn = self._gated_child(b"")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            for n in range(youtube._SCAN_CONCURRENCY):
+                asyncio.ensure_future(
+                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                )
+            await settle()
+            for job in list(youtube._INFLIGHT_SCANS.values()):
+                job.cancel()
+            await settle()
+            assert not youtube._scan_slot().locked()
+
+        assert len(spawned) == youtube._SCAN_CONCURRENCY
+
+    @staticmethod
+    def _printed(covered: str) -> bytes:
+        """A summary and the closing progress line that says how much was read."""
+        return (
+            TestEbur128Summary._CAPTURED + f"size=N/A time={covered} bitrate=N/A\n"
+        ).encode()
+
+    async def test_a_scan_reads_at_most_twenty_minutes(self) -> None:
+        """Measured on nine 43-150 minute recordings, a 20-minute prefix landed
+        within 1.1 LU of the whole; reading more is bytes and CPU for nothing."""
+        assert youtube._SCAN_MAX_AUDIO_SECS == 1200.0
+        argv: list[str] = []
+        _, spawn = self._child(stderr=self._printed("00:04:00.00"))
+
+        async def record(*args: Any, **kwargs: Any) -> Any:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None, duration=240)
+
+        assert argv[argv.index("-t") + 1] == "1200"
+        assert argv.index("-t") < argv.index("-i")
+
+    async def test_a_song_within_the_cap_is_a_whole_reading(
+        self, fake_redis: Any
+    ) -> None:
+        _, spawn = self._child(stderr=self._printed("00:04:00.00"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=240
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        stored = orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL)))
+        assert stored == {"i": -19.7, "peak": -3.8}
+
+    async def test_a_long_song_is_cached_as_its_prefix_for_a_month(
+        self, fake_redis: Any
+    ) -> None:
+        """Every re-scan would read the same twenty minutes, so the prefix is the
+        song's level, not a reading to retry."""
+        _, spawn = self._child(stderr=self._printed("00:20:00.02"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=5400
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=1200.02)
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {
+            "i": -19.7,
+            "peak": -3.8,
+            "covered": 1200.02,
+        }
+        assert await fake_redis.ttl(key) > youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_cached_prefix_reads_back_with_its_coverage(
+        self, fake_redis: Any
+    ) -> None:
+        await cache_set(
+            fake_redis,
+            _loudness_cache_key(self._URL),
+            {"i": -12.5, "peak": -1.2, "covered": 1200.0},
+            60,
+        )
+        assert await measure_loudness(
+            "https://cdn/a", self._URL, fake_redis
+        ) == Loudness(i=-12.5, peak=-1.2, covered_secs=1200.0)
+
+    async def test_a_scan_stopped_at_its_deadline_keeps_ten_minutes_for_an_hour(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A slow fetch: SIGINT makes ffmpeg print the summary of what it read.
+        Ten minutes of a long recording landed within 2.5 LU of the whole, against
+        up to 9.8 off target unmeasured — but a faster fetch would read more, so
+        it is retried within the hour."""
+        assert youtube._PARTIAL_MIN_SECS == 600.0
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(hangs=True, on_stop=self._printed("00:12:00.00"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=5400
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=720.0)
+        process.send_signal.assert_called_once_with(signal.SIGINT)
+        process.kill.assert_not_called()
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key))["covered"] == 720.0
+        assert await fake_redis.ttl(key) == youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_fetch_blocked_on_the_network_takes_a_second_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ffmpeg reads the first SIGINT between packets, and one stalled inside a
+        read never gets there; the ffmpeg tier measures it on the real binary."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(
+            hangs=True, on_stop=self._printed("00:12:00.00"), signals_to_stop=2
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, None, duration=5400
+            )
+
+        assert measured is not None and measured.covered_secs == 720.0
+        assert process.send_signal.call_count == 2
+        process.kill.assert_not_called()
+
+    async def test_a_source_ffmpeg_finds_endless_is_stopped_before_its_audio(
+        self, fake_redis: Any
+    ) -> None:
+        """No duration from yt-dlp: the header decides, and `Duration: N/A` is a
+        radio stream the scan would otherwise read for its whole deadline."""
+        process, spawn = self._child(
+            stderr=b"Input #0, mp3\n  Duration: N/A, start: 0.000000\n", hangs=True
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await asyncio.wait_for(
+                    measure_loudness("https://cdn/a", self._URL, fake_redis), 1
+                )
+                is None
+            )
+
+        process.kill.assert_called_once()
+        assert orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL))) == {
+            "unmeasured": True
+        }
+
+    async def test_a_song_with_a_known_duration_is_not_held_to_the_header(
+        self,
+    ) -> None:
+        """The check costs nothing, but a source yt-dlp gave a duration has
+        already said it ends."""
+        _, spawn = self._child(
+            stderr=b"  Duration: N/A\n" + TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert await measure_loudness(
+                "https://cdn/a", self._URL, None, duration=240
+            ) == Loudness(i=-19.7, peak=-3.8)
+
+    @pytest.mark.parametrize("covered", ["00:09:59.00", None])
+    async def test_a_stopped_scan_short_of_ten_minutes_is_not_a_level(
+        self,
+        fake_redis: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        covered: Optional[str],
+    ) -> None:
+        """Five minutes of a long recording sat up to 2.9 LU off the whole, and a
+        reading that does not say how much it covered covers nothing provable."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        printed = (
+            self._printed(covered) if covered else TestEbur128Summary._CAPTURED.encode()
+        )
+        _, spawn = self._child(hangs=True, on_stop=printed)
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await measure_loudness(
+                    "https://cdn/a", self._URL, fake_redis, duration=5400
+                )
+                is None
+            )
+
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+
+    async def test_a_scan_that_printed_no_summary_is_not_a_level(self) -> None:
+        _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+    async def test_the_scan_suppresses_the_progress_line(self) -> None:
+        """ffmpeg's progress line is carriage-returned, and the summary pattern is
+        anchored per line. `-nostats` is what keeps the two from meeting."""
+        argv: list[str] = []
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+
+        async def record(*args: Any, **kwargs: Any) -> MagicMock:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None)
+
+        assert "-nostats" in argv
+        assert "-reconnect_on_http_error" in argv
+
+    async def test_the_scan_reads_sample_peak(self) -> None:
+        """Sample peak is the one alimiter holds the ceiling on, and asking for it
+        costs what asking for no peak costs — `peak=true` is four times the scan."""
+        argv: list[str] = []
+        process, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+
+        async def record(*args: Any, **kwargs: Any) -> MagicMock:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None)
+
+        assert "ebur128=framelog=quiet:peak=sample" in argv
+
+    @pytest.mark.parametrize(
+        ("kind", "kwargs"),
+        [("no summary", {"stderr": b"nothing useful\n"}), ("timeout", {"hangs": True})],
+    )
+    async def test_a_scan_that_measured_nothing_is_remembered_briefly(
+        self, fake_redis: Any, kind: str, kwargs: dict[str, Any]
+    ) -> None:
+        """Otherwise the whole timeout is spent again on every play of a song the
+        knob cannot cover, and it never yields a level."""
+        _, spawn = self._child(**kwargs)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch.object(youtube, "_SCAN_DEADLINE_SECS", 0.01),
+            patch.object(youtube, "_SCAN_STOP_GRACE_SECS", 0.01),
+        ):
+            assert (
+                await measure_loudness("https://cdn/a", self._URL, fake_redis) is None
+            )
+
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+        assert await fake_redis.ttl(key) == youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_remembered_failure_spawns_nothing(self, fake_redis: Any) -> None:
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"unmeasured": True}, 60
+        )
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("re-scanned a song that already measured nothing")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            assert (
+                await measure_loudness("https://cdn/a", self._URL, fake_redis) is None
+            )
+
+    async def test_a_missing_ffmpeg_is_not_a_failed_play(self) -> None:
+        """A level is an improvement to a play, not a precondition for one."""
+
+        async def missing(*_args: Any, **_kwargs: Any) -> Any:
+            raise FileNotFoundError(2, "No such file or directory: 'ffmpeg'")
+
+        with patch("asyncio.create_subprocess_exec", new=missing):
+            assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+
+class TestScanCoveredSecs:
+    """How much audio a scan read, which decides whether a cut-short one counts."""
+
+    def test_the_closing_line_is_read(self) -> None:
+        assert (
+            youtube._scan_covered_secs("size=N/A time=01:02:03.50 bitrate=N/A")
+            == 3723.5
+        )
+
+    def test_the_last_line_wins(self) -> None:
+        printed = "time=00:00:01.00\nsize=N/A time=00:20:00.00 bitrate=N/A\n"
+        assert youtube._scan_covered_secs(printed) == 1200.0
+
+    def test_nothing_printed_is_nothing_known(self) -> None:
+        assert youtube._scan_covered_secs("I: -14.0 LUFS") is None
+
+
+def _googlevideo(clen: object, host: str = "rr1---sn-abc.googlevideo.com") -> str:
+    return f"https://{host}/videoplayback?expire=1&itag=251&clen={clen}&sig=SECRET"
+
+
+class _RangeServer:
+    """What `_feed_ranges` sees of a session: `get()` answering each request from a
+    script, and the Range header every request carried. A script entry is a status,
+    or `("dies", n)` for a 206 whose connection dies n bytes in."""
+
+    def __init__(self, payload: bytes, script: Optional[list[Any]] = None) -> None:
+        self.payload = payload
+        self.script = list(script or [])
+        self.asked: list[tuple[int, int]] = []
+
+    def get(self, _url: object, *, headers: dict[str, str], **_kwargs: Any) -> Any:
+        first, last = (
+            int(n) for n in headers["Range"].removeprefix("bytes=").split("-")
+        )
+        self.asked.append((first, last))
+        step = self.script.pop(0) if self.script else 206
+        body = self.payload[first : last + 1]
+
+        async def chunks() -> Any:
+            if step == 206:
+                # Two chunks, so a cursor that counts requests rather than bytes
+                # shows up as a wrong Range.
+                yield body[: len(body) // 2]
+                yield body[len(body) // 2 :]
+                return
+            yield body[: step[1]]
+            raise aiohttp.ClientPayloadError("connection died")
+
+        response = MagicMock()
+        response.status = step if isinstance(step, int) else 206
+        response.content.iter_any = chunks
+        entered = MagicMock()
+        entered.__aenter__ = AsyncMock(return_value=response)
+        entered.__aexit__ = AsyncMock(return_value=False)
+        return entered
+
+
+class _Stdin:
+    """The scan's stdin: what was written to it, and whether it was closed."""
+
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        assert not self.closed
+        self.written += data
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestRangedScanSize:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Another host's `clen` says nothing about how it serves a range.
+            "https://cdn.example.com/a.webm?clen=99999999",
+            "https://googlevideo.com.example.net/videoplayback?clen=99999999",
+            "https://notgooglevideo.com/videoplayback?clen=99999999",
+            # The muxed rung's HLS manifest: a path, and no size.
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/x.m3u8",
+            "https://rr1---sn-abc.googlevideo.com/videoplayback?itag=251",
+            "https://rr1---sn-abc.googlevideo.com/videoplayback?clen=lots",
+            "not a url",
+        ],
+    )
+    def test_only_a_sized_googlevideo_file_has_one(self, url: str) -> None:
+        assert youtube._ranged_scan_size(url) is None
+
+    def test_it_is_the_clen(self) -> None:
+        assert youtube._ranged_scan_size(_googlevideo(16_216_875)) == 16_216_875
+
+
+class TestFeedRanges:
+    """googlevideo serves one request for more than 10 MB at about twice realtime,
+    which no scan timeout covers; asked for in ranges of that size it is served at
+    full speed. See docs/ARCHITECTURE.md#loudness-normalization."""
+
+    _RANGE = 1000
+    _URL = _googlevideo(0)
+
+    @pytest.fixture(autouse=True)
+    def _small_ranges(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(youtube, "_SCAN_RANGE_BYTES", self._RANGE)
+
+    async def _feed(self, server: _RangeServer) -> _Stdin:
+        stdin = _Stdin()
+        with patch("src.youtube._get_probe_session", return_value=server):
+            try:
+                await youtube._feed_ranges(
+                    self._URL, len(server.payload), cast(Any, stdin)
+                )
+            finally:
+                self.stdin = stdin
+        return stdin
+
+    @pytest.mark.parametrize("size", [1, 999, 1000, 1001, 2000, 2005, 6437])
+    async def test_the_ranges_cover_every_byte_once(self, size: int) -> None:
+        payload = bytes(n % 251 for n in range(size))
+        server = _RangeServer(payload)
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert stdin.closed
+        assert server.asked[0][0] == 0
+        assert server.asked[-1][1] == size - 1
+        for (_, last), (first, _) in zip(server.asked, server.asked[1:]):
+            assert first == last + 1
+        assert all(last - first < self._RANGE for first, last in server.asked)
+
+    async def test_a_dead_connection_resumes_at_the_byte_it_reached(self) -> None:
+        payload = bytes(n % 251 for n in range(2500))
+        # The second range delivers 300 of its 1000 bytes and dies.
+        server = _RangeServer(payload, [206, ("dies", 300)])
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert server.asked == [(0, 999), (1000, 1999), (1300, 2299), (2300, 2499)]
+
+    async def test_a_5xx_is_retried(self) -> None:
+        payload = bytes(1500)
+        server = _RangeServer(payload, [503, 206, 503])
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert server.asked == [(0, 999), (0, 999), (1000, 1499), (1000, 1499)]
+
+    async def test_it_gives_up_after_the_retries(self) -> None:
+        server = _RangeServer(bytes(5000), [("dies", 0)] * 50)
+
+        with pytest.raises(aiohttp.ClientPayloadError):
+            await self._feed(server)
+
+        assert len(server.asked) == youtube._SCAN_FETCH_RETRIES + 1
+        assert self.stdin.closed
+
+    @pytest.mark.parametrize("status", [403, 404, 429, 200])
+    async def test_any_other_answer_ends_the_scan_at_once(self, status: int) -> None:
+        """A 403 is a revoked URL and asking again does not un-revoke it. A 200 is
+        a server that ignored the Range and sent the whole file from byte 0."""
+        server = _RangeServer(bytes(5000), [206, status])
+
+        with pytest.raises(aiohttp.ClientResponseError) as raised:
+            await self._feed(server)
+
+        assert raised.value.status == status
+        assert len(server.asked) == 2
+        assert self.stdin.closed
+        assert len(self.stdin.written) == self._RANGE
+
+
+class TestMeasureLoudnessInRanges:
+    """The half of a ranged scan that is measure_loudness's: which songs take it,
+    what ffmpeg is asked to read, and what a failed feed costs."""
+
+    _PAGE = "https://yt.com/watch?v=long"
+    _LONG = _googlevideo(youtube._SCAN_RANGE_BYTES + 1)
+
+    @staticmethod
+    def _child(
+        argv: list[Any],
+        kwargs: dict[str, Any],
+        *,
+        hangs: bool = False,
+        printed: bytes = TestEbur128Summary._CAPTURED.encode(),
+    ) -> tuple[MagicMock, Callable[..., Awaitable[Any]]]:
+        """The ffmpeg child of a ranged scan: its stderr reaches EOF once stdin is
+        closed, the way the real one finishes when its input does."""
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = _Stdin()
+
+        async def read() -> bytes:
+            while hangs or not process.stdin.closed:
+                await asyncio.sleep(0)
+            return printed
+
+        async def wait() -> int:
+            process.returncode = 0
+            return 0
+
+        async def readline() -> bytes:
+            # No input header: the live check reads to the end and finds none.
+            return b""
+
+        process.stderr.read = read
+        process.stderr.readline = readline
+        process.wait = wait
+        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
+        process.send_signal = MagicMock()
+
+        async def spawn(*args: Any, **kw: Any) -> MagicMock:
+            argv.extend(args)
+            kwargs.update(kw)
+            return process
+
+        return process, spawn
+
+    @staticmethod
+    def _feeds(payload: bytes = b"audio") -> Any:
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.write(payload)
+            stdin.close()
+
+        return feed
+
+    async def test_a_song_over_the_range_is_piped_in(self, fake_redis: Any) -> None:
+        argv: list[Any] = []
+        kwargs: dict[str, Any] = {}
+        process, spawn = self._child(argv, kwargs)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds(b"the song")),
+        ):
+            measured = await measure_loudness(self._LONG, self._PAGE, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        assert argv[argv.index("-i") + 1] == "pipe:0"
+        assert self._LONG not in argv
+        assert kwargs["stdin"] == asyncio.subprocess.PIPE
+        assert bytes(process.stdin.written) == b"the song"
+        process.kill.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            _googlevideo(youtube._SCAN_RANGE_BYTES),
+            _googlevideo(1),
+            "https://cdn.example.com/a.webm?clen=99999999",
+        ],
+    )
+    async def test_any_other_song_is_ffmpegs_own_request(self, url: str) -> None:
+        argv: list[str] = []
+        kwargs: dict[str, Any] = {}
+
+        async def spawn(*args: Any, **kw: Any) -> MagicMock:
+            argv.extend(args)
+            kwargs.update(kw)
+            return await TestMeasureLoudness._child(
+                stderr=TestEbur128Summary._CAPTURED.encode()
+            )[1]()
+
+        async def refuse(*_args: Any) -> None:
+            raise AssertionError("fetched a song ffmpeg reads at full speed itself")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=refuse),
+        ):
+            assert await measure_loudness(url, self._PAGE, None) is not None
+
+        assert argv[argv.index("-i") + 1] == url
+        assert "-reconnect_on_http_error" in argv
+        assert kwargs["stdin"] is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientResponseError(
+                aiohttp.RequestInfo(
+                    URL(_googlevideo(1)), "GET", cast(Any, {}), URL(_googlevideo(1))
+                ),
+                (),
+                status=403,
+            ),
+            aiohttp.ClientPayloadError("connection died"),
+            youtube.ProbeSessionClosed("closed"),
+            BrokenPipeError(32, "Broken pipe"),
+        ],
+        ids=["refused", "dead", "shutdown", "ffmpeg-gone"],
+    )
+    async def test_a_feed_that_failed_is_not_a_level(
+        self, fake_redis: Any, error: Exception, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """ffmpeg still prints a summary, of the audio that reached it."""
+        process, spawn = self._child([], {})
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.write(b"half a song")
+            stdin.close()
+            raise error
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert await measure_loudness(self._LONG, self._PAGE, fake_redis) is None
+
+        key = _loudness_cache_key(self._PAGE)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+        process.kill.assert_called_once()
+        assert "SECRET" not in caplog.text
+
+    async def test_a_failed_feed_does_not_leave_the_reader_running(self) -> None:
+        """The child is killed after the scan gives up, and a reader still waiting
+        on its stderr then would be a task nothing holds."""
+        process, spawn = self._child([], {}, hangs=True)
+
+        async def feed(*_args: Any) -> None:
+            raise aiohttp.ClientPayloadError("connection died")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            assert await measure_loudness(self._LONG, self._PAGE, None) is None
+
+        process.kill.assert_called_once()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    async def test_a_long_song_is_fed_only_its_first_twenty_minutes(self) -> None:
+        """The serves are near-constant bitrate, so the same share of the bytes is
+        the same share of the song — and `-t` would end ffmpeg mid-feed, which the
+        feed would read as a broken pipe."""
+        argv: list[Any] = []
+        _, spawn = self._child(argv, {})
+        fed: list[int] = []
+
+        async def feed(_url: str, size: int, stdin: _Stdin) -> None:
+            fed.append(size)
+            stdin.close()
+
+        size = youtube._SCAN_RANGE_BYTES + 1
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            await measure_loudness(self._LONG, self._PAGE, None, duration=3600)
+            await measure_loudness(self._LONG, f"{self._PAGE}2", None, duration=1200)
+
+        assert fed == [math.ceil(size / 3), size]
+        assert "-t" not in argv
+
+    async def test_a_deadline_ends_the_feed_rather_than_signalling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Closing stdin is ffmpeg's end of input, and it prints its summary of
+        what reached it; a SIGINT racing that close is not needed."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(
+            [],
+            {},
+            printed=TestMeasureLoudness._printed("00:15:00.00"),
+        )
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            try:
+                stdin.write(b"some")
+                await asyncio.Event().wait()
+            finally:
+                stdin.close()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            measured = await measure_loudness(
+                self._LONG, self._PAGE, None, duration=3600
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=900.0)
+        process.send_signal.assert_not_called()
+        assert process.stdin.closed
+
+    async def test_a_feed_that_times_out_on_its_own_is_a_failure(self) -> None:
+        """aiohttp's own timeouts are TimeoutErrors too, and only the scan's
+        deadline means "stop and keep what was read"."""
+        process, spawn = self._child(
+            [], {}, printed=TestMeasureLoudness._printed("00:15:00.00")
+        )
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.close()
+            raise aiohttp.ServerTimeoutError("read timed out")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            assert (
+                await measure_loudness(self._LONG, self._PAGE, None, duration=3600)
+                is None
+            )
+
+        process.send_signal.assert_not_called()
+
+    async def test_a_child_that_never_finishes_is_killed_and_not_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        monkeypatch.setattr(youtube, "_SCAN_STOP_GRACE_SECS", 0.01)
+        process, spawn = self._child([], {}, hangs=True)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds()),
+        ):
+            measured = await asyncio.wait_for(
+                measure_loudness(self._LONG, self._PAGE, None), 5
+            )
+
+        assert measured is None
+        process.kill.assert_called_once()
+        await settle()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    async def test_a_scan_cancelled_at_shutdown_kills_its_child_and_feed(self) -> None:
+        process, spawn = self._child([], {}, hangs=True)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds()),
+        ):
+            task = asyncio.ensure_future(measure_loudness(self._LONG, self._PAGE, None))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            youtube._INFLIGHT_SCANS[_loudness_cache_key(self._PAGE)].cancel()
+            assert await task is None
+
+        process.kill.assert_called_once()
+        await settle()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+
+class TestYtStreamLoudness:
+    """What the mode does to one song's argv, end to end."""
+
+    @staticmethod
+    async def _options(
+        mode: LoudnessMode,
+        *,
+        stderr: bytes = b"",
+        duration: Optional[int] = 213,
+        spawn: Optional[Callable[..., Awaitable[Any]]] = None,
+        **served: Any,
+    ) -> tuple[Optional[str], str]:
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            options: Optional[str] = None,
+            bitrate: Optional[int] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["options"] = options or ""
+
+        _, default_spawn = TestMeasureLoudness._child(stderr=stderr)
+        data = _fake_ytdl_data(
+            acodec="opus",
+            audio_channels=2,
+            format_id="251",
+            duration=duration,
+            **served,
+        )
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch("asyncio.create_subprocess_exec", new=spawn or default_spawn),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://yt.com/v=x",
+                    title="Song",
+                    requester=MagicMock(),
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                loudness=mode,
+            )
+        return captured["codec"], captured["options"]
+
+    async def test_off_still_copies_the_bitstream(self) -> None:
+        codec, options = await self._options(LoudnessMode.OFF)
+        assert codec == "copy"
+        assert "-filter:a" not in options
+
+    async def test_peak_re_encodes_with_the_limiter(self) -> None:
+        codec, options = await self._options(LoudnessMode.PEAK)
+        assert codec is None
+        assert f"-filter:a {_PEAK_LIMITER}" in options
+
+    async def test_peak_measures_nothing(self) -> None:
+        """The ceiling needs no measurement, and that is the only reason PEAK adds
+        no wait to a first play. A gate that let it scan would cost every one."""
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("scanned a song for a mode that needs no level")
+
+        codec, options = await self._options(LoudnessMode.PEAK, spawn=refuse)
+        assert codec is None
+        assert "volume=" not in options
+
+    async def test_normalize_measures_the_song_and_emits_its_gain(self) -> None:
+        codec, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            stderr=TestEbur128Summary._CAPTURED.encode(),
+        )
+        assert codec is None
+        # -19.7 LUFS against a -14 target.
+        assert "volume=5.7dB" in options
+        assert options.index("volume=5.7dB") < options.index("alimiter")
+
+    async def test_normalize_plays_a_song_it_could_not_measure(self) -> None:
+        codec, options = await self._options(LoudnessMode.NORMALIZE, stderr=b"nope")
+        assert codec is None
+        assert "volume=" not in options
+        assert _PEAK_LIMITER in options
+
+    @pytest.mark.parametrize(
+        "flags",
+        [{"is_live": True}, {"live_status": "is_live"}, {"live_status": "post_live"}],
+    )
+    async def test_a_livestream_is_never_scanned(self, flags: dict[str, Any]) -> None:
+        """The scan would read the stream until its deadline and measure whatever
+        it happened to catch."""
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("scanned a livestream")
+
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, spawn=refuse, **flags
+        )
+
+        assert _PEAK_LIMITER in options
+
+    async def test_a_direct_file_with_no_duration_is_measured(self) -> None:
+        """yt-dlp's generic extractor reports no duration for a direct MP3, and
+        once was the reason normalize never moved one."""
+        printed = (
+            b"  Duration: 00:06:12.72, start: 0.000000, bitrate: 192 kb/s\n"
+            + TestEbur128Summary._CAPTURED.encode()
+        )
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, stderr=printed
+        )
+
+        assert "volume=5.7dB" in options
+
+    async def test_an_endless_source_yt_dlp_did_not_flag_is_refused_at_once(
+        self,
+    ) -> None:
+        """An Icecast stream looks like a direct file to yt-dlp. ffmpeg says
+        `Duration: N/A` before it reads any audio, and the scan stops there."""
+        process, spawn = TestMeasureLoudness._child(
+            stderr=b"  Duration: N/A, start: 0.000000, bitrate: 128 kb/s\n",
+            hangs=True,
+        )
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, spawn=spawn
+        )
+
+        assert "volume=" not in options
+        process.kill.assert_called_once()
+
+    async def test_a_play_waits_for_the_scan_at_most_the_knob(self) -> None:
+        """The knob is the silence a listener sits through, so it bounds the wait
+        and not the scan, which goes on to cache what it measures."""
+        config.loudness_scan_timeout_secs.set_override(3.0)
+        asked: dict[str, Any] = {}
+
+        async def measure(*_args: Any, **kwargs: Any) -> None:
+            asked.update(kwargs)
+
+        with patch("src.youtube.measure_loudness", new=measure):
+            await self._options(LoudnessMode.NORMALIZE)
+
+        assert asked == {"duration": 213, "wait": 3.0}
+
+    @staticmethod
+    async def _no_scan(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("scanned a song YouTube had already measured")
+
+    async def test_youtubes_own_figure_is_the_gain_and_nothing_is_scanned(
+        self,
+    ) -> None:
+        """The player response yt-dlp already fetched carries the loudness YouTube
+        normalizes against — within 0.05 dB of ebur128 on every song measured — so
+        a normalizing server's first play of a song waits for nothing."""
+        codec, options = await self._options(
+            LoudnessMode.NORMALIZE, spawn=self._no_scan, loudness_lkfs=-8.29
+        )
+
+        assert codec is None
+        # -8.29 LUFS against a -14 target.
+        assert "volume=-5.7dB" in options
+        assert options.index("volume=-5.7dB") < options.index("alimiter")
+
+    async def test_a_livestream_with_a_figure_is_normalized(self) -> None:
+        """Being live only rules out the scan."""
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            duration=None,
+            spawn=self._no_scan,
+            loudness_lkfs=-20.0,
+            is_live=True,
+        )
+        assert "volume=6.0dB" in options
+
+    @pytest.mark.parametrize(
+        "figure", [None, "-8.29", True, float("nan"), float("inf"), [-8.29]]
+    )
+    async def test_a_figure_that_is_not_a_number_falls_to_the_scan(
+        self, figure: Any
+    ) -> None:
+        """It has been through the stream cache, and a NaN would be the gain."""
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            stderr=TestEbur128Summary._CAPTURED.encode(),
+            loudness_lkfs=figure,
+        )
+        assert "volume=5.7dB" in options
+
+    @pytest.mark.parametrize("mode", [LoudnessMode.OFF, LoudnessMode.PEAK])
+    async def test_only_normalize_reads_the_figure(self, mode: LoudnessMode) -> None:
+        _, options = await self._options(mode, loudness_lkfs=-8.29)
+        assert "volume=" not in options
+
+    async def test_the_figure_is_clamped_like_a_measured_one(self) -> None:
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, spawn=self._no_scan, loudness_lkfs=-60.0
+        )
+        assert "volume=12.0dB" in options
+
+    def test_the_span_says_where_the_level_came_from(self) -> None:
+        """`youtube` against `scan` is how an operator sees the capture stop working
+        after a yt-dlp bump: the songs still normalize, and every one waits."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with provider.get_tracer("t").start_as_current_span("song"):
+            lufs = youtube._player_loudness(
+                cast(Any, _fake_ytdl_data(loudness_lkfs=-8.29))
+            )
+
+        assert lufs == -8.29
+        attributes = exporter.get_finished_spans()[-1].attributes or {}
+        assert attributes["ytdl.loudness_source"] == "youtube"
+        assert attributes["ytdl.loudness_lufs"] == -8.29
+
+    def test_a_cache_hit_carries_the_figure(self) -> None:
+        """Otherwise every cached play of a YouTube song falls back to the scan."""
+        assert "loudness_lkfs" in _STREAM_CACHE_FIELDS
+
+
+class TestScanTarget:
+    """Which URL a scan reads. A YouTube song only reaches the scan without its own
+    figure — a moved capture seam, a non-default track, a `-drc` serve — and then
+    its itag 249 measures what 251 does at a third of the bytes."""
+
+    @staticmethod
+    def _data(format_id: str, *ladder: str, **extra: Any) -> Any:
+        return {
+            "url": "https://cdn/served",
+            "format_id": format_id,
+            "duration": 200,
+            "audio_candidates": [
+                {"format_id": f, "url": f"https://cdn/{f}"} for f in ladder
+            ],
+            **extra,
+        }
+
+    def test_a_251_serve_is_scanned_on_its_249(self) -> None:
+        data = self._data("251", "250", "249", "140")
+        assert youtube._scan_target(data) == "https://cdn/249"
+
+    def test_a_dub_is_scanned_on_its_own_track(self) -> None:
+        data = self._data("251-23", "249-0", "249-23")
+        assert youtube._scan_target(data) == "https://cdn/249-23"
+
+    @pytest.mark.parametrize(
+        ("format_id", "ladder"),
+        [
+            ("251", ("250", "140")),
+            ("251-23", ("249", "249-0")),
+            # A different encode of the very thing measured.
+            ("251-drc", ("249", "249-drc")),
+            ("hls_aac_160k", ("hls_aac_96k",)),
+            ("249", ()),
+        ],
+    )
+    def test_anything_else_scans_what_plays(
+        self, format_id: str, ladder: tuple[str, ...]
+    ) -> None:
+        assert youtube._scan_target(self._data(format_id, *ladder)) == (
+            "https://cdn/served"
+        )
+
+    def test_the_lifted_249_is_preferred(self) -> None:
+        """The ladder keeps three rungs, 251-140-250 on a typical video, so the 249
+        a scan wants is lifted on its own in the worker."""
+        data = self._data("251", "140", "250", scan_url="https://cdn/lifted-249")
+        assert youtube._scan_target(data) == "https://cdn/lifted-249"
+
+    def test_a_lifted_url_does_not_outrank_a_drc_serve(self) -> None:
+        data = self._data("251-drc", scan_url="https://cdn/lifted-249")
+        assert youtube._scan_target(data) == "https://cdn/served"
+
+    def test_the_lifted_url_survives_the_stream_cache(self) -> None:
+        assert "scan_url" in youtube._STREAM_CACHE_FIELDS
+
+    def test_a_249_rung_without_a_url_is_absent(self) -> None:
+        data = self._data("251")
+        data["audio_candidates"] = [{"format_id": "249"}]
+        assert youtube._scan_target(data) == "https://cdn/served"
+
+    def test_a_livestream_has_no_target(self) -> None:
+        assert youtube._scan_target(self._data("251", "249", is_live=True)) is None
+
+    async def test_a_play_scans_the_249(self) -> None:
+        argv: list[str] = []
+        _, spawn = TestMeasureLoudness._child(
+            stderr=TestEbur128Summary._CAPTURED.encode()
+        )
+
+        async def record(*args: Any, **kwargs: Any) -> Any:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        await TestYtStreamLoudness._options(
+            LoudnessMode.NORMALIZE,
+            spawn=record,
+            audio_candidates=[{"format_id": "249", "url": "https://cdn/249"}],
+        )
+
+        assert argv[argv.index("-i") + 1] == "https://cdn/249"
+
+
+class TestLiftScanUrl:
+    """The worker keeps the served track's 249 before `formats` is dropped."""
+
+    @staticmethod
+    def _node(format_id: str, *ids: str) -> dict[str, Any]:
+        return {
+            "format_id": format_id,
+            "formats": [{"format_id": f, "url": f"https://cdn/{f}"} for f in ids],
+        }
+
+    @pytest.mark.parametrize(
+        ("served", "ids", "lifted"),
+        [
+            ("251", ("249", "250", "140", "251"), "https://cdn/249"),
+            ("251-23", ("249-0", "249-23", "251-23"), "https://cdn/249-23"),
+            ("140", ("249", "140"), "https://cdn/249"),
+            ("251", ("250", "140", "251"), None),
+            ("249", ("249",), None),
+            ("251-drc", ("249", "249-drc"), None),
+            ("hls_aac_160k", ("249",), None),
+        ],
+    )
+    def test_which_url_is_lifted(
+        self, served: str, ids: tuple[str, ...], lifted: Optional[str]
+    ) -> None:
+        node = self._node(served, *ids)
+        youtube._lift_scan_url(node)
+        assert node.get("scan_url") == lifted
+
+    def test_a_249_without_a_url_is_not_lifted(self) -> None:
+        node = {"format_id": "251", "formats": [{"format_id": "249"}]}
+        youtube._lift_scan_url(node)
+        assert "scan_url" not in node
+
+    def test_slimming_keeps_it_after_formats_leave(self) -> None:
+        info = {
+            "id": "x",
+            "url": "https://cdn/251",
+            "format_id": "251",
+            "formats": [
+                {"format_id": "249", "url": "https://cdn/249", "acodec": "opus"},
+                {"format_id": "251", "url": "https://cdn/251", "acodec": "opus"},
+            ],
+        }
+        slim = cast(Any, youtube._slim_info(info))
+        assert slim["scan_url"] == "https://cdn/249"
+        assert "formats" not in slim
+
+
+class TestPrefetchLoudness:
+    """The warm half of a scan: which queued songs it measures, from what."""
+
+    _PAGE = "https://sc.com/a/b"
+
+    async def _cached(self, fake_redis: Any, **fields: Any) -> None:
+        data = {"url": "https://cdn/a", "webpage_url": self._PAGE, "duration": 200}
+        await cache_set(
+            fake_redis, youtube._stream_cache_key(self._PAGE), {**data, **fields}, 60
+        )
+
+    async def _measured(self, redis: Any) -> list[tuple[Any, ...]]:
+        calls: list[tuple[Any, ...]] = []
+
+        async def measure(*args: Any, **kwargs: Any) -> None:
+            calls.append((*args, kwargs))
+
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("src.youtube.measure_loudness", new=measure):
+            await YTDL.prefetch_loudness(qo, redis)
+        return calls
+
+    async def test_it_measures_the_cached_url_and_waits_for_all_of_it(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis)
+        assert await self._measured(fake_redis) == [
+            ("https://cdn/a", self._PAGE, fake_redis, {"duration": 200})
+        ]
+
+    async def test_a_song_youtube_measured_is_not_scanned(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis, loudness_lkfs=-9.0)
+        assert await self._measured(fake_redis) == []
+
+    async def test_a_livestream_is_not_scanned(self, fake_redis: Any) -> None:
+        await self._cached(fake_redis, duration=None, is_live=True)
+        assert await self._measured(fake_redis) == []
+
+    async def test_a_direct_file_is_measured_behind_the_live_check(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis, duration=None)
+        assert await self._measured(fake_redis) == [
+            ("https://cdn/a", self._PAGE, fake_redis, {"duration": None})
+        ]
+
+    def test_the_live_flags_survive_the_stream_cache(self) -> None:
+        """A cache hit without them reaches the scan's header check, which costs a
+        connection to the stream to learn what yt-dlp already said."""
+        assert {"is_live", "live_status"} <= youtube._STREAM_CACHE_FIELDS
+
+    async def test_nothing_cached_is_nothing_to_measure(self, fake_redis: Any) -> None:
+        assert await self._measured(fake_redis) == []
+
+    async def test_no_redis_has_nowhere_to_leave_the_level(self) -> None:
+        assert await self._measured(None) == []
+
+    async def test_the_play_after_it_reads_the_level(self, fake_redis: Any) -> None:
+        """End to end through the real measure: the warm's scan lands in Redis and
+        the play spawns nothing."""
+        await self._cached(fake_redis)
+        _, spawn = TestMeasureLoudness._child(
+            stderr=TestEbur128Summary._CAPTURED.encode()
+        )
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await YTDL.prefetch_loudness(qo, fake_redis)
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("the play scanned a song its warm had measured")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            assert await measure_loudness(
+                "https://cdn/a", self._PAGE, fake_redis, wait=1.0
+            ) == Loudness(i=-19.7, peak=-3.8)
+
+
+def _player_response(video_id: object, lkfs: object) -> dict[str, Any]:
+    return {
+        "videoDetails": {"videoId": video_id},
+        "playerConfig": {"audioConfig": {"trackAbsoluteLoudnessLkfs": lkfs}},
+    }
+
+
+@pytest.fixture
+def player_loudness() -> Iterator[dict[str, float]]:
+    """The worker's per-extraction figures, empty before and after."""
+    youtube._PLAYER_LOUDNESS.clear()
+    yield youtube._PLAYER_LOUDNESS
+    youtube._PLAYER_LOUDNESS.clear()
+
+
+class TestNotePlayerLoudness:
+    """What is read out of yt-dlp's player responses. Their shape is YouTube's and
+    yt-dlp's to change, so nothing here may raise."""
+
+    def test_each_video_gets_its_own_figure(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness(
+            [
+                _player_response("aaa", -13.01),
+                _player_response("bbb", -8),
+                # What -7.08 looks like after YouTube's float32.
+                _player_response("ccc", -7.0799999),
+            ]
+        )
+        assert player_loudness == {"aaa": -13.01, "bbb": -8.0, "ccc": -7.08}
+        assert all(type(lkfs) is float for lkfs in player_loudness.values())
+
+    def test_the_first_client_to_answer_wins(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness(
+            [_player_response("aaa", -13.01), _player_response("aaa", -12.0)]
+        )
+        assert player_loudness == {"aaa": -13.01}
+
+    @pytest.mark.parametrize(
+        "responses",
+        [
+            None,
+            "responses",
+            ({"videoDetails": {"videoId": "aaa"}},),
+            [None, 3, "pr", []],
+            [{}],
+            [{"videoDetails": {"videoId": "aaa"}}],
+            [{"videoDetails": {"videoId": "aaa"}, "playerConfig": None}],
+            [{"videoDetails": None, "playerConfig": {"audioConfig": {}}}],
+            [_player_response("aaa", None)],
+            [_player_response("aaa", "-13.01")],
+            [_player_response("aaa", True)],
+            [_player_response("aaa", float("nan"))],
+            [_player_response("aaa", float("-inf"))],
+            [_player_response(None, -13.01)],
+            [_player_response(123, -13.01)],
+        ],
+    )
+    def test_anything_else_is_ignored_without_raising(
+        self, player_loudness: dict[str, float], responses: Any
+    ) -> None:
+        youtube._note_player_loudness(responses)
+        assert player_loudness == {}
+
+    def test_one_bad_response_does_not_cost_the_next(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness([{}, None, _player_response("bbb", -9.5)])
+        assert player_loudness == {"bbb": -9.5}
+
+
+class TestCapturePlayerLoudness:
+    """The seam is a private method of the pinned yt-dlp. A bump that moves it must
+    fail here, not turn every YouTube song's first play back into a scan in
+    production with nothing to show for it."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_the_extractor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from yt_dlp.extractor.youtube import YoutubeIE
+
+        self.extractor = cast(Any, YoutubeIE)
+        monkeypatch.setattr(
+            YoutubeIE, "_extract_player_responses", YoutubeIE._extract_player_responses
+        )
+        monkeypatch.setattr(
+            youtube, "_noting_player_loudness", youtube._noting_player_loudness
+        )
+
+    def test_the_pinned_yt_dlp_has_the_seam_and_its_shape(self) -> None:
+        import inspect
+
+        assert youtube.capture_player_loudness() is True
+        installed = self.extractor._extract_player_responses
+        assert installed is youtube._noting_player_loudness
+        # What the wrapper reads: a tuple whose first item is the responses.
+        source = inspect.getsource(inspect.unwrap(installed))
+        assert "return prs, player_url" in source
+        assert "prs.append(" in source
+
+    def test_every_extraction_installs_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In the worker, where the extraction runs — the parent never imports the
+        extractor at all."""
+        import inspect
+
+        bare = inspect.unwrap(self.extractor._extract_player_responses)
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", bare)
+        monkeypatch.setattr(youtube, "_noting_player_loudness", None)
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.return_value = {"id": "aaa", "url": "u"}
+            _ytdlp_extract(ExtractRequest(url="u", opts={}))
+
+        installed = self.extractor._extract_player_responses
+        assert installed is not bare
+        assert installed is youtube._noting_player_loudness
+
+    def test_a_second_call_does_not_wrap_the_wrapper(self) -> None:
+        youtube.capture_player_loudness()
+        once = self.extractor._extract_player_responses
+        assert youtube.capture_player_loudness() is True
+        assert self.extractor._extract_player_responses is once
+
+    def test_the_result_passes_through_and_its_figures_are_noted(
+        self, monkeypatch: pytest.MonkeyPatch, player_loudness: dict[str, float]
+    ) -> None:
+        result = ([_player_response("aaa", -13.01)], "https://player.js")
+        seen: list[tuple[Any, ...]] = []
+
+        def original(*args: Any, **kwargs: Any) -> Any:
+            seen.append((args, kwargs))
+            return result
+
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", original)
+        assert youtube.capture_player_loudness() is True
+
+        answered = self.extractor._extract_player_responses("ie", "clients", x=1)
+
+        assert answered is result
+        assert seen == [(("ie", "clients"), {"x": 1})]
+        assert player_loudness == {"aaa": -13.01}
+
+    @pytest.mark.parametrize("result", [None, (), [], "prs", ([],), (None, None)])
+    def test_a_result_of_another_shape_passes_through_untouched(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        player_loudness: dict[str, float],
+        result: Any,
+    ) -> None:
+        monkeypatch.setattr(
+            self.extractor, "_extract_player_responses", lambda *_a, **_k: result
+        )
+        youtube.capture_player_loudness()
+
+        assert self.extractor._extract_player_responses() is result
+        assert player_loudness == {}
+
+    def test_an_extractor_error_is_still_the_extractors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def original(*_args: Any, **_kwargs: Any) -> Any:
+            raise DownloadError("Video unavailable")
+
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", original)
+        youtube.capture_player_loudness()
+
+        with pytest.raises(DownloadError):
+            self.extractor._extract_player_responses()
+
+    def test_a_yt_dlp_without_the_seam_is_an_answer_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delattr(self.extractor, "_extract_player_responses")
+
+        assert youtube.capture_player_loudness() is False
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.return_value = {"id": "aaa", "url": "u"}
+            extracted = _ytdlp_extract(ExtractRequest(url="u", opts={}))
+        assert extracted is not None and "loudness_lkfs" not in extracted
+
+
+class TestLiftPlayerLoudness:
+    """Which served formats YouTube's figure describes."""
+
+    @staticmethod
+    def _lifted(player_loudness: dict[str, float], **node: Any) -> Optional[float]:
+        player_loudness["aaa"] = -13.01
+        info = {"id": "aaa", "format_id": "251", "format_note": "medium", **node}
+        youtube._lift_player_loudness(info)
+        return info.get("loudness_lkfs")
+
+    @pytest.mark.parametrize("format_id", ["251", "140", "18", "93"])
+    def test_the_only_audio_track_takes_it(
+        self, player_loudness: dict[str, float], format_id: str
+    ) -> None:
+        """Whatever the encode: the muxed rungs carry the same track."""
+        assert self._lifted(player_loudness, format_id=format_id) == -13.01
+
+    def test_the_default_track_of_several_takes_it(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        """Measured on three such videos: the figure is the default track's level."""
+        assert (
+            self._lifted(
+                player_loudness,
+                format_id="251-23",
+                format_note="English (US) original (default), medium",
+            )
+            == -13.01
+        )
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            # A dub is a different recording of the vocal.
+            {"format_id": "251-4", "format_note": "Deutsch - dubbed, medium"},
+            {"format_id": "251-4", "format_note": None},
+            {"format_id": "251-4"},
+            # Dynamic range compression changes the very thing measured.
+            {"format_id": "251-drc", "format_note": "medium, DRC"},
+            {"format_id": "251-drc-3", "format_note": "English (default), medium"},
+            {"format_id": None},
+            {"format_id": "http_opus_0_0"},
+            {"id": "bbb"},
+            {"id": None},
+        ],
+    )
+    def test_any_other_serve_is_left_to_the_scan(
+        self, player_loudness: dict[str, float], node: dict[str, Any]
+    ) -> None:
+        assert self._lifted(player_loudness, **node) is None
+
+
+class TestExtractionCarriesPlayerLoudness:
+    """The worker's half: the figure reaches the info-dict that crosses the pool
+    boundary, for a link and for each result of a search."""
+
+    @staticmethod
+    def _extract(info: dict[str, Any], noted: list[Any]) -> Any:
+        """Run _ytdlp_extract over a YoutubeDL that notes `noted` the way the
+        extractor's wrapped step does mid-extraction."""
+
+        def extract_info(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            youtube._note_player_loudness(noted)
+            return info
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.side_effect = extract_info
+            return _ytdlp_extract(ExtractRequest(url="u", opts={}))
+
+    def test_a_link_carries_its_videos_figure(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            {"id": "aaa", "url": "https://cdn/a", "format_id": "251"},
+            [_player_response("aaa", -13.01)],
+        )
+        assert extracted["loudness_lkfs"] == -13.01
+
+    def test_each_search_result_carries_its_own(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            {
+                "_type": "playlist",
+                "entries": [
+                    {"id": "aaa", "url": "https://cdn/a", "format_id": "251"},
+                    None,
+                    {"id": "bbb", "url": "https://cdn/b", "format_id": "140"},
+                    {"id": "ccc", "url": "https://cdn/c", "format_id": "251"},
+                ],
+            },
+            [_player_response("bbb", -8.29), _player_response("aaa", -13.01)],
+        )
+        figures = [e and e.get("loudness_lkfs") for e in extracted["entries"]]
+        assert figures == [-13.01, None, -8.29, None]
+        assert "loudness_lkfs" not in extracted
+
+    def test_a_figure_does_not_outlive_its_extraction(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        """A worker serves thousands of extractions, and a later one that came back
+        without a player response must not inherit an earlier one's level."""
+        player_loudness["aaa"] = -3.0
+        player_loudness["zzz"] = -30.0
+
+        extracted = self._extract(
+            {"id": "aaa", "url": "https://cdn/a", "format_id": "251"}, []
+        )
+
+        assert "loudness_lkfs" not in extracted
+        assert player_loudness == {}
+
+    def test_the_figure_survives_slimming_and_the_cache_filter(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            _realistic_raw_info(id="aaa"), [_player_response("aaa", -13.01)]
+        )
+        assert extracted["loudness_lkfs"] == -13.01
+        assert "formats" not in extracted
 
 
 class TestEncodeBitrate:

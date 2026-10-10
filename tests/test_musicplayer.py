@@ -32,6 +32,7 @@ from src.guild_state import (
     GuildConfig,
     GuildStateData,
     HistoryEntry,
+    LoudnessMode,
     NowPlayingData,
     SongQueueEntry,
     parse_queue_entry,
@@ -4837,6 +4838,45 @@ class TestStateRestore:
         await music_player._restore_state()
         assert music_player.volume == 0.5
 
+    async def test_restore_sets_loudness(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Without this leg a restart silently returns every normalizing guild to
+        off, while `-settings` keeps printing the mode it stored."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"normalize"
+        )
+        await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
+    async def test_a_mode_the_cache_already_holds_is_not_overwritten_by_restore(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """`seed` returns the fields it ACCEPTED: a write that has not reached Redis
+        yet is the newer one, so the snapshot must not undo it."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"off"
+        )
+        music_player.loudness = LoudnessMode.NORMALIZE
+        with patch.object(
+            music_player._cog.guild_settings, "seed", return_value=frozenset()
+        ):
+            await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
+    async def test_the_settings_cache_seeds_loudness_before_any_read(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """`_adopt_cached_settings` is the pre-restore fallback: the first song of a
+        session is built from it."""
+        mocked(music_player._cog.guild_settings).peek = MagicMock(
+            return_value=GuildConfig(loudness="peak")
+        )
+        music_player._adopt_cached_settings()
+        assert music_player.loudness is LoudnessMode.PEAK
+
     async def test_restore_noop_when_no_redis(
         self,
         mock_bot: MagicMock,
@@ -5626,6 +5666,16 @@ class TestStreamSource:
             await player._stream_source(source)
         assert stream.await_args is not None
         return dict(stream.await_args.kwargs)
+
+    async def test_the_guilds_loudness_reaches_the_stream(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """The hand-off `-settings loudness` depends on. Both ends are covered on
+        their own — the setting reaching the player, and the mode reaching the
+        argv — and this is the step between them."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["loudness"] is LoudnessMode.NORMALIZE
 
     async def test_the_channels_own_bitrate_reaches_the_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject
@@ -15651,6 +15701,131 @@ class TestEnqueueWarmBound:
             await asyncio.sleep(0)
 
         assert warmed == [qobj]
+
+
+class TestAQueuedSongIsMeasuredBeforeItsTurn:
+    """A normalizing guild's song is measured by its enqueue warm, so the play that
+    reaches it reads the level instead of sitting through the scan — the one-at-a-
+    time `-play` and `-p --next` would otherwise scan at the song boundary."""
+
+    @staticmethod
+    def _queued(music_player: MusicPlayer, author: MagicMock) -> QueueObject:
+        qobj = QueueObject(
+            webpage_url="https://sc.com/a/b", title="One", requester=author
+        )
+        seed_queue(music_player.queue, qobj)
+        return qobj
+
+    async def test_a_normalizing_guild_measures_outside_the_pool_bound(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The scan holds no yt-dlp worker, and holding the warm slot through it
+        would park another guild's warm behind a fetch of the whole song."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        qobj = self._queued(music_player, mock_author)
+        filled = dataclasses.replace(qobj, duration=180)
+        sem = asyncio.Semaphore(1)
+        measured: list[tuple[Any, bool]] = []
+
+        async def measure(item: Any, *, redis: Any) -> None:
+            measured.append((item, sem.locked()))
+
+        with (
+            patch("src.musicplayer.prefetch_warm_slot", return_value=sem),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=filled)),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player._warm_stream(qobj)
+
+        assert measured == [(filled, False)]
+
+    @pytest.mark.parametrize("mode", [LoudnessMode.OFF, LoudnessMode.PEAK])
+    async def test_only_normalize_measures(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mode: LoudnessMode
+    ) -> None:
+        music_player.loudness = mode
+        qobj = self._queued(music_player, mock_author)
+        measure = AsyncMock()
+        with (
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=qobj)),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player._warm_stream(qobj)
+
+        measure.assert_not_awaited()
+
+    async def test_a_song_that_left_the_queue_is_not_measured(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """-remove or -clear while the warm ran: a fetch of the whole song for a
+        play that will not happen."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        qobj = QueueObject(
+            webpage_url="https://sc.com/a/b", title="One", requester=mock_author
+        )
+        measure = AsyncMock()
+        with (
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=qobj)),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player._warm_stream(qobj)
+
+        measure.assert_not_awaited()
+
+    async def test_a_stopped_player_measures_nothing(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player.loudness = LoudnessMode.NORMALIZE
+        qobj = self._queued(music_player, mock_author)
+        music_player.mark_retired()
+        measure = AsyncMock()
+        with (
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=qobj)),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player._warm_stream(qobj)
+
+        measure.assert_not_awaited()
+
+    async def test_a_failed_warm_measures_nothing(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player.loudness = LoudnessMode.NORMALIZE
+        qobj = self._queued(music_player, mock_author)
+        measure = AsyncMock()
+        with (
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=None)),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player._warm_stream(qobj)
+
+        measure.assert_not_awaited()
+
+    async def test_put_next_measures_the_song_it_inserts(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """`-p --next` gives the prefetch slot back and does not re-spawn it, so the
+        warm is the only thing ahead of that song's turn."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        qobj = QueueObject(
+            webpage_url="https://sc.com/a/b", title="One", requester=mock_author
+        )
+        measure = AsyncMock()
+        with (
+            patch.object(
+                YTDL,
+                "prefetch_stream",
+                new=AsyncMock(side_effect=lambda item, **_: item),
+            ),
+            patch.object(YTDL, "prefetch_loudness", new=measure),
+        ):
+            await music_player.queue_put_next(qobj)
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        measure.assert_awaited_once()
+        assert measure.await_args is not None
+        assert measure.await_args.args[0].webpage_url == qobj.webpage_url
 
 
 class TestACutShortInterjectionDoesNotDoubleRecord:
