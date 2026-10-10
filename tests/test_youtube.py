@@ -1,6 +1,8 @@
 """Tests for src/youtube.py — YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import math
+import signal
 import copy
 import pathlib
 import contextlib
@@ -14,7 +16,7 @@ from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from collections.abc import Awaitable, Callable, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aiohttp
 import discord
@@ -7487,6 +7489,55 @@ class TestLoudnessFilters:
         assert "latency=1" in _PEAK_LIMITER
 
 
+class _ScanChild:
+    """ffmpeg as a scan drives it: stderr that reaches EOF when the child ends, a
+    SIGINT that ends it having printed `on_stop` (or is ignored when that is None),
+    and a kill that ends it having printed nothing."""
+
+    def __init__(
+        self,
+        stderr: bytes = b"",
+        *,
+        hangs: bool = False,
+        on_stop: Optional[bytes] = None,
+        signals_to_stop: int = 1,
+    ) -> None:
+        self.returncode: Optional[int] = None
+        self.printed = stderr
+        self.on_stop = on_stop
+        self.signals_to_stop = signals_to_stop
+        self.ended = asyncio.Event()
+        if not hangs:
+            self.ended.set()
+        self.stdin: Any = None
+        self.stderr = MagicMock()
+        self.stderr.read = self._read
+        self.kill = MagicMock(side_effect=self._killed)
+        self.send_signal = MagicMock(side_effect=self._signalled)
+
+    async def _read(self) -> bytes:
+        await self.ended.wait()
+        return self.printed
+
+    async def wait(self) -> int:
+        await self.ended.wait()
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def _killed(self) -> None:
+        self.returncode = -9
+        self.printed = b""
+        self.ended.set()
+
+    def _signalled(self, _signal: int) -> None:
+        self.signals_to_stop -= 1
+        if self.on_stop is not None and self.signals_to_stop <= 0:
+            self.printed = self.on_stop
+            self.returncode = 255
+            self.ended.set()
+
+
 class TestMeasureLoudness:
     """The one thing between a normalizing guild's first play of a song and its
     audio. Bounded, cached for a month, and killed by a cancellation — the prefetch
@@ -7496,23 +7547,19 @@ class TestMeasureLoudness:
 
     @staticmethod
     def _child(
-        *, stderr: bytes = b"", hangs: bool = False
-    ) -> tuple[MagicMock, Callable[..., Awaitable[Any]]]:
+        *,
+        stderr: bytes = b"",
+        hangs: bool = False,
+        on_stop: Optional[bytes] = None,
+        signals_to_stop: int = 1,
+    ) -> tuple[Any, Callable[..., Awaitable[Any]]]:
         """A stand-in for the ffmpeg child, and the create_subprocess_exec that
-        answers with it. `hangs` never returns from communicate()."""
-        process = MagicMock()
-        process.returncode = None
+        answers with it. `hangs` never ends on its own."""
+        process = _ScanChild(
+            stderr, hangs=hangs, on_stop=on_stop, signals_to_stop=signals_to_stop
+        )
 
-        async def communicate() -> tuple[bytes, bytes]:
-            if hangs:
-                await asyncio.Event().wait()
-            process.returncode = 0
-            return b"", stderr
-
-        process.communicate = communicate
-        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
-
-        async def spawn(*_args: Any, **_kwargs: Any) -> MagicMock:
+        async def spawn(*_args: Any, **_kwargs: Any) -> _ScanChild:
             return process
 
         return process, spawn
@@ -7564,45 +7611,37 @@ class TestMeasureLoudness:
 
         assert measured == Loudness(i=-19.7, peak=-3.8)
 
-    async def test_a_timeout_kills_the_child_and_plays_the_song_anyway(self) -> None:
+    async def test_a_child_that_ignores_the_stop_is_killed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A dead child left behind holds a CDN connection open for the life of the
         process."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        monkeypatch.setattr(youtube, "_SCAN_STOP_GRACE_SECS", 0.01)
         process, spawn = self._child(hangs=True)
-        config.loudness_scan_timeout_secs.set_override(
-            config.loudness_scan_timeout_secs.floor
-        )
         with patch("asyncio.create_subprocess_exec", new=spawn):
             measured = await asyncio.wait_for(
                 measure_loudness("https://cdn/a", self._URL, None), 5
             )
 
         assert measured is None
+        assert process.send_signal.call_args_list == [call(signal.SIGINT)] * 2
         process.kill.assert_called_once()
 
     @staticmethod
     def _gated_child(
         stderr: bytes,
-    ) -> tuple[MagicMock, asyncio.Event, list[int], Callable[..., Awaitable[Any]]]:
+    ) -> tuple[Any, asyncio.Event, list[int], Callable[..., Awaitable[Any]]]:
         """A child that finishes only once the returned event is set, and a spawn
         that counts how many times it was asked for one."""
-        process = MagicMock()
-        process.returncode = None
-        release = asyncio.Event()
+        process = _ScanChild(stderr, hangs=True)
         spawned: list[int] = []
 
-        async def communicate() -> tuple[bytes, bytes]:
-            await release.wait()
-            process.returncode = 0
-            return b"", stderr
-
-        process.communicate = communicate
-        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
-
-        async def spawn(*_args: Any, **_kwargs: Any) -> MagicMock:
+        async def spawn(*_args: Any, **_kwargs: Any) -> _ScanChild:
             spawned.append(1)
             return process
 
-        return process, release, spawned, spawn
+        return process, process.ended, spawned, spawn
 
     async def test_a_cancelled_caller_leaves_the_scan_to_finish_and_cache(
         self, fake_redis: Any
@@ -7731,6 +7770,141 @@ class TestMeasureLoudness:
 
         assert len(spawned) == youtube._SCAN_CONCURRENCY
 
+    @staticmethod
+    def _printed(covered: str) -> bytes:
+        """A summary and the closing progress line that says how much was read."""
+        return (
+            TestEbur128Summary._CAPTURED + f"size=N/A time={covered} bitrate=N/A\n"
+        ).encode()
+
+    async def test_a_scan_reads_at_most_twenty_minutes(self) -> None:
+        """Measured on nine 43-150 minute recordings, a 20-minute prefix landed
+        within 1.1 LU of the whole; reading more is bytes and CPU for nothing."""
+        assert youtube._SCAN_MAX_AUDIO_SECS == 1200.0
+        argv: list[str] = []
+        _, spawn = self._child(stderr=self._printed("00:04:00.00"))
+
+        async def record(*args: Any, **kwargs: Any) -> Any:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None, duration=240)
+
+        assert argv[argv.index("-t") + 1] == "1200"
+        assert argv.index("-t") < argv.index("-i")
+
+    async def test_a_song_within_the_cap_is_a_whole_reading(
+        self, fake_redis: Any
+    ) -> None:
+        _, spawn = self._child(stderr=self._printed("00:04:00.00"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=240
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        stored = orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL)))
+        assert stored == {"i": -19.7, "peak": -3.8}
+
+    async def test_a_long_song_is_cached_as_its_prefix_for_a_month(
+        self, fake_redis: Any
+    ) -> None:
+        """Every re-scan would read the same twenty minutes, so the prefix is the
+        song's level, not a reading to retry."""
+        _, spawn = self._child(stderr=self._printed("00:20:00.02"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=5400
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=1200.02)
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {
+            "i": -19.7,
+            "peak": -3.8,
+            "covered": 1200.02,
+        }
+        assert await fake_redis.ttl(key) > youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_cached_prefix_reads_back_with_its_coverage(
+        self, fake_redis: Any
+    ) -> None:
+        await cache_set(
+            fake_redis,
+            _loudness_cache_key(self._URL),
+            {"i": -12.5, "peak": -1.2, "covered": 1200.0},
+            60,
+        )
+        assert await measure_loudness(
+            "https://cdn/a", self._URL, fake_redis
+        ) == Loudness(i=-12.5, peak=-1.2, covered_secs=1200.0)
+
+    async def test_a_scan_stopped_at_its_deadline_keeps_ten_minutes_for_an_hour(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A slow fetch: SIGINT makes ffmpeg print the summary of what it read.
+        Ten minutes of a long recording landed within 2.5 LU of the whole, against
+        up to 9.8 off target unmeasured — but a faster fetch would read more, so
+        it is retried within the hour."""
+        assert youtube._PARTIAL_MIN_SECS == 600.0
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(hangs=True, on_stop=self._printed("00:12:00.00"))
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, fake_redis, duration=5400
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=720.0)
+        process.send_signal.assert_called_once_with(signal.SIGINT)
+        process.kill.assert_not_called()
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key))["covered"] == 720.0
+        assert await fake_redis.ttl(key) == youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_fetch_blocked_on_the_network_takes_a_second_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ffmpeg reads the first SIGINT between packets, and one stalled inside a
+        read never gets there; the ffmpeg tier measures it on the real binary."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(
+            hangs=True, on_stop=self._printed("00:12:00.00"), signals_to_stop=2
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness(
+                "https://cdn/a", self._URL, None, duration=5400
+            )
+
+        assert measured is not None and measured.covered_secs == 720.0
+        assert process.send_signal.call_count == 2
+        process.kill.assert_not_called()
+
+    @pytest.mark.parametrize("covered", ["00:09:59.00", None])
+    async def test_a_stopped_scan_short_of_ten_minutes_is_not_a_level(
+        self,
+        fake_redis: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        covered: Optional[str],
+    ) -> None:
+        """Five minutes of a long recording sat up to 2.9 LU off the whole, and a
+        reading that does not say how much it covered covers nothing provable."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        printed = (
+            self._printed(covered) if covered else TestEbur128Summary._CAPTURED.encode()
+        )
+        _, spawn = self._child(hangs=True, on_stop=printed)
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await measure_loudness(
+                    "https://cdn/a", self._URL, fake_redis, duration=5400
+                )
+                is None
+            )
+
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+
     async def test_a_scan_that_printed_no_summary_is_not_a_level(self) -> None:
         _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
         with patch("asyncio.create_subprocess_exec", new=spawn):
@@ -7779,7 +7953,8 @@ class TestMeasureLoudness:
         _, spawn = self._child(**kwargs)
         with (
             patch("asyncio.create_subprocess_exec", new=spawn),
-            patch.object(config, "loudness_scan_timeout_secs", return_value=0.01),
+            patch.object(youtube, "_SCAN_DEADLINE_SECS", 0.01),
+            patch.object(youtube, "_SCAN_STOP_GRACE_SECS", 0.01),
         ):
             assert (
                 await measure_loudness("https://cdn/a", self._URL, fake_redis) is None
@@ -7810,6 +7985,23 @@ class TestMeasureLoudness:
 
         with patch("asyncio.create_subprocess_exec", new=missing):
             assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+
+class TestScanCoveredSecs:
+    """How much audio a scan read, which decides whether a cut-short one counts."""
+
+    def test_the_closing_line_is_read(self) -> None:
+        assert (
+            youtube._scan_covered_secs("size=N/A time=01:02:03.50 bitrate=N/A")
+            == 3723.5
+        )
+
+    def test_the_last_line_wins(self) -> None:
+        printed = "time=00:00:01.00\nsize=N/A time=00:20:00.00 bitrate=N/A\n"
+        assert youtube._scan_covered_secs(printed) == 1200.0
+
+    def test_nothing_printed_is_nothing_known(self) -> None:
+        assert youtube._scan_covered_secs("I: -14.0 LUFS") is None
 
 
 def _googlevideo(clen: object, host: str = "rr1---sn-abc.googlevideo.com") -> str:
@@ -7983,7 +8175,11 @@ class TestMeasureLoudnessInRanges:
 
     @staticmethod
     def _child(
-        argv: list[Any], kwargs: dict[str, Any], *, hangs: bool = False
+        argv: list[Any],
+        kwargs: dict[str, Any],
+        *,
+        hangs: bool = False,
+        printed: bytes = TestEbur128Summary._CAPTURED.encode(),
     ) -> tuple[MagicMock, Callable[..., Awaitable[Any]]]:
         """The ffmpeg child of a ranged scan: its stderr reaches EOF once stdin is
         closed, the way the real one finishes when its input does."""
@@ -7994,7 +8190,7 @@ class TestMeasureLoudnessInRanges:
         async def read() -> bytes:
             while hangs or not process.stdin.closed:
                 await asyncio.sleep(0)
-            return TestEbur128Summary._CAPTURED.encode()
+            return printed
 
         async def wait() -> int:
             process.returncode = 0
@@ -8003,6 +8199,7 @@ class TestMeasureLoudnessInRanges:
         process.stderr.read = read
         process.wait = wait
         process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
+        process.send_signal = MagicMock()
 
         async def spawn(*args: Any, **kw: Any) -> MagicMock:
             argv.extend(args)
@@ -8124,11 +8321,88 @@ class TestMeasureLoudnessInRanges:
         process.kill.assert_called_once()
         assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
-    async def test_a_timeout_kills_the_child_and_stops_reading_it(self) -> None:
-        process, spawn = self._child([], {}, hangs=True)
-        config.loudness_scan_timeout_secs.set_override(
-            config.loudness_scan_timeout_secs.floor
+    async def test_a_long_song_is_fed_only_its_first_twenty_minutes(self) -> None:
+        """The serves are near-constant bitrate, so the same share of the bytes is
+        the same share of the song — and `-t` would end ffmpeg mid-feed, which the
+        feed would read as a broken pipe."""
+        argv: list[Any] = []
+        _, spawn = self._child(argv, {})
+        fed: list[int] = []
+
+        async def feed(_url: str, size: int, stdin: _Stdin) -> None:
+            fed.append(size)
+            stdin.close()
+
+        size = youtube._SCAN_RANGE_BYTES + 1
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            await measure_loudness(self._LONG, self._PAGE, None, duration=3600)
+            await measure_loudness(self._LONG, f"{self._PAGE}2", None, duration=1200)
+
+        assert fed == [math.ceil(size / 3), size]
+        assert "-t" not in argv
+
+    async def test_a_deadline_ends_the_feed_rather_than_signalling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Closing stdin is ffmpeg's end of input, and it prints its summary of
+        what reached it; a SIGINT racing that close is not needed."""
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        process, spawn = self._child(
+            [],
+            {},
+            printed=TestMeasureLoudness._printed("00:15:00.00"),
         )
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            try:
+                stdin.write(b"some")
+                await asyncio.Event().wait()
+            finally:
+                stdin.close()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            measured = await measure_loudness(
+                self._LONG, self._PAGE, None, duration=3600
+            )
+
+        assert measured == Loudness(i=-19.7, peak=-3.8, covered_secs=900.0)
+        process.send_signal.assert_not_called()
+        assert process.stdin.closed
+
+    async def test_a_feed_that_times_out_on_its_own_is_a_failure(self) -> None:
+        """aiohttp's own timeouts are TimeoutErrors too, and only the scan's
+        deadline means "stop and keep what was read"."""
+        process, spawn = self._child(
+            [], {}, printed=TestMeasureLoudness._printed("00:15:00.00")
+        )
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.close()
+            raise aiohttp.ServerTimeoutError("read timed out")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            assert (
+                await measure_loudness(self._LONG, self._PAGE, None, duration=3600)
+                is None
+            )
+
+        process.send_signal.assert_not_called()
+
+    async def test_a_child_that_never_finishes_is_killed_and_not_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(youtube, "_SCAN_DEADLINE_SECS", 0.01)
+        monkeypatch.setattr(youtube, "_SCAN_STOP_GRACE_SECS", 0.01)
+        process, spawn = self._child([], {}, hangs=True)
         with (
             patch("asyncio.create_subprocess_exec", new=spawn),
             patch("src.youtube._feed_ranges", new=self._feeds()),
@@ -8272,7 +8546,7 @@ class TestYtStreamLoudness:
         with patch("src.youtube.measure_loudness", new=measure):
             await self._options(LoudnessMode.NORMALIZE)
 
-        assert asked == {"wait": 3.0}
+        assert asked == {"duration": 213, "wait": 3.0}
 
     @staticmethod
     async def _no_scan(*_args: Any, **_kwargs: Any) -> Any:
@@ -8376,7 +8650,7 @@ class TestPrefetchLoudness:
     ) -> None:
         await self._cached(fake_redis)
         assert await self._measured(fake_redis) == [
-            ("https://cdn/a", self._PAGE, fake_redis, {})
+            ("https://cdn/a", self._PAGE, fake_redis, {"duration": 200})
         ]
 
     async def test_a_song_youtube_measured_is_not_scanned(

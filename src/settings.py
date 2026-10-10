@@ -531,19 +531,19 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.PLAYBACK,
         label="Loudness scan timeout",
-        summary="Time limit for measuring how loud a song is.",
+        summary="How long a song waits to be measured before it plays.",
         more=(
-            "Only a server with `loudness normalize` pays it, once per song per "
-            "month, and not for a song YouTube already sent a loudness for. Past "
-            "it the song plays at its own level."
+            "Only `loudness normalize` waits, for a song not yet measured; a "
+            "queued song is measured before its turn. Past it the song plays at "
+            "its own level, measured for next time."
         ),
-        applies="from the next song measured",
+        applies="from the next song that waits",
         knob=config.loudness_scan_timeout_secs,
         minimum=2.0,
         maximum=config.LOUDNESS_SCAN_TIMEOUT_MAX_SECS,
         why_minimum=(
-            "The scan reads the whole song from the CDN, which takes a second or "
-            "two on a healthy connection."
+            "The scan reads up to twenty minutes of the song from the CDN, which "
+            "takes a second or two on a healthy connection."
         ),
         why_maximum="Every second of it is silence before the song starts.",
     ),

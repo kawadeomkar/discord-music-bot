@@ -5,6 +5,7 @@ import functools
 import math
 import os
 import re
+import signal
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
@@ -963,6 +964,9 @@ class Loudness:
 
     i: float
     peak: float
+    # Seconds of the song the reading covers when it is a prefix of it; None when
+    # the scan read the whole song.
+    covered_secs: Optional[float] = None
 
 
 # ebur128's summary block, printed at info level once the stream ends. Anchored per
@@ -974,10 +978,27 @@ _LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", r
 # carries none of the non-evictable-key obligations.
 _LOUDNESS_TTL: Final[int] = 30 * 86400
 
-# An hour, for "this one did not measure". A song longer than the scan timeout can
-# cover fails identically every play, and without this the whole timeout is spent
-# again each time; an hour is short enough that a transient failure heals.
+# An hour, for "this one did not measure" and for a reading cut short by the scan's
+# deadline: without it every play re-pays the scan, and an hour is short enough that
+# a transient failure or a slow fetch heals.
 _LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
+# A song longer than this is measured from its first twenty minutes. On nine 43-150
+# minute mixes, albums, concerts and a podcast that prefix landed within 1.1 LU of
+# the whole, against up to 9.8 LU off the target unmeasured; re-scanning reads the
+# same prefix, so it is cached like a whole song. See docs/ARCHITECTURE.md#long-songs.
+_SCAN_MAX_AUDIO_SECS: Final[float] = 1200.0
+# All a scan may spend once it holds a slot. Past it ffmpeg is told to stop and prints
+# the summary of what it read, which is kept if it covers _PARTIAL_MIN_SECS.
+_SCAN_DEADLINE_SECS: Final[float] = 30.0
+# ffmpeg exited 18 ms after SIGINT, measured; this only bounds one that does not.
+_SCAN_STOP_GRACE_SECS: Final[float] = 2.0
+# How long a first SIGINT gets before the second (_interrupt).
+_SCAN_SECOND_SIGNAL_SECS: Final[float] = 0.25
+# Ten minutes landed within 2.5 LU of the whole on the same nine.
+_PARTIAL_MIN_SECS: Final[float] = 600.0
+# ffmpeg's closing progress line, printed even under -nostats: how much it read.
+_SCAN_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 # What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
 _SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
@@ -1077,20 +1098,69 @@ async def _feed_ranges(stream_url: str, size: int, stdin: asyncio.StreamWriter) 
         stdin.close()
 
 
-async def _scan_in_ranges(
-    process: asyncio.subprocess.Process, stream_url: str, size: int
-) -> bytes:
-    """Feed a scan its input and return what it printed. stderr is read while the
-    feed runs: a pipe nobody drains stops ffmpeg, which stops it reading stdin."""
-    assert process.stdin is not None and process.stderr is not None
+async def _run_scan(
+    process: asyncio.subprocess.Process, stream_url: str, feed_bytes: Optional[int]
+) -> tuple[bytes, bool]:
+    """Drive one scan to its end or its deadline: what ffmpeg printed, and whether
+    it was stopped early. stderr is read throughout — a pipe nobody drains stops
+    ffmpeg, which stops it reading stdin. A feed that fails raises."""
+    assert process.stderr is not None
     printed = asyncio.create_task(process.stderr.read())
+    feed: Optional[asyncio.Task[None]] = None
+    if feed_bytes is not None:
+        assert process.stdin is not None
+        feed = asyncio.create_task(_feed_ranges(stream_url, feed_bytes, process.stdin))
+    stopped = False
     try:
-        await _feed_ranges(stream_url, size, process.stdin)
-        stderr = await printed
-        await process.wait()
+        try:
+            async with asyncio.timeout(_SCAN_DEADLINE_SECS) as deadline:
+                if feed is not None:
+                    await asyncio.shield(feed)
+                await asyncio.shield(printed)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            stopped = True
+            # The end of its input, or SIGINT: either way ffmpeg finishes the
+            # stream it has and prints the summary of it.
+            if feed is not None and not feed.done():
+                await cancel_task(feed)
+            else:
+                await _interrupt(process, printed)
+            async with asyncio.timeout(_SCAN_STOP_GRACE_SECS):
+                await asyncio.shield(printed)
+        # Its summary is in hand; one that lingers past this is killed below.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_SCAN_STOP_GRACE_SECS):
+                await process.wait()
+        return printed.result(), stopped
     finally:
+        await cancel_task(feed)
         await cancel_task(printed)
-    return stderr
+
+
+async def _interrupt(
+    process: asyncio.subprocess.Process, printed: asyncio.Task[bytes]
+) -> None:
+    """Tell ffmpeg to finish what it has. It reads a first SIGINT only between
+    packets, so one blocked on a stalled fetch needs a second to break the read —
+    measured on 7.1.5 and 9.0.2. A third would abort it without the summary."""
+    for _ in range(2):
+        with contextlib.suppress(ProcessLookupError):
+            process.send_signal(signal.SIGINT)
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_SCAN_SECOND_SIGNAL_SECS):
+                await asyncio.shield(printed)
+                return
+
+
+def _scan_covered_secs(stderr: str) -> Optional[float]:
+    """How much audio a scan read, from ffmpeg's closing progress line."""
+    found = _SCAN_TIME.findall(stderr)
+    if not found:
+        return None
+    hours, minutes, seconds = found[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
@@ -1123,6 +1193,7 @@ async def measure_loudness(
     webpage_url: str,
     redis: Optional[aioredis.Redis],
     *,
+    duration: Optional[float] = None,
     wait: Optional[float] = None,
 ) -> Optional[Loudness]:
     """How loud this song is, from the cache when it has been measured before.
@@ -1143,7 +1214,12 @@ async def measure_loudness(
         return None
     if isinstance(cached, dict) and "i" in cached and "peak" in cached:
         try:
-            measured = Loudness(i=float(cached["i"]), peak=float(cached["peak"]))
+            covered = cached.get("covered")
+            measured = Loudness(
+                i=float(cached["i"]),
+                peak=float(cached["peak"]),
+                covered_secs=None if covered is None else float(covered),
+            )
         except TypeError, ValueError:
             measured = None
         if measured is not None:
@@ -1153,7 +1229,7 @@ async def measure_loudness(
 
     job = _INFLIGHT_SCANS.get(cache_key)
     if job is None:
-        job = _start_scan(stream_url, webpage_url, redis, cache_key)
+        job = _start_scan(stream_url, webpage_url, redis, cache_key, duration)
     else:
         span.set_attribute("ytdl.loudness_joined_scan", True)
     try:
@@ -1179,9 +1255,12 @@ def _start_scan(
     webpage_url: str,
     redis: Optional[aioredis.Redis],
     cache_key: str,
+    duration: Optional[float],
 ) -> asyncio.Future[Optional[Loudness]]:
     """Start the one scan of this song, registered until it settles."""
-    job = asyncio.ensure_future(_scan_in_its_own_span(stream_url, webpage_url, redis))
+    job = asyncio.ensure_future(
+        _scan_in_its_own_span(stream_url, webpage_url, redis, duration)
+    )
     _INFLIGHT_SCANS[cache_key] = job
 
     # Registered before anything awaits the job, so a caller arriving after it
@@ -1199,7 +1278,10 @@ def _start_scan(
 
 
 async def _scan_in_its_own_span(
-    stream_url: str, webpage_url: str, redis: Optional[aioredis.Redis]
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    duration: Optional[float],
 ) -> Optional[Loudness]:
     """_scan_loudness under a span of its own, and under the process-wide bound: it
     outlives the span of the caller that started it, and an ended span drops every
@@ -1211,13 +1293,14 @@ async def _scan_in_its_own_span(
             span.set_attribute(
                 "ytdl.loudness_scan_queued_secs", round(time.monotonic() - queued, 3)
             )
-            return await _scan_loudness(stream_url, webpage_url, redis)
+            return await _scan_loudness(stream_url, webpage_url, redis, duration)
 
 
 async def _scan_loudness(
     stream_url: str,
     webpage_url: str,
     redis: Optional[aioredis.Redis],
+    duration: Optional[float],
 ) -> Optional[Loudness]:
     """Measure one song with ffmpeg's ebur128 and cache the answer either way.
 
@@ -1229,55 +1312,68 @@ async def _scan_loudness(
     cache_key = _loudness_cache_key(webpage_url)
     process: Optional[asyncio.subprocess.Process] = None
     stderr = b""
+    stopped = False
     failure: Optional[str] = None
+    capped = duration is not None and duration > _SCAN_MAX_AUDIO_SECS
     # A googlevideo file over the range is fetched here and piped in: ffmpeg's one
-    # request for it is throttled past any timeout this scan has. Anything else
-    # ffmpeg reads itself, with the play path's reconnects, because a drop is
-    # remembered for an hour.
+    # request for it is throttled past any deadline this scan has. A capped one is
+    # fed the same share of its bytes as of its length: the serves are near-
+    # constant bitrate. Anything else ffmpeg reads itself, with the play path's
+    # reconnects, and stops at the cap on its own.
     size = _ranged_scan_size(stream_url) or 0
     ranged = size > _SCAN_RANGE_BYTES
-    source = ("-i", "pipe:0") if ranged else (*_SCAN_RECONNECT_ARGS, "-i", stream_url)
+    feed_bytes: Optional[int] = None
+    if ranged:
+        feed_bytes = (
+            min(size, math.ceil(size * _SCAN_MAX_AUDIO_SECS / duration))
+            if capped and duration
+            else size
+        )
+        source: tuple[str, ...] = ("-i", "pipe:0")
+    else:
+        cap = f"{_SCAN_MAX_AUDIO_SECS:g}"
+        source = (*_SCAN_RECONNECT_ARGS, "-t", cap, "-i", stream_url)
     try:
-        async with asyncio.timeout(config.loudness_scan_timeout_secs()):
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-nostats",
-                "-loglevel",
-                "info",
-                *source,
-                "-vn",
-                "-af",
-                # Sample peak, which is the one `alimiter` holds the ceiling on, and
-                # it costs what asking for no peak costs: 0.25 s against 0.98 s for
-                # `peak=true` on a four-minute song, measured.
-                "ebur128=framelog=quiet:peak=sample",
-                "-f",
-                "null",
-                "-",
-                stdin=asyncio.subprocess.PIPE if ranged else None,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            if ranged:
-                stderr = await _scan_in_ranges(process, stream_url, size)
-            else:
-                _, stderr = await process.communicate()
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-nostats",
+            "-loglevel",
+            "info",
+            *source,
+            "-vn",
+            "-af",
+            # Sample peak, which is the one `alimiter` holds the ceiling on, and it
+            # costs what asking for no peak costs: 0.25 s against 0.98 s for
+            # `peak=true` on a four-minute song, measured.
+            "ebur128=framelog=quiet:peak=sample",
+            "-f",
+            "null",
+            "-",
+            stdin=asyncio.subprocess.PIPE if ranged else None,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr, stopped = await _run_scan(process, stream_url, feed_bytes)
     except aiohttp.ClientResponseError as e:
         # Not its repr, which carries the signed URL.
         failure = f"HTTP {e.status} for a range"
     except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
         failure = repr(e)
     finally:
-        # Both the timeout and a cancellation land here, and either leaves a child
-        # holding a CDN connection. kill(), not terminate(): this one has no cleanup
-        # to do.
+        # A failure, a stop that did not end it and a cancellation all land here,
+        # and each leaves a child holding a CDN connection. kill(), not
+        # terminate(): this one has no cleanup to do.
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
 
-    measured = (
-        None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
-    )
+    printed = stderr.decode("utf-8", "replace")
+    measured = None if failure else parse_ebur128_summary(printed)
+    covered = _scan_covered_secs(printed)
+    short = covered is None or covered < _PARTIAL_MIN_SECS
+    if measured is not None and stopped and short:
+        failure = f"stopped at its deadline after {covered or 0.0:.0f}s of audio"
+        measured = None
     if measured is None:
         log.warning(
             f"loudness scan failed for {webpage_url}: {failure}"
@@ -1285,17 +1381,22 @@ async def _scan_loudness(
             else f"loudness scan printed no summary for {webpage_url}"
         )
         span.set_attribute("ytdl.loudness_scan_failed", True)
-        # Remembered for an hour rather than re-paid on every play: a song the scan
-        # timeout cannot cover times out the same way next time. Short, so a
-        # transient failure heals itself.
         await cache_set(
             redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
         )
         return None
+    value: dict[str, float] = {"i": measured.i, "peak": measured.peak}
+    if stopped or capped:
+        covered = covered if covered is not None else _SCAN_MAX_AUDIO_SECS
+        measured = replace(measured, covered_secs=covered)
+        value["covered"] = covered
+        span.set_attribute("ytdl.loudness_covered_secs", value["covered"])
     span.set_attribute("ytdl.loudness_lufs", measured.i)
-    await cache_set(
-        redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
-    )
+    span.set_attribute("ytdl.loudness_scan_stopped", stopped)
+    # A reading cut short by the deadline is a slow fetch's, retried within the
+    # hour; a capped one is what every re-scan would read again.
+    ttl = _LOUDNESS_UNMEASURED_TTL if stopped else _LOUDNESS_TTL
+    await cache_set(redis, cache_key, value, ttl)
     return measured
 
 
@@ -2608,7 +2709,9 @@ class YTDL(discord.FFmpegOpusAudio):
             return
         target = _scan_target(data)
         if target is not None:
-            await measure_loudness(target, qo.webpage_url, redis)
+            await measure_loudness(
+                target, qo.webpage_url, redis, duration=data.get("duration")
+            )
 
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
@@ -2866,6 +2969,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     target,
                     qo.webpage_url,
                     redis,
+                    duration=data.get("duration"),
                     wait=config.loudness_scan_timeout_secs(),
                 )
                 if measured is not None:

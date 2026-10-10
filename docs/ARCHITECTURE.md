@@ -2181,16 +2181,16 @@ reads `pipe:0`. Everything else — a shorter song, another host, the HLS rung, 
 no `clen` — is ffmpeg's own single request with the play path's reconnect flags. Measured
 through `measure_loudness` on live streams: 37 min in 3.5 s, 42 min in 4.0 s, 61 min in
 5.8 s, each within 0.05 dB of the `trackAbsoluteLoudnessLkfs` YouTube's own player response
-carries for the track. The 8 s default therefore covers a song of roughly an hour. The play
-path is untouched by the throttle: it reads at 1× and is served at 2×.
+carries for the track. The play path is untouched by the throttle: it reads at 1× and is
+served at 2×.
 
 **SoundCloud is HLS, and paced by its segments.** Its serves are `hls_aac_160k` and
 `hls_aac_96k` playlists of ~10 s fMP4 segments, which ffmpeg's HLS demuxer fetches one at a
 time, and none is large enough to be throttled the way a googlevideo file is. Measured live:
 a 3–9 minute song scans in 1.1–2.1 s (median 1.2 s over 24 runs), and a one-hour mix in
-10.8–11.3 s, so the 8 s default covers SoundCloud songs of about 40 minutes and a longer mix
-plays at its own level. Individual scans occasionally stall on a slow segment — 5.6 s and
-7.1 s for songs that otherwise take 1.2 — which the timeout absorbs. `-http_multiple 1`,
+10.8–11.3 s; past 20 minutes a song is measured from its start ([Long songs](#long-songs)).
+Individual scans occasionally stall on a slow segment — 5.6 s and 7.1 s for songs that
+otherwise take 1.2 — which the scan's deadline absorbs. `-http_multiple 1`,
 which fetches the next segment alongside the current one, was measured against that and
 left out: across 24 interleaved runs both forms had the same median, p90 and maximum, and
 the option is fatal on every other demuxer (`Option http_multiple not found`, exit 8), so
@@ -2221,12 +2221,58 @@ of its own is not fetched twice at all.
 `measure_loudness` caches the result under `ytdl:loudness:v1:{webpage_url}` for 30 days —
 what a song measures does not change, so the TTL is there because the entry is cheap to
 lose, not because it goes stale. A scan that measured nothing is cached too, under the same
-key for an hour (`_LOUDNESS_UNMEASURED_TTL`), so a song past the timeout costs it once an
-hour instead of on every play. Both are TTL'd and evictable, so they carry none of the
+key for an hour (`_LOUDNESS_UNMEASURED_TTL`), so a failing song costs it once an hour
+instead of on every play. Both are TTL'd and evictable, so they carry none of the
 non-evictable-key obligations in
 [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
-Livestreams — no duration — are never scanned: the scan would read until its timeout and
+Livestreams — no duration — are never scanned: the scan would read until its deadline and
 measure whatever it caught.
+
+##### Long songs
+
+A song longer than `_SCAN_MAX_AUDIO_SECS` (20 minutes) is measured from its first twenty
+minutes: ffmpeg's own `-t` on anything it fetches itself, and on the ranged path the same
+share of the file's bytes as of its length — the serves are near-constant bitrate, and `-t`
+there would end ffmpeg mid-feed, which the feed would read as a broken pipe. Closing stdin is
+ffmpeg's end of input, so it prints the summary of the prefix it was fed. The reading is
+cached for 30 days like a whole song's, with `covered` beside `i` and `peak`: every re-scan
+would read the same prefix.
+
+The cap is measured, not assumed: integrated loudness over the first N minutes against the
+whole file, on nine 43–150 minute recordings (two DJ sets, a lo-fi mix, a full album, a
+classical compilation, two concerts, a podcast and a 150-minute mix), itag 249:
+
+| Prefix | Worst error | Median error |
+|---|---|---|
+| 5 min | 2.9 LU | 1.5 LU |
+| 10 min | 2.5 LU | 1.0 LU |
+| 15 min | 1.4 LU | 0.7 LU |
+| **20 min** | **1.1 LU** | 0.7 LU |
+| 30 min | 1.5 LU | 0.3 LU |
+| 45 min (8 long enough) | 2.4 LU | 0.35 LU |
+| 60 min (7) | 1.6 LU | 0.2 LU |
+
+The error is not monotonic — a quiet movement or a loud drop later in a recording moves the
+whole — and the alternative is no gain at all, which left those nine between 0.6 and 9.8 LU
+off the target. Twenty minutes is the shortest prefix with the smallest worst case, and it is
+bounded work: about 20 MB of a 251, or 8 MB of a 249, and two seconds of decode.
+
+**A scan's deadline, and what it keeps.** Once it holds a slot a scan has
+`_SCAN_DEADLINE_SECS` (30 s). Past it the ranged feed is ended (stdin closed) or, for ffmpeg's
+own fetch, ffmpeg is sent SIGINT — twice: it reads the first only between packets, so one
+stalled inside a network read never sees it, which the ffmpeg tier pins on the real binary
+(one signal leaves it blocked; the second interrupts the read, and ffmpeg prints its summary
+and the closing `time=` line in about 0.2 s on both 7.1.5 and 9.0.2). A third would abort it
+without the summary. The reading is kept when that line says it covered at least
+`_PARTIAL_MIN_SECS` (ten minutes, within 2.5 LU above), and cached for an hour, not a month: it
+is a slow fetch's reading, and a faster one would read more. Shorter, or with no `time=`
+line, it is not a level. A child that does not stop within `_SCAN_STOP_GRACE_SECS` is killed.
+`ytdl.loudness_covered_secs` and `ytdl.loudness_scan_stopped` on the scan's span say which
+case a reading was.
+
+So the hour-long negative cache no longer meets the songs it was written for: a long song
+measures its prefix inside the deadline instead of failing at it every hour. What it still
+holds is a scan that failed — a refused URL, no summary, or a stop short of ten minutes.
 
 ##### When a song is measured
 
