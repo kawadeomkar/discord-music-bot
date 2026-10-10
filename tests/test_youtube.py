@@ -7579,21 +7579,157 @@ class TestMeasureLoudness:
         assert measured is None
         process.kill.assert_called_once()
 
-    async def test_a_cancellation_propagates_and_the_child_is_dead(self) -> None:
-        """The prefetch's contract: every bulk queue mutation awaits its cancel, so
-        nothing here may swallow one or outlive it."""
-        process, spawn = self._child(hangs=True)
+    @staticmethod
+    def _gated_child(
+        stderr: bytes,
+    ) -> tuple[MagicMock, asyncio.Event, list[int], Callable[..., Awaitable[Any]]]:
+        """A child that finishes only once the returned event is set, and a spawn
+        that counts how many times it was asked for one."""
+        process = MagicMock()
+        process.returncode = None
+        release = asyncio.Event()
+        spawned: list[int] = []
+
+        async def communicate() -> tuple[bytes, bytes]:
+            await release.wait()
+            process.returncode = 0
+            return b"", stderr
+
+        process.communicate = communicate
+        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
+
+        async def spawn(*_args: Any, **_kwargs: Any) -> MagicMock:
+            spawned.append(1)
+            return process
+
+        return process, release, spawned, spawn
+
+    async def test_a_cancelled_caller_leaves_the_scan_to_finish_and_cache(
+        self, fake_redis: Any
+    ) -> None:
+        """Every bulk queue mutation cancels the prefetch this runs inside. The scan
+        it started is the one the next play, or another guild, is waiting on."""
+        process, release, _, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
         with patch("asyncio.create_subprocess_exec", new=spawn):
             task = asyncio.ensure_future(
-                measure_loudness("https://cdn/a", self._URL, None)
+                measure_loudness("https://cdn/a", self._URL, fake_redis)
             )
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            await settle()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            job = youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)]
+            release.set()
+            assert await job == Loudness(i=-19.7, peak=-3.8)
+
+        process.kill.assert_not_called()
+        assert await fake_redis.get(_loudness_cache_key(self._URL)) is not None
+        assert not youtube._INFLIGHT_SCANS
+
+    async def test_callers_of_one_song_share_one_scan(self, fake_redis: Any) -> None:
+        """Two guilds missing the cache together, or a warm and the play it ran
+        ahead of: one fetch of the song, one answer for both."""
+        _, release, spawned, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            first = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, fake_redis)
+            )
+            second = asyncio.ensure_future(
+                measure_loudness("https://cdn/b", self._URL, fake_redis)
+            )
+            await settle()
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        assert spawned == [1]
+        assert results == [Loudness(i=-19.7, peak=-3.8)] * 2
+
+    async def test_a_caller_that_stops_waiting_plays_without_and_the_scan_caches(
+        self, fake_redis: Any
+    ) -> None:
+        """`wait` bounds the silence before a play, not the scan: what the scan
+        measures after the song started is there for its next play."""
+        _, release, _, spawn = self._gated_child(TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert (
+                await measure_loudness(
+                    "https://cdn/a", self._URL, fake_redis, wait=0.01
+                )
+                is None
+            )
+            release.set()
+            await youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)]
+
+        assert orjson.loads(await fake_redis.get(_loudness_cache_key(self._URL))) == {
+            "i": -19.7,
+            "peak": -3.8,
+        }
+
+    async def test_a_scan_cancelled_at_shutdown_kills_its_child(self) -> None:
+        """The one cancellation that reaches the scan itself. Its caller was not
+        cancelled, so it is answered "no level" rather than a CancelledError it
+        would read as its own."""
+        process, _, _, spawn = self._gated_child(b"")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            caller = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, None)
+            )
+            await settle()
+            youtube._INFLIGHT_SCANS[_loudness_cache_key(self._URL)].cancel()
+            assert await caller is None
 
         process.kill.assert_called_once()
+
+    async def test_no_more_than_two_scans_run_at_once(self) -> None:
+        """A long scan keeps about two cores busy; eight at once saturated a
+        twelve-core host and every one of them missed its bound."""
+        assert youtube._SCAN_CONCURRENCY == 2
+        process, release, spawned, spawn = self._gated_child(
+            TestEbur128Summary._CAPTURED.encode()
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            songs = [
+                asyncio.ensure_future(
+                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                )
+                for n in range(3)
+            ]
+            await settle()
+            assert len(spawned) == 2
+            release.set()
+            results = await asyncio.gather(*songs)
+
+        assert len(spawned) == 3
+        assert all(r == Loudness(i=-19.7, peak=-3.8) for r in results)
+
+    def test_the_bound_is_rebuilt_for_a_new_loop(self) -> None:
+        """A Semaphore binds to the first loop that waits on it, and the bot's loop
+        is not the first one a process (or a test run) creates."""
+
+        async def grab() -> asyncio.Semaphore:
+            return youtube._scan_slot()
+
+        first, second = asyncio.run(grab()), asyncio.run(grab())
+        assert first is not second
+
+    async def test_a_cancelled_scan_gives_its_slot_back(self) -> None:
+        process, _, spawned, spawn = self._gated_child(b"")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            for n in range(youtube._SCAN_CONCURRENCY):
+                asyncio.ensure_future(
+                    measure_loudness("https://cdn/a", f"{self._URL}{n}", None)
+                )
+            await settle()
+            for job in list(youtube._INFLIGHT_SCANS.values()):
+                job.cancel()
+            await settle()
+            assert not youtube._scan_slot().locked()
+
+        assert len(spawned) == youtube._SCAN_CONCURRENCY
 
     async def test_a_scan_that_printed_no_summary_is_not_a_level(self) -> None:
         _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
@@ -8006,7 +8142,7 @@ class TestMeasureLoudnessInRanges:
         await settle()
         assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
-    async def test_a_cancellation_propagates_and_the_child_is_dead(self) -> None:
+    async def test_a_scan_cancelled_at_shutdown_kills_its_child_and_feed(self) -> None:
         process, spawn = self._child([], {}, hangs=True)
         with (
             patch("asyncio.create_subprocess_exec", new=spawn),
@@ -8015,11 +8151,11 @@ class TestMeasureLoudnessInRanges:
             task = asyncio.ensure_future(measure_loudness(self._LONG, self._PAGE, None))
             for _ in range(5):
                 await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            youtube._INFLIGHT_SCANS[_loudness_cache_key(self._PAGE)].cancel()
+            assert await task is None
 
         process.kill.assert_called_once()
+        await settle()
         assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
 
@@ -8124,6 +8260,20 @@ class TestYtStreamLoudness:
 
         assert _PEAK_LIMITER in options
 
+    async def test_a_play_waits_for_the_scan_at_most_the_knob(self) -> None:
+        """The knob is the silence a listener sits through, so it bounds the wait
+        and not the scan, which goes on to cache what it measures."""
+        config.loudness_scan_timeout_secs.set_override(3.0)
+        asked: dict[str, Any] = {}
+
+        async def measure(*_args: Any, **kwargs: Any) -> None:
+            asked.update(kwargs)
+
+        with patch("src.youtube.measure_loudness", new=measure):
+            await self._options(LoudnessMode.NORMALIZE)
+
+        assert asked == {"wait": 3.0}
+
     @staticmethod
     async def _no_scan(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("scanned a song YouTube had already measured")
@@ -8197,6 +8347,72 @@ class TestYtStreamLoudness:
     def test_a_cache_hit_carries_the_figure(self) -> None:
         """Otherwise every cached play of a YouTube song falls back to the scan."""
         assert "loudness_lkfs" in _STREAM_CACHE_FIELDS
+
+
+class TestPrefetchLoudness:
+    """The warm half of a scan: which queued songs it measures, from what."""
+
+    _PAGE = "https://sc.com/a/b"
+
+    async def _cached(self, fake_redis: Any, **fields: Any) -> None:
+        data = {"url": "https://cdn/a", "webpage_url": self._PAGE, "duration": 200}
+        await cache_set(
+            fake_redis, youtube._stream_cache_key(self._PAGE), {**data, **fields}, 60
+        )
+
+    async def _measured(self, redis: Any) -> list[tuple[Any, ...]]:
+        calls: list[tuple[Any, ...]] = []
+
+        async def measure(*args: Any, **kwargs: Any) -> None:
+            calls.append((*args, kwargs))
+
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("src.youtube.measure_loudness", new=measure):
+            await YTDL.prefetch_loudness(qo, redis)
+        return calls
+
+    async def test_it_measures_the_cached_url_and_waits_for_all_of_it(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis)
+        assert await self._measured(fake_redis) == [
+            ("https://cdn/a", self._PAGE, fake_redis, {})
+        ]
+
+    async def test_a_song_youtube_measured_is_not_scanned(
+        self, fake_redis: Any
+    ) -> None:
+        await self._cached(fake_redis, loudness_lkfs=-9.0)
+        assert await self._measured(fake_redis) == []
+
+    async def test_a_livestream_is_not_scanned(self, fake_redis: Any) -> None:
+        await self._cached(fake_redis, duration=None)
+        assert await self._measured(fake_redis) == []
+
+    async def test_nothing_cached_is_nothing_to_measure(self, fake_redis: Any) -> None:
+        assert await self._measured(fake_redis) == []
+
+    async def test_no_redis_has_nowhere_to_leave_the_level(self) -> None:
+        assert await self._measured(None) == []
+
+    async def test_the_play_after_it_reads_the_level(self, fake_redis: Any) -> None:
+        """End to end through the real measure: the warm's scan lands in Redis and
+        the play spawns nothing."""
+        await self._cached(fake_redis)
+        _, spawn = TestMeasureLoudness._child(
+            stderr=TestEbur128Summary._CAPTURED.encode()
+        )
+        qo = QueueObject(webpage_url=self._PAGE, title="Song", requester=MagicMock())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await YTDL.prefetch_loudness(qo, fake_redis)
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("the play scanned a song its warm had measured")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            assert await measure_loudness(
+                "https://cdn/a", self._PAGE, fake_redis, wait=1.0
+            ) == Loudness(i=-19.7, peak=-3.8)
 
 
 def _player_response(video_id: object, lkfs: object) -> dict[str, Any]:

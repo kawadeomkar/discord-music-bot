@@ -1000,6 +1000,25 @@ _SCAN_RANGE_BYTES: Final[int] = 10 << 20
 _SCAN_FETCH_RETRIES: Final[int] = 2
 
 
+# How many scans run at once, process-wide. One CPU-bound scan keeps about two cores
+# busy (ffmpeg's demux, decode and filter threads); two leave most of a small host
+# to playback. See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_SCAN_CONCURRENCY: Final[int] = 2
+_scan_gate: Optional[asyncio.Semaphore] = None
+_scan_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _scan_slot() -> asyncio.Semaphore:
+    """The bound on concurrent scans, rebuilt when the running loop changes — a
+    Semaphore binds to the first loop that awaits it and refuses another."""
+    global _scan_gate, _scan_gate_loop
+    loop = asyncio.get_running_loop()
+    if _scan_gate is None or _scan_gate_loop is not loop:
+        _scan_gate = asyncio.Semaphore(_SCAN_CONCURRENCY)
+        _scan_gate_loop = loop
+    return _scan_gate
+
+
 def _loudness_cache_key(webpage_url: str) -> str:
     return f"ytdl:loudness:v1:{webpage_url}"
 
@@ -1093,21 +1112,28 @@ def normalize_gain_db(lufs: float) -> float:
     return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - lufs))
 
 
+# cache key -> the scan measuring that song right now. Callers join it through a
+# shield, so one waiter's cancellation never stops a scan another is waiting for.
+# See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_INFLIGHT_SCANS: dict[str, asyncio.Future[Optional[Loudness]]] = {}
+
+
 async def measure_loudness(
     stream_url: str,
     webpage_url: str,
     redis: Optional[aioredis.Redis],
+    *,
+    wait: Optional[float] = None,
 ) -> Optional[Loudness]:
     """How loud this song is, from the cache when it has been measured before.
 
-    None means "play it at its own level": a failed scan, a timed-out one, or no
-    summary in what ffmpeg printed. Never raises — a level is an improvement to a
-    play, not a precondition for one.
+    None means "play it at its own level": a failed scan, no summary in what ffmpeg
+    printed, or a scan still running after `wait` seconds. Never raises — a level
+    is an improvement to a play, not a precondition for one.
 
-    The child is spawned with asyncio, not run in an executor, so a cancellation
-    KILLS it: the prefetch this runs inside is cancelled by every bulk queue
-    mutation, and its contract forbids uninterruptible work there (an executor job
-    cannot be interrupted, which is why the resolve refuses to re-extract from it).
+    The scan itself is one task per song, shared by every caller: giving up on it
+    (`wait`, or a cancellation) leaves it running to its own bound, and what it
+    measures is cached for the next play.
     """
     span = trace.get_current_span()
     cache_key = _loudness_cache_key(webpage_url)
@@ -1125,6 +1151,82 @@ async def measure_loudness(
             span.set_attribute("ytdl.loudness_lufs", measured.i)
             return measured
 
+    job = _INFLIGHT_SCANS.get(cache_key)
+    if job is None:
+        job = _start_scan(stream_url, webpage_url, redis, cache_key)
+    else:
+        span.set_attribute("ytdl.loudness_joined_scan", True)
+    try:
+        async with asyncio.timeout(wait):
+            measured = await asyncio.shield(job)
+    except TimeoutError:
+        span.set_attribute("ytdl.loudness_source", "pending")
+        return None
+    except asyncio.CancelledError:
+        # The job itself was cancelled (shutdown), not this caller: no level.
+        task = asyncio.current_task()
+        if job.cancelled() and task is not None and not task.cancelling():
+            return None
+        raise
+    span.set_attribute("ytdl.loudness_source", "scan" if measured else "none")
+    if measured is not None:
+        span.set_attribute("ytdl.loudness_lufs", measured.i)
+    return measured
+
+
+def _start_scan(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    cache_key: str,
+) -> asyncio.Future[Optional[Loudness]]:
+    """Start the one scan of this song, registered until it settles."""
+    job = asyncio.ensure_future(_scan_in_its_own_span(stream_url, webpage_url, redis))
+    _INFLIGHT_SCANS[cache_key] = job
+
+    # Registered before anything awaits the job, so a caller arriving after it
+    # settles reads the cache rather than joining a finished scan.
+    def _settle(finished: asyncio.Future[Optional[Loudness]]) -> None:
+        if _INFLIGHT_SCANS.get(cache_key) is finished:
+            del _INFLIGHT_SCANS[cache_key]
+        if not finished.cancelled() and finished.exception() is not None:
+            log.warning(
+                f"loudness scan crashed for {webpage_url}: {finished.exception()!r}"
+            )
+
+    job.add_done_callback(_settle)
+    return job
+
+
+async def _scan_in_its_own_span(
+    stream_url: str, webpage_url: str, redis: Optional[aioredis.Redis]
+) -> Optional[Loudness]:
+    """_scan_loudness under a span of its own, and under the process-wide bound: it
+    outlives the span of the caller that started it, and an ended span drops every
+    attribute written to it. Its own deadline starts once it holds a slot."""
+    with _tracer.start_as_current_span("ytdl.loudness_scan") as span:
+        span.set_attribute("ytdl.url", webpage_url)
+        queued = time.monotonic()
+        async with _scan_slot():
+            span.set_attribute(
+                "ytdl.loudness_scan_queued_secs", round(time.monotonic() - queued, 3)
+            )
+            return await _scan_loudness(stream_url, webpage_url, redis)
+
+
+async def _scan_loudness(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+) -> Optional[Loudness]:
+    """Measure one song with ffmpeg's ebur128 and cache the answer either way.
+
+    The child is spawned with asyncio, not run in an executor, so a cancellation
+    KILLS it — which only the process's own shutdown does, since every caller
+    joins through a shield.
+    """
+    span = trace.get_current_span()
+    cache_key = _loudness_cache_key(webpage_url)
     process: Optional[asyncio.subprocess.Process] = None
     stderr = b""
     failure: Optional[str] = None
@@ -1166,9 +1268,9 @@ async def measure_loudness(
     except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
         failure = repr(e)
     finally:
-        # Both the timeout and an outer cancellation land here, and either leaves a
-        # child holding a CDN connection. kill(), not terminate(): this one has no
-        # cleanup to do.
+        # Both the timeout and a cancellation land here, and either leaves a child
+        # holding a CDN connection. kill(), not terminate(): this one has no cleanup
+        # to do.
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
@@ -1182,7 +1284,7 @@ async def measure_loudness(
             if failure
             else f"loudness scan printed no summary for {webpage_url}"
         )
-        span.set_attribute("ytdl.loudness_source", "none")
+        span.set_attribute("ytdl.loudness_scan_failed", True)
         # Remembered for an hour rather than re-paid on every play: a song the scan
         # timeout cannot cover times out the same way next time. Short, so a
         # transient failure heals itself.
@@ -1190,7 +1292,6 @@ async def measure_loudness(
             redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
         )
         return None
-    span.set_attribute("ytdl.loudness_source", "scan")
     span.set_attribute("ytdl.loudness_lufs", measured.i)
     await cache_set(
         redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
@@ -1212,6 +1313,15 @@ def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
     span.set_attribute("ytdl.loudness_source", "youtube")
     span.set_attribute("ytdl.loudness_lufs", float(lkfs))
     return float(lkfs)
+
+
+def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
+    """The URL a scan of this song reads, or None when it is not to be scanned.
+    Livestreams (no duration) never are: the scan would read until its bound and
+    measure whatever it happened to catch."""
+    if not data.get("duration") or not data.get("url"):
+        return None
+    return data["url"]
 
 
 def _source_cache_key(search: str) -> str:
@@ -2481,6 +2591,25 @@ class YTDL(discord.FFmpegOpusAudio):
             return _enrich_queueobject(qo, data)
         return None
 
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.prefetch_loudness")
+    async def prefetch_loudness(
+        cls, qo: QueueObject, redis: Optional[aioredis.Redis]
+    ) -> None:
+        """Measure a queued song before its turn, from the stream URL its warm just
+        cached, so a normalizing guild's play reads the level from Redis instead of
+        waiting on the scan. Waits for the whole scan: nobody is listening here.
+        See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        if redis is None:
+            return
+        data = await _stream_cache_get(redis, _stream_cache_key(qo.webpage_url))
+        if data is None or _player_loudness(data) is not None:
+            return
+        target = _scan_target(data)
+        if target is not None:
+            await measure_loudness(target, qo.webpage_url, redis)
+
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
         """The audio URLs to try for this song, best first.
@@ -2729,12 +2858,16 @@ class YTDL(discord.FFmpegOpusAudio):
         gain_db: Optional[float] = None
         if loudness is LoudnessMode.NORMALIZE:
             span = trace.get_current_span()
-            # YouTube's own figure costs nothing; the scan is for a song without
-            # one. Livestreams (no duration) are never scanned: the scan would read
-            # until its timeout and measure whatever it happened to catch.
+            # YouTube's own figure costs nothing; the scan is for a song without one.
             lufs = _player_loudness(data)
-            if lufs is None and data.get("duration"):
-                measured = await measure_loudness(data["url"], qo.webpage_url, redis)
+            target = _scan_target(data) if lufs is None else None
+            if target is not None:
+                measured = await measure_loudness(
+                    target,
+                    qo.webpage_url,
+                    redis,
+                    wait=config.loudness_scan_timeout_secs(),
+                )
                 if measured is not None:
                     lufs = measured.i
                     # The gain asked for, against what fits under the ceiling. A
