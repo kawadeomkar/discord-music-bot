@@ -2126,8 +2126,58 @@ Why a static gain rather than a normalizing filter, measured on the same loud/qu
 for it costs what asking for no peak costs: 0.25 s against 0.98 s for `peak=true` on a
 four-minute song, measured on ffmpeg 9.0.2. That puts the decode near 960× realtime — 0.40 s
 of CPU for four minutes, 2.87 s for an hour — so what bounds a scan is fetching the audio a
-second time.
+second time, and how that fetch is made decides whether a long song can be measured at all.
 
+**A song over 10 MB is fetched in ranges.** googlevideo serves a single request spanning
+more than about 10 MB at ~33 KB/s — twice realtime — from its first byte, and that is the
+request ffmpeg makes (`Range: bytes=0-`). Measured live: a 6.0 MB and a 9.0 MB file arrive
+whole in 0.2 s, while a 16.2 MB one delivers 279 KB in 8 s, so a fifteen-minute song needs
+about 450 s and no value of the knob reaches it. The same file asked for as
+`Range: bytes=a-b` in 10 MB spans is served at 20–45 MB/s. yt-dlp downloads in the same
+spans for the same reason (`CHUNK_SIZE = 10 << 20` in its YouTube extractor, surfaced as
+`downloader_options.http_chunk_size`). So for a googlevideo URL whose `clen` is over
+`_SCAN_RANGE_BYTES`, `_feed_ranges` fetches the spans over the
+[stream probe session](#stream-probe-session) and writes them to ffmpeg's stdin, and ffmpeg
+reads `pipe:0`. Everything else — a shorter song, another host, the HLS rung, which carries
+no `clen` — is ffmpeg's own single request with the play path's reconnect flags. Measured
+through `measure_loudness` on live streams: 37 min in 3.5 s, 42 min in 4.0 s, 61 min in
+5.8 s, each within 0.05 dB of the `trackAbsoluteLoudnessLkfs` YouTube's own player response
+carries for the track. The 8 s default therefore covers a song of roughly an hour. The play
+path is untouched by the throttle: it reads at 1× and is served at 2×.
+
+**SoundCloud is HLS, and paced by its segments.** Its serves are `hls_aac_160k` and
+`hls_aac_96k` playlists of ~10 s fMP4 segments, which ffmpeg's HLS demuxer fetches one at a
+time, and none is large enough to be throttled the way a googlevideo file is. Measured live:
+a 3–9 minute song scans in 1.1–2.1 s (median 1.2 s over 24 runs), and a one-hour mix in
+10.8–11.3 s, so the 8 s default covers SoundCloud songs of about 40 minutes and a longer mix
+plays at its own level. Individual scans occasionally stall on a slow segment — 5.6 s and
+7.1 s for songs that otherwise take 1.2 — which the timeout absorbs. `-http_multiple 1`,
+which fetches the next segment alongside the current one, was measured against that and
+left out: across 24 interleaved runs both forms had the same median, p90 and maximum, and
+the option is fatal on every other demuxer (`Option http_multiple not found`, exit 8), so
+it would need its own HLS gate for no measured gain. The ffmpeg tier pins that an HLS
+playlist scans through the same argv as everything else.
+
+The feed owns what the reconnect flags own on the other path. A connection that dies, or a
+5xx, resumes at the byte it reached, at most `_SCAN_FETCH_RETRIES` (2) times a scan; any
+other status ends it at once — a 403 is a revoked URL, and a 200 is a server that ignored
+the range and is sending the file from byte 0. A feed that fails is a failed scan even
+though ffmpeg exits 0 and prints a summary of the audio that did reach it: the feed's
+exception is what `measure_loudness` reads, not the summary. The ffmpeg tier pins the seam
+— real aiohttp ranges into a real ffmpeg's stdin, a range that dies and is resumed with
+every byte delivered once, and ranges that keep dying yielding no level.
+
+Two ways of keeping the fetch inside ffmpeg were measured and are not used. Its `concat:`
+protocol over `&range=` URLs refuses the http reconnect options (`Option reconnect not
+found`, exit 8), and against a local server whose last piece died mid-body it re-requested
+the pieces in a tight loop — about 50,000 requests in 6 s — until killed. `-request_size`,
+which makes ffmpeg issue bounded ranges itself, exists on 9.0 and not on the image's 7.1.5,
+where an unknown option fails every scan at argv parse.
+
+One observation from the measuring, a single address on a single evening: after one
+video's audio had been fetched in full about five times inside two hours, fresh URLs for it
+answered 403 to any range past the first megabyte. A scan is one extra fetch per song per
+30 days, which is the distance the cache keeps from that.
 `measure_loudness` caches the result under `ytdl:loudness:v1:{webpage_url}` for 30 days —
 what a song measures does not change, so the TTL is there because the entry is cheap to
 lose, not because it goes stale. A scan that measured nothing is cached too, under the same
@@ -2755,7 +2805,10 @@ Four things cross into the worker processes, each with its own contract:
 
 `_probe_stream_url` runs before every song and holds one process-wide
 `ClientSession`. What that buys is narrower than it looks, and the two properties
-below are the reason the shape is what it is.
+below are the reason the shape is what it is. The ranged loudness scan
+([Loudness normalization](#loudness-normalization)) borrows the session for the cookie
+jar below; its requests read their bodies and pass `ClientTimeout(total=None)`, since
+the scan's own timeout bounds them and the 5 s backstop would cut a long fetch short.
 
 **It does not pool connections, and cannot.** The probe passes `read_bufsize=0` and
 calls `response.close()` on an unread body, because a revoked URL still answers 206
