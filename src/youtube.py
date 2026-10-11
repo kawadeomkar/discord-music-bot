@@ -273,6 +273,9 @@ class YTDLVideoMetadata(TypedDict, total=False):
     # Not yt-dlp's: the loudness YouTube's own player normalizes this song against,
     # lifted from the player response in the worker (_lift_player_loudness).
     loudness_lkfs: float
+    # Not yt-dlp's: the served track's itag 249, which a loudness scan reads in
+    # place of the 251 that plays (_lift_scan_url, _scan_target).
+    scan_url: str
     # The song's audio ladder, best first, candidate[0] being the format above.
     # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
     # revoked URL costs one sideways probe instead of the song.
@@ -563,6 +566,25 @@ def _lift_player_loudness(node: dict[str, Any]) -> None:
     node["loudness_lkfs"] = lkfs
 
 
+def _lift_scan_url(node: dict[str, Any]) -> None:
+    """Keep the URL of the served track's itag 249 before `formats` leaves: the
+    retry ladder keeps three rungs, 251-140-250 on a typical video, so 249 is
+    rarely one of them. Not for a song _lift_player_loudness already gave a figure,
+    which is never scanned. See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    served = _ITAG_FORMAT_ID.fullmatch(str(node.get("format_id") or ""))
+    formats = node.get("formats")
+    if served is None or not isinstance(formats, list) or "loudness_lkfs" in node:
+        return
+    # The track suffix, so a dub's scan reads the dub: `251-23` -> `249-23`.
+    twin = "249" + served[0][len(served[1]) :]
+    if twin == served[0]:
+        return
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("format_id") == twin and fmt.get("url"):
+            node["scan_url"] = fmt["url"]
+            return
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
@@ -581,6 +603,7 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     for node in nodes:
         _lift_thumbnail(node)
         _lift_player_loudness(node)
+        _lift_scan_url(node)
         candidates = _mine_audio_candidates(node)
         if candidates:
             node["audio_candidates"] = candidates
@@ -850,6 +873,8 @@ _STREAM_CACHE_FIELDS = frozenset(
         # sideways probe rather than a re-extraction. This key is TTL'd and
         # evictable, so it carries no golden-rule-12 obligation.
         "audio_candidates",
+        # One more such URL; a cache hit without it scans the 251 that plays.
+        "scan_url",
     }
 )
 
@@ -1028,7 +1053,7 @@ _PARTIAL_MIN_SECS: Final[float] = 600.0
 _SCAN_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 # Sample peak, which is the one `alimiter` holds the ceiling on, and it costs what
-# asking for no peak costs: 0.25 s against 0.98 s for `peak=true` on a four-minute
+# asking for no peak costs: 0.35 s against 0.82 s for `peak=true` on a 3½-minute
 # song, measured.
 _SCAN_FILTER: Final[str] = "ebur128=framelog=quiet:peak=sample"
 
@@ -1395,7 +1420,18 @@ def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
     measure whatever it happened to catch."""
     if not data.get("duration") or not data.get("url"):
         return None
-    return data["url"]
+    return _smallest_opus_url(data) or data["url"]
+
+
+def _smallest_opus_url(data: YTDLVideoInfo) -> Optional[str]:
+    """The served track's itag 249, which the worker lifted. Its integrated
+    loudness matched 251's within 0.1 LU on eleven videos at 35-42 % of the bytes;
+    its sample peak reads up to 2.9 dB higher, which only the span reports. A song
+    promoted onto a `-drc` rung keeps the lift but is scanned as served.
+    See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+    if _ITAG_FORMAT_ID.fullmatch(str(data.get("format_id") or "")) is None:
+        return None
+    return data.get("scan_url")
 
 
 async def _song_loudness(
