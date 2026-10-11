@@ -318,6 +318,26 @@ class TestRegistryInvariants:
                 suffix = "_secs" if spec.kind in _TIME_KINDS else ""
                 assert spec.field == spec.key.replace("-", "_") + suffix, spec.key
 
+    def test_13_every_choice_spec_lists_its_values_and_defaults_to_one(self) -> None:
+        """A CHOICE with no choices accepts nothing, and choices on any other kind
+        are never read — both are typos with no runtime symptom. SettingSpec
+        refuses either at import; this is the standing assertion that it does."""
+        for spec in SETTINGS:
+            assert bool(spec.choices) == (spec.kind is SettingKind.CHOICE), spec.key
+            if spec.choices:
+                assert spec.default in spec.choices, spec.key
+                assert len(set(spec.choices)) == len(spec.choices), spec.key
+                for choice in spec.choices:
+                    assert choice == settings._fold(choice), spec.key
+
+    def test_13_a_choice_spec_without_choices_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="choices belong to CHOICE"):
+            dataclasses.replace(_spec("loudness"), choices=())
+
+    def test_13_a_default_outside_the_choices_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="is not a choice"):
+            dataclasses.replace(_spec("loudness"), default="loud")
+
     def test_11_debug_deadline_outlasts_the_postgres_block(self) -> None:
         from src import debug
 
@@ -695,6 +715,37 @@ class TestSwitch:
 
     def test_anything_else_is_refused(self) -> None:
         assert isinstance(parse_value(_spec("debug"), "maybe"), Refusal)
+
+
+class TestChoice:
+    """A CHOICE takes one of the names its spec lists, folded like every other
+    value the grammar reads."""
+
+    @pytest.mark.parametrize("value", ["off", "PEAK", "  normalize  ", "Normalize"])
+    def test_a_listed_name_is_accepted_in_any_case(self, value: str) -> None:
+        assert parse_value(_spec("loudness"), value) == Parsed(
+            value=value.strip().lower()
+        )
+
+    @pytest.mark.parametrize("value", ["loud", "", "on", "0.5", "peak peak"])
+    def test_anything_else_is_refused(self, value: str) -> None:
+        result = parse_value(_spec("loudness"), value)
+        assert isinstance(result, Refusal)
+        assert result.reason is RefusalReason.BAD_SHAPE
+
+    def test_the_refusal_names_every_choice(self) -> None:
+        """There are never many, and a user who misspelled one should not have to
+        ask what the others are."""
+        result = parse_value(_spec("loudness"), "loud")
+        assert isinstance(result, Refusal)
+        for choice in _spec("loudness").choices:
+            assert f"`{choice}`" in result.text
+
+    def test_the_stored_value_is_the_choice_verbatim(self) -> None:
+        """The wire holds what LoudnessMode names, so from_redis can read it back."""
+        assert set(_spec("loudness").choices) == {
+            mode.value for mode in guild_state.LoudnessMode
+        }
 
 
 class TestTimezone:
@@ -2055,13 +2106,17 @@ class TestGuildSettingsWritePath:
 
         await guild_settings.write(_GUILD, GuildConfig(volume=0.3))
         await guild_settings.write(_GUILD, GuildConfig(timezone="Europe/London"))
+        await guild_settings.write(_GUILD, GuildConfig(loudness="normalize"))
         assert player.volume == 0.3
         assert player.timezone == ZoneInfo("Europe/London")
+        assert player.loudness is guild_state.LoudnessMode.NORMALIZE
 
         await guild_settings.reset(_GUILD, ConfigField.VOLUME)
         await guild_settings.reset(_GUILD, ConfigField.TIMEZONE)
+        await guild_settings.reset(_GUILD, ConfigField.LOUDNESS)
         assert player.volume == guild_state.DEFAULT_VOLUME
         assert player.timezone == ZoneInfo(guild_state.DEFAULT_TIMEZONE)
+        assert player.loudness is guild_state.LoudnessMode.OFF
 
     async def test_a_volume_reset_clears_both_copies(
         self, guild_cog: Any, fake_redis: aioredis.Redis

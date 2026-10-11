@@ -2091,6 +2091,31 @@ class TestUpdateConfig:
         assert await store.update_config(GuildConfig(np_refresh_secs=10.0)) is True
         assert await fake_redis.ttl(store.config_key()) == -1
 
+    async def test_a_loudness_mode_is_stored_by_its_own_name(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Loudness has no writer of its own: there is nothing to validate past the
+        grammar and no second copy to keep, so it rides the generic writer."""
+        assert await store.update_config(GuildConfig(loudness="normalize")) is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"loudness"] == (
+            b"normalize"
+        )
+
+    async def test_the_loudness_write_clears_an_expiry_it_finds(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.hset(store.config_key(), "debug_mode", "1")
+        await fake_redis.expire(store.config_key(), 60)
+        assert await store.update_config(GuildConfig(loudness="peak")) is True
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_a_stored_loudness_choice_is_resettable(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.update_config(GuildConfig(loudness="peak"))
+        assert await store.reset_config_fields(ConfigField.LOUDNESS) is True
+        assert not await fake_redis.hexists(store.config_key(), "loudness")
+
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         change = GuildConfig(np_refresh_secs=10.0)
         assert await broken_store.update_config(change) is False

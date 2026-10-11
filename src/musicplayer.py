@@ -41,6 +41,7 @@ from src.guild_state import (
     ConfigField,
     GuildConfig,
     HistoryEntry,
+    LoudnessMode,
     NowPlayingData,
     SongQueueEntry,
 )
@@ -303,6 +304,7 @@ class MusicPlayer:
         "play_message",
         "history",
         "volume",
+        "loudness",
         "timezone",
         "_player",
         "_prefetch_task",
@@ -415,6 +417,9 @@ class MusicPlayer:
         self.play_next = asyncio.Event()
         self.play_message: Optional[discord.Embed] = None
         self.volume = DEFAULT_VOLUME
+        # OFF until a restore says otherwise: a guild that never chose plays
+        # filterless, and bit-copied.
+        self.loudness = LoudnessMode.OFF
         # Replaced at restore from GuildConfig.
         self.timezone = ZoneInfo(DEFAULT_TIMEZONE)
 
@@ -820,15 +825,16 @@ class MusicPlayer:
     # ── State restore ─────────────────────────────────────────────────────────
 
     def _adopt_cached_settings(self) -> None:
-        """The volume and zone the settings cache holds, taken before any read. The
-        cache keeps a write that did not reach Redis, which seed() never replaces,
-        and it is all a player has without a store or a readable snapshot."""
+        """Every setting the cache holds, taken before any read. The cache keeps a
+        write that did not reach Redis, which seed() never replaces, and it is all a
+        player has without a store or a readable snapshot."""
         cached = self._cog.guild_settings.peek(self._guild.id)
         if cached is None:
             return
         if cached.volume is not None:
             self.volume = cached.volume
         self.timezone = cached.tzinfo()
+        self.loudness = cached.loudness_mode()
 
     async def _restore_state(self) -> None:
         """Restore queue, history, and volume from Redis after a restart. Runs as a
@@ -873,6 +879,9 @@ class MusicPlayer:
                         if ConfigField.TIMEZONE in accepted:
                             # tzinfo() degrades an unset or unusable name.
                             self.timezone = snapshot.config.tzinfo()
+                        if ConfigField.LOUDNESS in accepted:
+                            # loudness_mode() degrades an unset or unknown mode.
+                            self.loudness = snapshot.config.loudness_mode()
                         # Config, then the legacy :state copy; both are in domain.
                         stored_volume = snapshot.stored_volume
                         if ConfigField.VOLUME in accepted and stored_volume is not None:
@@ -2111,6 +2120,7 @@ class MusicPlayer:
                 source,
                 self._channel,
                 volume=self.volume,
+                loudness=self.loudness,
                 channel_bitrate=self._channel_bitrate(),
                 redis=self.store.redis if self.store is not None else None,
                 allow_reextract=allow_reextract,
