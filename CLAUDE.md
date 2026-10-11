@@ -27,7 +27,7 @@ The tier boundary is a rule, not a preference, and it governs reads in BOTH mode
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,790 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 60-test `redis` tier (testcontainers), and a 21-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~97%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~6,070 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 60-test `redis` tier (testcontainers), and a 28-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~97%) |
 | Lint/types | ruff 0.16.8 (format + lint) and pyright 1.1.414 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -220,7 +220,7 @@ Discord gateway/voice                    YouTube / Spotify / SoundCloud CDNs
 └───────────────────┼─────────────────────────┘
                     ▼
    Redis 7 (AOF) ── guild:{id}:{state,queue,now_playing,history}
-                    ytdl:source:* / ytdl:stream:* / spotify:* caches
+                    ytdl:source:* / ytdl:stream:* / ytdl:loudness:* / spotify:* caches
                     lock:guild:{id}:recovery
                     history:outbox  (STREAM + "drainers" consumer group, no TTL)
                          │

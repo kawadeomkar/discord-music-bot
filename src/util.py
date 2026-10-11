@@ -155,6 +155,50 @@ def spawn_background(
     return task
 
 
+def start_single_flight[T](
+    registry: dict[str, asyncio.Future[T]],
+    key: str,
+    coro: Coroutine[Any, Any, T],
+    failure: str,
+) -> asyncio.Future[T]:
+    """Run `coro` as the one job for `key`, registered in `registry` until it
+    settles. The done-callback is attached before anything can await the job, so a
+    caller resuming after it settles finds the key gone rather than joining a
+    finished job. Nobody is obliged to await the result, so the callback retrieves
+    any exception itself and logs it after `failure`."""
+    job = asyncio.ensure_future(coro)
+    registry[key] = job
+
+    def _settle(finished: asyncio.Future[T]) -> None:
+        if registry.get(key) is finished:
+            del registry[key]
+        if not finished.cancelled() and finished.exception() is not None:
+            log.warning(f"{failure}: {finished.exception()!r}")
+
+    job.add_done_callback(_settle)
+    return job
+
+
+class LoopSemaphore:
+    """A process-wide asyncio.Semaphore, rebuilt when the running loop changes: a
+    Semaphore binds to the first loop that awaits it and refuses another. Calling
+    it answers the current loop's semaphore, sized by `size` at each rebuild."""
+
+    __slots__ = ("_loop", "_semaphore", "_size")
+
+    def __init__(self, size: Callable[[], int]) -> None:
+        self._size = size
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def __call__(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._semaphore is None or self._loop is not loop:
+            self._semaphore = asyncio.Semaphore(self._size())
+            self._loop = loop
+        return self._semaphore
+
+
 async def _typing_keepalive(ctx: commands.Context) -> None:
     try:
         async with ctx.typing():

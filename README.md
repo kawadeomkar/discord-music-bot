@@ -554,6 +554,7 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. Generous on purpose: every second of it can be another member's legitimate lookup, and expiring early is a refusal nobody needed. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
 | `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a single-track `-play` takes before the bot says it is still looking the song up; a playlist shows the live progress card instead. One notice per channel at a time, and the message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5. A server can set its own with `-settings slow-notice` (4–60s), or turn the notice off |
 | `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine. Floored at 0.1 |
+| `LOUDNESS_SCAN_TIMEOUT_SECS` | | `8.0` | How long a play in a server running `-settings loudness normalize` waits for its song to be measured, when it has not been in the last 30 days. YouTube songs normally skip it — their loudness arrives with the extraction — and a song queued behind another is measured while it waits its turn, so it is paid mostly by the first song of a session from another source. Every second of it is silence before that play. Past it the song plays at its own level under the peak ceiling alone, and the measurement finishes in the background for its next play. A song longer than 20 minutes is measured from its first twenty. Only that mode scans, and livestreams never do. Floored at 1.0; `-settings bot loudness-scan-timeout` moves it within 2–20s |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card. Floored at 1.0: every edit counts against the channel's rate limit, which the bot's other messages share. A server can make its own bar slower with `-settings np-refresh`, never faster |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `QUEUE_PROGRESS_DELAY_SECS` | | `2.5` | How long a playlist enqueue resolves before the live progress card appears. Above the ~2.0s a ten-track collection takes end to end, so the common case still sees exactly what it saw before. One card per channel. Floored at 0.05. A server can set its own with `-settings queue-progress-delay` (2–60s) |
@@ -917,6 +918,31 @@ deploying — is under
 [Backfilling history that predates the archive](#backfilling-history-that-predates-the-archive).
 Deliberately not repeated here: two copies of an irreversible runbook is how one of them
 ends up missing the step that matters.
+
+## Troubleshooting
+
+### The bot sounds muffled or quiet to one person
+
+The stream every listener receives is the same packets. When one person hears it muffled,
+thin or quiet and nobody else does, the cause is on their side:
+
+- **A phone with the microphone live.** iOS and Android switch the app into call
+  processing while a mic is open, which narrows the phone's own output. Push-to-talk, or
+  muting, restores it.
+- **Per-user volume.** Right-click the bot in the voice channel — that slider is theirs
+  alone, and it starts wherever they last left it.
+- **The output device.** A headset switching between its call and media profiles, or an
+  equaliser left on, changes the bot and nothing else in the channel.
+
+Discord's Automatic Gain Control and Noise Suppression are worth ruling out of the
+question rather than trying: both process that person's own microphone, so neither can
+change how the bot sounds to them.
+
+If *everyone* hears it, it is the stream, and the only two settings that change how a song
+sounds are `-settings volume` and `-settings loudness` (whose `off` is the default, and the
+only value that sends YouTube's own bitstream through untouched). Which format a song is
+playing from is not in chat — it rides the `ytdl.format_id` and `ytdl.opus_passthrough`
+attributes on that song's trace.
 
 ## Architecture
 
