@@ -30,6 +30,7 @@ from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
 from src.telemetry import get_tracer
 from src.util import (
+    LoopSemaphore,
     PoolSlotUnavailable,
     ProgressFn,
     cancel_task,
@@ -37,6 +38,7 @@ from src.util import (
     fmt_duration,
     get_logger,
     spawn_background,
+    start_single_flight,
 )
 from src import ytdlp_pool as ytdlp_pool_module
 from src.ytdlp_pool import YtdlpPool
@@ -1023,6 +1025,13 @@ _SCAN_RANGE_BYTES: Final[int] = 10 << 20
 _SCAN_FETCH_RETRIES: Final[int] = 2
 
 
+# How many scans run at once, process-wide. One CPU-bound scan keeps about two cores
+# busy (ffmpeg's demux, decode and filter threads); two leave most of a small host
+# to playback. See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_SCAN_CONCURRENCY: Final[int] = 2
+_scan_slot = LoopSemaphore(lambda: _SCAN_CONCURRENCY)
+
+
 def _loudness_cache_key(webpage_url: str) -> str:
     return f"ytdl:loudness:v1:{webpage_url}"
 
@@ -1116,21 +1125,28 @@ def normalize_gain_db(lufs: float) -> float:
     return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - lufs))
 
 
+# cache key -> the scan measuring that song right now. Callers join it through a
+# shield, so one waiter's cancellation never stops a scan another is waiting for.
+# See docs/ARCHITECTURE.md#when-a-song-is-measured.
+_INFLIGHT_SCANS: dict[str, asyncio.Future[Optional[Loudness]]] = {}
+
+
 async def measure_loudness(
     stream_url: str,
     webpage_url: str,
     redis: Optional[aioredis.Redis],
+    *,
+    wait: Optional[float] = None,
 ) -> Optional[Loudness]:
     """How loud this song is, from the cache when it has been measured before.
 
-    None means "play it at its own level": a failed scan, a timed-out one, or no
-    summary in what ffmpeg printed. Never raises — a level is an improvement to a
-    play, not a precondition for one.
+    None means "play it at its own level": a failed scan, no summary in what ffmpeg
+    printed, or a scan still running after `wait` seconds. Never raises — a level
+    is an improvement to a play, not a precondition for one.
 
-    The child is spawned with asyncio, not run in an executor, so a cancellation
-    KILLS it: the prefetch this runs inside is cancelled by every bulk queue
-    mutation, and its contract forbids uninterruptible work there (an executor job
-    cannot be interrupted, which is why the resolve refuses to re-extract from it).
+    The scan itself is one task per song, shared by every caller: giving up on it
+    (`wait`, or a cancellation) leaves it running to its own bound, and what it
+    measures is cached for the next play.
     """
     span = trace.get_current_span()
     cache_key = _loudness_cache_key(webpage_url)
@@ -1144,6 +1160,51 @@ async def measure_loudness(
         span.set_attribute("ytdl.loudness_lufs", measured.i)
         return measured
 
+    job = _INFLIGHT_SCANS.get(cache_key)
+    if job is None:
+        job = start_single_flight(
+            _INFLIGHT_SCANS,
+            cache_key,
+            _loudness_scan(stream_url, webpage_url, redis),
+            f"loudness scan crashed for {webpage_url}",
+        )
+    else:
+        span.set_attribute("ytdl.loudness_joined_scan", True)
+    try:
+        async with asyncio.timeout(wait):
+            measured = await asyncio.shield(job)
+    except TimeoutError:
+        span.set_attribute("ytdl.loudness_source", "pending")
+        return None
+    except asyncio.CancelledError:
+        # The job itself was cancelled (shutdown), not this caller: no level.
+        task = asyncio.current_task()
+        if job.cancelled() and task is not None and not task.cancelling():
+            return None
+        raise
+    span.set_attribute("ytdl.loudness_source", "scan" if measured else "none")
+    if measured is not None:
+        span.set_attribute("ytdl.loudness_lufs", measured.i)
+    return measured
+
+
+@_tracer.start_as_current_span("ytdl.loudness_scan")
+async def _loudness_scan(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+) -> Optional[Loudness]:
+    """Measure one song with ffmpeg's ebur128 and cache the answer either way.
+
+    It runs as a job of its own under a span of its own: it outlives the span of the
+    caller that started it, and an ended span drops every attribute written to it.
+    The child is spawned with asyncio, not run in an executor, so a cancellation
+    KILLS it — which only the process's own shutdown does, since every caller
+    joins through a shield.
+    """
+    span = trace.get_current_span()
+    span.set_attribute("ytdl.url", webpage_url)
+    cache_key = _loudness_cache_key(webpage_url)
     process: Optional[asyncio.subprocess.Process] = None
     stderr = b""
     failure: Optional[str] = None
@@ -1154,40 +1215,47 @@ async def measure_loudness(
     size = _ranged_scan_size(stream_url) or 0
     ranged = size > _SCAN_RANGE_BYTES
     source = ("-i", "pipe:0") if ranged else (*_RECONNECT_ARGS, "-i", stream_url)
-    try:
-        async with asyncio.timeout(config.loudness_scan_timeout_secs()):
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-nostats",
-                "-loglevel",
-                "info",
-                *source,
-                "-vn",
-                "-af",
-                _SCAN_FILTER,
-                "-f",
-                "null",
-                "-",
-                stdin=asyncio.subprocess.PIPE if ranged else None,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            if ranged:
-                stderr = await _scan_in_ranges(process, stream_url, size)
-            else:
-                _, stderr = await process.communicate()
-    except aiohttp.ClientResponseError as e:
-        # Not its repr, which carries the signed URL.
-        failure = f"HTTP {e.status} for a range"
-    except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
-        failure = repr(e)
-    finally:
-        # Both the timeout and an outer cancellation land here, and either leaves a
-        # child holding a CDN connection. kill(), not terminate(): this one has no
-        # cleanup to do.
-        if process is not None and process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
+    # The process-wide bound holds the fetch and the decode, not the bookkeeping;
+    # the scan's deadline starts once it holds a slot.
+    queued = time.monotonic()
+    async with _scan_slot():
+        span.set_attribute(
+            "ytdl.loudness_scan_queued_secs", round(time.monotonic() - queued, 3)
+        )
+        try:
+            async with asyncio.timeout(config.loudness_scan_timeout_secs()):
+                process = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-nostats",
+                    "-loglevel",
+                    "info",
+                    *source,
+                    "-vn",
+                    "-af",
+                    _SCAN_FILTER,
+                    "-f",
+                    "null",
+                    "-",
+                    stdin=asyncio.subprocess.PIPE if ranged else None,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                if ranged:
+                    stderr = await _scan_in_ranges(process, stream_url, size)
+                else:
+                    _, stderr = await process.communicate()
+        except aiohttp.ClientResponseError as e:
+            # Not its repr, which carries the signed URL.
+            failure = f"HTTP {e.status} for a range"
+        except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
+            failure = repr(e)
+        finally:
+            # Both the timeout and a cancellation land here, and either leaves a child
+            # holding a CDN connection. kill(), not terminate(): this one has no cleanup
+            # to do.
+            if process is not None and process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
 
     measured = (
         None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
@@ -1198,7 +1266,7 @@ async def measure_loudness(
             if failure
             else f"loudness scan printed no summary for {webpage_url}"
         )
-        span.set_attribute("ytdl.loudness_source", "none")
+        span.set_attribute("ytdl.loudness_scan_failed", True)
         # Remembered for an hour rather than re-paid on every play: a song the scan
         # timeout cannot cover times out the same way next time. Short, so a
         # transient failure heals itself.
@@ -1206,7 +1274,6 @@ async def measure_loudness(
             redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
         )
         return None
-    span.set_attribute("ytdl.loudness_source", "scan")
     span.set_attribute("ytdl.loudness_lufs", measured.i)
     await cache_set(redis, cache_key, measured.to_cache(), _LOUDNESS_TTL)
     return measured
@@ -1222,6 +1289,36 @@ def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
     span.set_attribute("ytdl.loudness_source", "youtube")
     span.set_attribute("ytdl.loudness_lufs", lkfs)
     return lkfs
+
+
+def _scan_target(data: YTDLVideoInfo) -> Optional[str]:
+    """The URL a scan of this song reads, or None when it is not to be scanned.
+    Livestreams (no duration) never are: the scan would read until its bound and
+    measure whatever it happened to catch."""
+    if not data.get("duration") or not data.get("url"):
+        return None
+    return data["url"]
+
+
+async def _song_loudness(
+    data: YTDLVideoInfo,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+    *,
+    wait: Optional[float] = None,
+) -> tuple[Optional[float], Optional[Loudness]]:
+    """The integrated loudness to normalize this song by, and the scan's reading
+    when a scan supplied it. YouTube's own figure costs nothing, so the scan is for
+    a song without one; (None, None) for a song not to be scanned, or not measured
+    within `wait`."""
+    lufs = _player_loudness(data)
+    if lufs is not None:
+        return lufs, None
+    target = _scan_target(data)
+    if target is None:
+        return None, None
+    measured = await measure_loudness(target, webpage_url, redis, wait=wait)
+    return (None, None) if measured is None else (measured.i, measured)
 
 
 def _source_cache_key(search: str) -> str:
@@ -1619,29 +1716,28 @@ def _probe_is_recent(data: YTDLVideoInfo) -> bool:
 
 async def _probe_and_cache(
     redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
-) -> bool:
+) -> Optional[StreamProbe]:
     """Success-path post-processing for a fresh stream extraction: record the
-    serving format, probe, cache. True when an entry was written. A DEAD URL is
-    never cached; an UNCONFIRMED one for _UNCONFIRMED_STREAM_TTL only."""
+    serving format, probe, cache. Answers the probe's verdict, or None for a URL
+    not worth caching and so never probed. A DEAD URL is never cached; an
+    UNCONFIRMED one for _UNCONFIRMED_STREAM_TTL only."""
     span = trace.get_current_span()
     _record_serving_format(data)
     if _stream_url_ttl(data.get("url", "")) is None:
         # Uncacheable (no usable expiry, e.g. SoundCloud): a probe would spend a
         # network round only for _cache_stream to decline the write.
-        return False
+        return None
     probe = await _probe_stream_url(data.get("url", ""))
     span.set_attribute("ytdl.stream_probe", probe.value)
     if probe is StreamProbe.PLAYABLE:
-        return await _cache_stream(redis, cache_key, data, probed=True)
-    if probe is StreamProbe.UNCONFIRMED:
+        await _cache_stream(redis, cache_key, data, probed=True)
+    elif probe is StreamProbe.UNCONFIRMED:
         log.warning(
             "could not confirm a freshly extracted stream URL — caching it for "
             f"{_UNCONFIRMED_STREAM_TTL}s only"
         )
-        return await _cache_stream(
-            redis, cache_key, data, max_ttl=_UNCONFIRMED_STREAM_TTL
-        )
-    return False
+        await _cache_stream(redis, cache_key, data, max_ttl=_UNCONFIRMED_STREAM_TTL)
+    return probe
 
 
 # Stream-cache warms in flight, keyed by their cache key. yt_source starts one from
@@ -1649,12 +1745,12 @@ async def _probe_and_cache(
 # not a probed URL. Everything that reads the stream cache joins through
 # _stream_cache_get, so the warm is shared rather than raced into a second extraction
 # of the same URL. See docs/ARCHITECTURE.md#warming-the-stream-cache.
-_INFLIGHT_STREAM_WARMS: dict[str, asyncio.Future[bool]] = {}
+_INFLIGHT_STREAM_WARMS: dict[str, asyncio.Future[Optional[StreamProbe]]] = {}
 
 
 async def _warm_in_its_own_span(
     redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
-) -> bool:
+) -> Optional[StreamProbe]:
     """_probe_and_cache under a span of its own. The warm outlives the resolve that
     started it, whose span has ended by the time the probe answers, and an ended
     span drops every attribute written to it."""
@@ -1664,29 +1760,20 @@ async def _warm_in_its_own_span(
 
 def _start_stream_warm(
     redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
-) -> asyncio.Future[bool]:
+) -> asyncio.Future[Optional[StreamProbe]]:
     """Probe and cache one stream URL in the background, or return the job already
-    doing it. Nobody is obliged to await the result, so the done-callback retrieves
-    any exception itself: an unretrieved one would surface at collection time, in a
-    task with no caller left to name."""
+    doing it. Its key is gone by the time a joiner resumes, so the next miss starts
+    a fresh warm rather than joining a settled one — the same ordering _extract_once
+    depends on."""
     running = _INFLIGHT_STREAM_WARMS.get(cache_key)
     if running is not None:
         return running
-    job = asyncio.ensure_future(_warm_in_its_own_span(redis, cache_key, data))
-    _INFLIGHT_STREAM_WARMS[cache_key] = job
-
-    # Registered before anything can await the job, so the key is gone by the time a
-    # joiner resumes and the next miss starts a fresh warm rather than joining a
-    # settled one — the same ordering _extract_once depends on.
-    def _settle(finished: asyncio.Future[bool]) -> None:
-        _INFLIGHT_STREAM_WARMS.pop(cache_key, None)
-        if not finished.cancelled() and finished.exception() is not None:
-            log.warning(
-                f"stream cache warm failed for {cache_key}: {finished.exception()!r}"
-            )
-
-    job.add_done_callback(_settle)
-    return job
+    return start_single_flight(
+        _INFLIGHT_STREAM_WARMS,
+        cache_key,
+        _warm_in_its_own_span(redis, cache_key, data),
+        f"stream cache warm failed for {cache_key}",
+    )
 
 
 async def _stream_cache_get(
@@ -1830,22 +1917,10 @@ def _queue_object_from_identity(
 
 _INFLIGHT_EXTRACTS: dict[str, asyncio.Future[Optional[YTDLExtractResult]]] = {}
 
-_prefetch_gate: Optional[asyncio.Semaphore] = None
-_prefetch_gate_loop: Optional[asyncio.AbstractEventLoop] = None
-
-
-def prefetch_warm_slot() -> asyncio.Semaphore:
-    """The bound on enqueue-time stream warms, which are spawned one per song and
-    share the pool with the in-band resolves of every OTHER guild's playback loop.
-    Half the workers, so one guild's paste burst can never hold all of them.
-    Rebuilt when the running loop changes — a Semaphore binds to the first loop
-    that awaits it and refuses another."""
-    global _prefetch_gate, _prefetch_gate_loop
-    loop = asyncio.get_running_loop()
-    if _prefetch_gate is None or _prefetch_gate_loop is not loop:
-        _prefetch_gate = asyncio.Semaphore(max(1, ytdlp_pool.max_workers // 2))
-        _prefetch_gate_loop = loop
-    return _prefetch_gate
+# The bound on enqueue-time stream warms, which are spawned one per song and share
+# the pool with the in-band resolves of every OTHER guild's playback loop. Half the
+# workers, so one guild's paste burst can never hold all of them.
+prefetch_warm_slot = LoopSemaphore(lambda: max(1, ytdlp_pool.max_workers // 2))
 
 
 def _inflight_key(cache_key: str, profile: str) -> str:
@@ -2433,7 +2508,6 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.start_offset + self.elapsed_secs
 
     @classmethod
-    @_tracer.start_as_current_span("ytdl.prefetch_stream")
     async def prefetch_stream(
         cls,
         qo: QueueObject,
@@ -2448,16 +2522,31 @@ class YTDL(discord.FFmpegOpusAudio):
         an extraction was attempted and produced nothing, so an interjection can
         decline a head it cannot prove playable. Anything unprovable — no Redis —
         answers with the item as it came."""
+        warmed, _ = await cls.warm_stream(qo, redis)
+        return warmed
+
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.warm_stream")
+    async def warm_stream(
+        cls,
+        qo: QueueObject,
+        redis: Optional[aioredis.Redis] = None,
+    ) -> tuple[Optional[QueueObject], Optional[YTDLVideoInfo]]:
+        """prefetch_stream, and the stream a loudness scan of the song can read: the
+        cached entry, or the fresh extraction unless its probe found the URL dead.
+        A source whose URL is never cached — SoundCloud, a direct file — answers
+        with its extraction all the same. See
+        docs/ARCHITECTURE.md#when-a-song-is-measured."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
         if redis is None:
             trace.get_current_span().set_attribute("ytdl.skipped", True)
-            return qo
+            return qo, None
         cache_key = _stream_cache_key(qo.webpage_url)
         cached = await _stream_cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
-            return _enrich_queueobject(qo, cached)
+            return _enrich_queueobject(qo, cached), cached
         try:
             # Single-video cast: stream opts on a watch URL never yield a
             # search/playlist wrapper. Single-flighted with the playback loop's
@@ -2479,14 +2568,28 @@ class YTDL(discord.FFmpegOpusAudio):
                 StatusCode.ERROR, f"prefetch_stream failed: {e}"
             )
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
-            return None
+            return None, None
         if data is not None:
             # Shielded like every other join: a cancelled prefetch (every bulk queue
             # mutation cancels one) must leave the warm running for whoever else is
             # waiting on this key. The CancelledError still propagates from here.
-            await asyncio.shield(_start_stream_warm(redis, cache_key, data))
-            return _enrich_queueobject(qo, data)
-        return None
+            probe = await asyncio.shield(_start_stream_warm(redis, cache_key, data))
+            stream = None if probe is StreamProbe.DEAD else data
+            return _enrich_queueobject(qo, data), stream
+        return None, None
+
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.prefetch_loudness")
+    async def prefetch_loudness(
+        cls, qo: QueueObject, stream: YTDLVideoInfo, redis: Optional[aioredis.Redis]
+    ) -> None:
+        """Measure a queued song before its turn, from the stream its warm resolved,
+        so a normalizing guild's play reads the level from Redis instead of waiting
+        on the scan. Waits for the whole scan: nobody is listening here.
+        See docs/ARCHITECTURE.md#when-a-song-is-measured."""
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        if redis is not None:
+            await _song_loudness(stream, qo.webpage_url, redis)
 
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
@@ -2736,21 +2839,16 @@ class YTDL(discord.FFmpegOpusAudio):
         gain_db: Optional[float] = None
         if loudness is LoudnessMode.NORMALIZE:
             span = trace.get_current_span()
-            # YouTube's own figure costs nothing; the scan is for a song without
-            # one. Livestreams (no duration) are never scanned: the scan would read
-            # until its timeout and measure whatever it happened to catch.
-            lufs = _player_loudness(data)
-            if lufs is None and data.get("duration"):
-                measured = await measure_loudness(data["url"], qo.webpage_url, redis)
-                if measured is not None:
-                    lufs = measured.i
-                    # The gain asked for, against what fits under the ceiling. A
-                    # song with less headroom than gain lands short of the target,
-                    # because the limiter holds back the difference.
-                    span.set_attribute(
-                        "ytdl.normalize_headroom_db",
-                        _PEAK_CEILING_DBFS - measured.peak,
-                    )
+            lufs, measured = await _song_loudness(
+                data, qo.webpage_url, redis, wait=config.loudness_scan_timeout_secs()
+            )
+            if measured is not None:
+                # The gain asked for, against what fits under the ceiling. A song
+                # with less headroom than gain lands short of the target, because
+                # the limiter holds back the difference.
+                span.set_attribute(
+                    "ytdl.normalize_headroom_db", _PEAK_CEILING_DBFS - measured.peak
+                )
             if lufs is not None:
                 gain_db = normalize_gain_db(lufs)
                 span.set_attribute("ytdl.normalize_gain_db", gain_db)

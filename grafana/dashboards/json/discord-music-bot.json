@@ -752,7 +752,7 @@
       "id": 15,
       "type": "timeseries",
       "title": "Extraction latency p95 (yt-dlp phases)",
-      "description": "ytdl.yt_source (phase 1 resolve), ytdl.prefetch_stream / ytdl.yt_stream (phase 2/3 stream extraction), ytdl.yt_playlist. Cache hits keep these near zero; a jump means yt-dlp is doing real network rounds again.",
+      "description": "ytdl.yt_source (phase 1 resolve), ytdl.warm_stream / ytdl.yt_stream (phase 2/3 stream extraction), ytdl.yt_playlist. Cache hits keep these near zero; a jump means yt-dlp is doing real network rounds again.",
       "gridPos": {
         "h": 8,
         "w": 8,

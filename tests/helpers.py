@@ -185,6 +185,12 @@ def passthrough_prefetch() -> AsyncMock:
     return AsyncMock(side_effect=lambda qo, *, redis=None: qo)
 
 
+def passthrough_warm() -> AsyncMock:
+    """A `YTDL.warm_stream` double honouring its contract: the item comes back as
+    warmed, with no stream for a loudness scan to read."""
+    return AsyncMock(side_effect=lambda qo, *, redis=None: (qo, None))
+
+
 def seed_queue(gq: GuildQueue, *items: QueueObject) -> None:
     """Queue items without touching Redis — `put()` minus the mirror.
 

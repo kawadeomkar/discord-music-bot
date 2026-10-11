@@ -23,7 +23,7 @@ from src.redis_client import (
 )
 from src import config
 from src.telemetry import get_tracer
-from src.util import ProgressFn, get_logger
+from src.util import LoopSemaphore, ProgressFn, get_logger
 
 if TYPE_CHECKING:
     # Annotation only: this client stays free of the input-parsing layer.
@@ -69,8 +69,7 @@ _PLAYLIST_PAGE_TIMEOUT_SECS = 20.0
 # 100 requests where a track lookup was one, and PLAY_RESOLVE_CONCURRENCY does
 # not reach them: it guards yt-dlp workers, which a walk holds none of.
 _PLAYLIST_WALK_CONCURRENCY = 2
-_playlist_gate: Optional[asyncio.Semaphore] = None
-_playlist_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+_playlist_slot = LoopSemaphore(lambda: _PLAYLIST_WALK_CONCURRENCY)
 
 # Refreshed this long before Spotify's own expiry: a 429 retry can sleep 30s
 # between the expiry check and the request that carries the token.
@@ -482,17 +481,6 @@ async def _acquire_walk_slot() -> asyncio.Semaphore:
     except TimeoutError as e:
         raise SpotifyBusyError(wait_secs) from e
     return slot
-
-
-def _playlist_slot() -> asyncio.Semaphore:
-    """The process-wide bound on concurrent playlist walks. Rebuilt when the
-    running loop changes — a Semaphore binds to the first loop that awaits it."""
-    global _playlist_gate, _playlist_gate_loop
-    loop = asyncio.get_running_loop()
-    if _playlist_gate is None or _playlist_gate_loop is not loop:
-        _playlist_gate = asyncio.Semaphore(_PLAYLIST_WALK_CONCURRENCY)
-        _playlist_gate_loop = loop
-    return _playlist_gate
 
 
 @contextlib.contextmanager
