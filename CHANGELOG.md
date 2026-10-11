@@ -17,6 +17,15 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.58.1 — 2026-10-03
+
+**Spotify links resolve more reliably by recording.** A Spotify album longer than 50
+tracks no longer loses its tracks' ISRCs to an oversized request, a malformed ISRC is no
+longer searched verbatim, and a Spotify track whose ISRC YouTube does not index resolves
+one search faster.
+
+Nothing to do on deploy, and rolling back is safe.
+
 ## 2.58.0 — 2026-10-03
 
 **New setting: `-settings loudness`.** Off by default, and off behaves exactly as the bot
