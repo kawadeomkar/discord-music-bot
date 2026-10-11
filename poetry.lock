@@ -323,14 +323,14 @@ files = [
 
 [[package]]
 name = "bgutil-ytdlp-pot-provider"
-version = "2.0.0"
+version = "2.0.2"
 description = ""
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "bgutil_ytdlp_pot_provider-2.0.0-py3-none-any.whl", hash = "sha256:22884c399802771ddfd9275bb05b178d67c89db67a1d5d1e17ed7f681956628e"},
-    {file = "bgutil_ytdlp_pot_provider-2.0.0.tar.gz", hash = "sha256:dac2d1aeeac63218efe879e538e978d2efc088ed887124095e6fd6a09c3077df"},
+    {file = "bgutil_ytdlp_pot_provider-2.0.2-py3-none-any.whl", hash = "sha256:4f488008d25a715837df79472aad06ea052d20e14ad3a02609bbb0fbd746b8be"},
+    {file = "bgutil_ytdlp_pot_provider-2.0.2.tar.gz", hash = "sha256:a127b20c4757edb33f88061afb01220829d1b340638cf638a293065577a000b4"},
 ]
 
 [[package]]
@@ -3838,4 +3838,4 @@ charts = ["matplotlib"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.14,<4.0"
-content-hash = "1ebe6652ba2639fec03dccd550789244ccf30486dbe5b451cdef0b678ad3dc19"
+content-hash = "74aafe112526ee676bb7a6169fbd8a6b042296eba94a2ca8236bebb3f45d141b"
