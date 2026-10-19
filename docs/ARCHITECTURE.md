@@ -774,11 +774,16 @@ Where the ISRC comes from, and where it does not:
 
 The length Spotify reports is the second half of the rule: `select_search_entry` prefers
 the entry closest to it, with everything inside `_DURATION_TIE_SECS` of the best treated
-as a tie and settled by YouTube's own ranking. That widening rides the FLAT path only. One
-search POST costs the same for one result as for five (0.51 s measured, either way), where
-a processed search extracts every entry it answers with — 3.69 s for three against 1.22 s
-for one, and three times the player requests, which is not a cost worth paying at the
-dequeue resolve for a re-upload instead of a music video.
+as a tie and settled by YouTube's own ranking.
+
+The widening is asked for on the FLAT path, and the flat fallback re-uses the same term, so
+a resolve whose flat entry is too thin to play extracts three entries processed rather than
+one. A flat POST costs the same for one result as for five (0.51 s measured, either way); a
+processed extraction reads every entry it answers with — 3.69 s for three against 1.22 s
+for one, and three times the player requests. That is the cost of the fallback choosing the
+right recording instead of YouTube's top result, and it is paid only when the flat entry was
+unusable. The **dequeue** resolve is not widened at all: `_search_terms` returns the bare
+term when `flat` is false, so there is nothing for the length to choose between there.
 
 ### The music search fallback
 

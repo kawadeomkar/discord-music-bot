@@ -155,7 +155,7 @@ label's art track (263 s against 234 s for "Shape of You"). A playlist asks for 
 `fields` mask; an album's simplified tracks carry none, so `_page_isrcs` batches one
 `/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
 of a FLAT search, which costs the same for five as for one. Full rule and numbers:
-ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
+docs/ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
 the playlist's path through `queue_source`, the card and every placement; page 1 rides
