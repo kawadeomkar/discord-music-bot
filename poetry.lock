@@ -1202,14 +1202,14 @@ testing = ["hatch", "pre-commit", "pytest", "tox"]
 
 [[package]]
 name = "fakeredis"
-version = "2.38.0"
+version = "2.40.0"
 description = "Python implementation of redis API, can be used for testing purposes."
 optional = false
 python-versions = ">=3.8"
 groups = ["test"]
 files = [
-    {file = "fakeredis-2.38.0-py3-none-any.whl", hash = "sha256:d9fb0518c4eaa35f1f2c94df6b4a4c97ff3ca9f43d6cc8112317a9037d244301"},
-    {file = "fakeredis-2.38.0.tar.gz", hash = "sha256:d2abfd24652f86501044499bf08c9d639db050f695eefc06b8b8b6f0bb24dbd6"},
+    {file = "fakeredis-2.40.0-py3-none-any.whl", hash = "sha256:b155ef2442134372eb1cc5664cf5638ccbe0a6dde9d1942153708e2782f315c9"},
+    {file = "fakeredis-2.40.0.tar.gz", hash = "sha256:16eb05a3e97c37a033c73d1da7e885eb2aa47ba7604cc377144339efa2780a02"},
 ]
 
 [package.dependencies]
@@ -1219,6 +1219,7 @@ sortedcontainers = ">=2"
 [package.extras]
 bf = ["pyprobables (>=0.6)"]
 cf = ["pyprobables (>=0.6)"]
+digest = ["xxhash (>=3)"]
 json = ["jsonpath-ng (>=1.6)"]
 lua = ["lupa (>=2.1)"]
 probabilistic = ["pyprobables (>=0.6)"]
@@ -3863,4 +3864,4 @@ charts = ["matplotlib"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.14,<4.0"
-content-hash = "eb18aee83952da2c9754bc3230a4bfef07e37c0fc45b3db6393996f021832a4c"
+content-hash = "a4e3cb42bbbd6efdd17f73e10081c2fb1b541b13274690719fe8a59064e1f245"
